@@ -62,7 +62,7 @@ func run(args []string, input io.Reader, output io.Writer) int {
 			fmt.Fprintln(output, "\n恢复未完成。请保留上面的完整错误文字，以便继续处理。")
 		} else {
 			fmt.Fprintf(output, "\n已撤除 %d 条规则、%d 份保护配置；剩余保护配置：%d。\n", report.RemovedFilters, report.RemovedProfiles, report.RemainingProfiles)
-			fmt.Fprintln(output, "请退出 Clash 或关闭 Clash 的 TUN/系统代理，然后重新打开浏览器测试直连。\n恢复工具只确认本软件的保护规则已清除，不检测其他原因造成的断网。\n在修复版本验证前，请保持断线保护关闭。")
+			fmt.Fprintln(output, "请退出 Clash 或关闭 Clash 的 TUN/系统代理，然后重新打开浏览器测试直连。\n恢复工具只确认本软件的保护规则已清除，不检测其他原因造成的断网。")
 		}
 		fmt.Fprintln(output, "\n按回车关闭。")
 		_, _ = reader.ReadString('\n')

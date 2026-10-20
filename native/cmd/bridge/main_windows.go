@@ -175,7 +175,7 @@ func main() {
 		return
 	}
 	flags := flag.NewFlagSet("Claude Bridge", flag.ContinueOnError)
-	port := flags.Int("port", 3210, "local API port")
+	port := flags.Int("port", 3210, "local model API port (management uses the adjacent port)")
 	directory := flags.String("data-dir", "", "private application data directory")
 	noBrowser := flags.Bool("no-browser", false, "do not open browser")
 	owned := flags.Bool("owned-engine", false, "start an engine owned by the native desktop")

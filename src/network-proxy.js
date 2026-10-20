@@ -121,7 +121,7 @@ export class NetworkProxy extends EventEmitter {
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(this.listenPort, '127.0.0.1', () => { server.off('error', reject); resolve(); }); });
     } catch (error) { this.server = null; throw error; }
     if (this.closed) throw new Error('网络代理已关闭');
-    this.port = server.address().port; this.emit('state');
+    this.port = server.address().port; this.error = null; this.emit('state');
     return this.status();
   }
   status() {

@@ -272,7 +272,6 @@ function renderProxy(proxy = {}, ui = state()) {
   $('proxy-enable').textContent = proxy.enabled ? '关闭本地 Clash 节点' : '启用本地 Clash 节点';
   $('proxy-enable').disabled = actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client';
   $('proxy-subscription').value = proxy.subscriptionUrl || ''; $('copy-subscription').disabled = actionBusy || proxyBusy || !localAvailable || !proxy.subscriptionUrl;
-  $('copy-claude-subscription').disabled = actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client' || !proxy.claudeSubscriptionUrl;
   renderDevices($('proxy-device-list'), proxy.devices || [], { empty: '等待本机与已配对 B 的连接状态。' });
   $('proxy-clients').replaceChildren();
   const clients = proxy.clients || [];
@@ -303,20 +302,6 @@ async function proxyAction(route, body) {
 $('proxy-sharing').onclick = () => proxyAction('/api/proxy', { sharing: !proxyStatus.sharing });
 $('proxy-enable').onclick = () => proxyAction('/api/proxy', { enabled: !proxyStatus.enabled });
 $('copy-subscription').onclick = () => { if (proxyStatus.subscriptionUrl) copy(proxyStatus.subscriptionUrl); };
-$('copy-claude-subscription').onclick = async () => {
-  const ui = state();
-  if (actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client') return;
-  const revision = mutation;
-  proxyBusy = true; render(currentStatus);
-  try {
-    const result = await (await api('/api/proxy')).json();
-    if (revision !== mutation) return;
-    const proxy = result.proxy || result, subscription = proxy.claudeSubscriptionUrl;
-    if (!subscription) { toast('请先启用本地 Clash 节点，并确认客户端支持 Claude 专用配置。', true); return; }
-    await copy(subscription, 'Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN');
-  } catch (error) { if (revision === mutation) toast(error.message, true); }
-  finally { proxyBusy = false; render(currentStatus); }
-};
 
 function render(status) {
   if (!status) return;

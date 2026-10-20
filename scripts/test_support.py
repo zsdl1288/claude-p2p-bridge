@@ -1,16 +1,67 @@
 """Disposable fixtures shared by local Windows checks; never use live profiles."""
 import atexit
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import socket
 import stat
+import subprocess
 import tempfile
 import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / ".bridge"
+
+
+def management_port(port):
+    return 65534 if port == 65535 else port + 1
+
+
+@lru_cache(maxsize=1)
+def _dynamic_tcp_range():
+    if os.name != "nt":
+        return None
+    result = subprocess.run(
+        ["netsh", "interface", "ipv4", "show", "dynamicport", "tcp"],
+        check=True, capture_output=True, timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    # Read the two numeric fields without depending on the Windows UI language.
+    values = [int(value) for value in re.findall(rb":\s*(\d+)\s*$", result.stdout, re.MULTILINE)]
+    if len(values) != 2 or not (1 <= values[0] <= 65535 and 1 <= values[1] <= 65536 - values[0]):
+        raise RuntimeError("Cannot determine the Windows TCP dynamic port range")
+    return values[0], values[0] + values[1] - 1
+
+
+def available_port_pair():
+    """Probe both listeners outside Windows' client-port range.
+
+    An HTTP readiness probe can otherwise connect to itself before the child
+    binds its server, leaving TIME_WAIT on that port and masking startup errors.
+    The child still binds its own sockets; an unrelated process can win that
+    normal allocation race, so callers retain their bounded startup checks.
+    """
+    dynamic = _dynamic_tcp_range()
+    candidates = [port for port in range(1024, 65535)
+                  if not dynamic or not any(dynamic[0] <= value <= dynamic[1] for value in (port, port + 1))]
+    if not candidates:
+        raise RuntimeError("No loopback port pair outside the TCP dynamic range")
+    # Sample the valid space itself. Skipping a large excluded interval after
+    # choosing a start would send most concurrent fixtures to the same boundary.
+    start = secrets.randbelow(len(candidates))
+    for offset in range(len(candidates)):
+        port = candidates[(start + offset) % len(candidates)]
+        with socket.socket() as model, socket.socket() as management:
+            try:
+                model.bind(("127.0.0.1", port))
+                management.bind(("127.0.0.1", port + 1))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("No unused loopback port pair outside the TCP dynamic range")
 
 
 def _linked(path):

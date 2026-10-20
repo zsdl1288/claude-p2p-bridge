@@ -10,14 +10,13 @@ import http.client
 import json
 import os
 from pathlib import Path
-import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from build_support import ROOT as root, VERSION as version
 from build_desktop_fixture import build_fixture
-from test_support import TemporaryTestDirectory
+from test_support import TemporaryTestDirectory, available_port_pair, management_port
 
 engine = root / "bin/bridge-engine.exe"
 temporary = TemporaryTestDirectory("desktop-smoke-")
@@ -53,15 +52,7 @@ def request(base, route, body=None, token=None):
 
 def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, desktop_mode=False):
     if port is None:
-        while True:
-            with socket.socket() as model_probe, socket.socket() as management_probe:
-                model_probe.bind(("127.0.0.1", 0))
-                port = model_probe.getsockname()[1]
-                try:
-                    management_probe.bind(("127.0.0.1", management_port(port)))
-                except OSError:
-                    continue
-                break
+        port = available_port_pair()
     args = [str(desktop if desktop_mode else engine)]
     if not desktop_mode:
         args.append("--owned-engine")
@@ -80,6 +71,8 @@ def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, de
             if health["version"] == version:
                 bootstrap = request(base, "/api/bootstrap")
                 token = bootstrap["token"]
+                if token != (directory / name / "api-token").read_text(encoding="utf-8").strip():
+                    raise ValueError("Readiness response belongs to another test profile")
                 model_urls[base] = bootstrap["api"]
                 clients.append((base, token))
                 if wait_identity:
@@ -89,13 +82,9 @@ def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, de
         except (OSError, ValueError, AssertionError, http.client.HTTPException):
             pass
         if process.poll() is not None:
-            raise RuntimeError(f"{name} exited before startup")
+            raise RuntimeError(f"{name} exited before startup (exit {process.returncode})")
         time.sleep(poll_interval)
     raise TimeoutError(f"{name} did not start")
-
-
-def management_port(port):
-    return 65534 if port == 65535 else port + 1
 
 
 def model_port(base):
@@ -218,9 +207,7 @@ try:
     with opener.open(base + "/licenses", timeout=5) as response:
         assert "Tailscale" in response.read().decode("utf-8")
     # A different port and directory must still reuse the same desktop.
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        duplicate_port = probe.getsockname()[1]
+    duplicate_port = available_port_pair()
     duplicate = subprocess.run([str(desktop), "--minimized", "--port", str(duplicate_port),
                                 "--data-dir", str(directory / "duplicate")], env=env, timeout=15)
     assert duplicate.returncode == 0
@@ -248,9 +235,7 @@ try:
         processes[-1].kill()
         processes[-1].wait(timeout=10)
         while True:
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", 0))
-                takeover_port = probe.getsockname()[1]
+            takeover_port = available_port_pair()
             if takeover_port != model_port(crash_base):
                 break
         takeover_base, takeover_token = start("job-takeover", port=takeover_port, desktop_mode=True)

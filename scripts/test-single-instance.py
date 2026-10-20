@@ -8,7 +8,7 @@ import subprocess
 import threading
 import uuid
 from build_support import ROOT, VERSION
-from test_support import TemporaryTestDirectory
+from test_support import TemporaryTestDirectory, available_port_pair
 
 
 def main(skip_release=False):
@@ -103,8 +103,7 @@ def main(skip_release=False):
             release = ROOT / f"release/ClaudeBridge-{VERSION}-windows-x64.exe"
             if not skip_release and pid and release.is_file():
                 isolated = Path(directory) / "release-secondary"
-                with socket.socket() as probe:
-                    probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]
+                port = available_port_pair()
                 secondary = subprocess.run([str(release), "--minimized", "--port", str(port), "--data-dir", str(isolated)],
                                            timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
                 assert secondary.returncode == 0 and not isolated.exists(), "Release secondary launch wrote data or failed to exit"

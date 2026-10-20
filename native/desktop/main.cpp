@@ -246,14 +246,13 @@ class Application {
         const wchar_t* proxyColumns[] = {L"设备 / 身份", L"虚拟 IP", L"代理状态", L"连接 / 已传输"};
         const int proxyWidths[] = {230, 132, 160, 238};
         for (int i = 0; i < 4; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(proxyColumns[i]); column.cx = S(proxyWidths[i]); ListView_InsertColumn(proxyPeerList_, i, &column); }
-        Button(L"启用本地 Clash 节点", PROXY_ENABLE, 228, 334, 356, 32, 3, 1);
-        Button(L"复制 Claude 专用配置", COPY_CLAUDE_SUBSCRIPTION, 600, 334, 392, 32, 3, 1, true);
+        Button(L"启用本地 Clash 节点", PROXY_ENABLE, 228, 334, 764, 32, 3, 1); widgets_.back().stretch = true;
         Button(L"允许已配对的 A 使用本机网络", PROXY_SHARING, 228, 252, 420, 36, 3, 2);
         Label(L"已配对设备与网络使用情况", 228, 310, 700, 24, 3, 2, 1);
-        Label(L"Clash 全量配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
+        Label(L"Clash 完整配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
         Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 404, 556, 30, 3, 1, false, true, true);
-        Button(L"复制全量订阅", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
-        Label(L"Claude 专用：Claude 固定走 B，其他网站直连；保持 Clash TUN 运行，关闭系统代理 / 代理脚本。\r\nB 断时 Claude 无直连回退；旧版系统保护仍会阻止其他网站，需用离线网络恢复工具清除。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
+        Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
+        Label(L"导入完整配置并开启 Clash TUN，保持本客户端运行；关闭 Clash 的系统代理 / 代理脚本。\r\nB 断开时不回退直连。旧版系统保护如需清除，请使用离线网络恢复工具。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"设备在线表示配对连接可用；“使用中”表示该设备正连接网络共享。\r\n停止共享仅关闭代理连接，不会中断 Claude 模型服务。", 228, 634, 764, 42, 3, 2, 3, true); widgets_.back().stretch = true;
         Label(L"后台运行", 228, 132, 540, 24, 4, 0, 1);
         Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, 172, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
@@ -508,7 +507,6 @@ class Application {
         EnableWindow(Item(PROXY_ENABLE), enabled && proxyAvailable_ && Capability("proxy") && role == "client");
         EnableWindow(Item(PROXY_SHARING), enabled && proxyAvailable_ && Capability("proxy") && role == "host");
         EnableWindow(Item(COPY_SUBSCRIPTION), enabled && proxyAvailable_ && !proxy_.value("subscriptionUrl", "").empty());
-        EnableWindow(Item(COPY_CLAUDE_SUBSCRIPTION), enabled && proxyAvailable_ && Capability("proxy") && role == "client" && !proxy_.value("claudeSubscriptionUrl", "").empty());
     }
     void RenderProxy(const Json& proxy) {
         if (!proxy.is_object()) return;
@@ -666,7 +664,7 @@ class Application {
         if (actionThread_.joinable()) actionThread_.join();
         busy_ = true; UpdateButtons(); Report(L"正在处理…");
         actionThread_ = std::thread([this, route = std::move(route), body = std::move(body), kind] {
-            try { Post({kind, Api(ControlPort(), token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && (kind == "proxy-copy" || kind == "proxy-copy-claude")) ? nullptr : &body, 30000)}); }
+            try { Post({kind, Api(ControlPort(), token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && kind == "proxy-copy") ? nullptr : &body, 30000)}); }
             catch (const std::exception& error) { Post({"action-error", {}, error.what()}); }
         });
     }
@@ -733,19 +731,12 @@ class Application {
         }
         if (reply.kind == "probe") { Message(Wide(reply.data.value("message", "检测完成")), !reply.data.value("available", false)); return; }
         if (reply.kind == "cancel") { Report(L"已发送取消请求"); return; }
-        if (reply.kind == "proxy" || reply.kind == "proxy-copy" || reply.kind == "proxy-copy-claude") {
+        if (reply.kind == "proxy" || reply.kind == "proxy-copy") {
             RenderProxy(reply.data.contains("proxy") ? reply.data["proxy"] : reply.data);
-            if (reply.kind == "proxy-copy" || reply.kind == "proxy-copy-claude") {
-                const bool claudeOnly = reply.kind == "proxy-copy-claude";
-                auto subscription = proxy_.value(claudeOnly ? "claudeSubscriptionUrl" : "subscriptionUrl", "");
+            if (reply.kind == "proxy-copy") {
+                auto subscription = proxy_.value("subscriptionUrl", "");
                 if (subscription.empty()) Message(L"请先启用本地 Clash 节点。", true);
-                else {
-                    Clipboard(window_, Wide(subscription));
-                    if (claudeOnly) {
-                        std::wstring message = L"Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN";
-                        Text(proxyMessage_, message); Report(message);
-                    } else Report(L"全量配置订阅已复制 · 请在 Clash 导入并开启 TUN");
-                }
+                else { Clipboard(window_, Wide(subscription)); Report(L"完整配置订阅已复制 · 请在 Clash 导入并开启 TUN"); }
             } else Report(Wide(proxy_.value("message", "代理设置已更新")));
             return;
         }
@@ -803,7 +794,6 @@ class Application {
             case PROXY_ENABLE: Action(L"/api/proxy", {{"enabled", !proxy_.value("enabled", false)}}, "proxy"); break;
             case PROXY_SHARING: Action(L"/api/proxy", {{"sharing", !proxy_.value("sharing", false)}}, "proxy"); break;
             case COPY_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy"); break;
-            case COPY_CLAUDE_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy-claude"); break;
             case COPY_INVITE: Clipboard(window_, Wide(invitation_)); Report(L"配对码已复制"); break;
             case COPY_ENDPOINT: Clipboard(window_, Value(API_ENDPOINT)); Report(L"模型 Base URL 已复制"); break;
             case COPY_TOKEN: Clipboard(window_, Wide(token_)); Report(L"API 令牌已复制"); break;

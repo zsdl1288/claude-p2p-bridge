@@ -93,6 +93,26 @@ test('concurrent local proxy starts wait for the same listening address', async 
   assert.equal(second.listening, true);
 });
 
+test('a successful listener retry clears its earlier bind error before publishing state', async (t) => {
+  const occupied = net.createServer();
+  await new Promise((resolve) => occupied.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { if (occupied.listening) await new Promise((resolve) => occupied.close(resolve)); });
+  const port = occupied.address().port;
+  const proxy = new NetworkProxy({ bridge: new EventEmitter(), listenPort: port });
+  t.after(() => proxy.close());
+  await assert.rejects(proxy.start(), { code: 'EADDRINUSE' });
+  assert.match(proxy.status().error, /EADDRINUSE/);
+  await new Promise((resolve) => occupied.close(resolve));
+  const states = [];
+  proxy.on('state', () => states.push(proxy.status()));
+  const recovered = await proxy.start();
+  assert.equal(recovered.listening, true);
+  assert.equal(recovered.listenPort, port);
+  assert.equal(recovered.error, null);
+  assert.ok(states.some((state) => state.listening));
+  assert.ok(states.every((state) => state.error === null));
+});
+
 test('closing while the local proxy binds cancels startup without a stale listener or address error', async (t) => {
   const proxy = new NetworkProxy({ bridge: new EventEmitter() });
   t.after(() => proxy.close());

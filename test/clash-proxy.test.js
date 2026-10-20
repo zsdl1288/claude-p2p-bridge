@@ -50,49 +50,13 @@ test('generated complete Clash profile routes Internet and DNS through B without
   assert.equal(config.rules.at(-1), 'MATCH,B 网络出口');
   assert.equal(config['proxy-groups'], undefined);
   assert.equal(config.sniffer, undefined); assert.equal(config.dns['nameserver-policy'], undefined);
-  assert.deepEqual(clashProfile({ port: 12345, username: 'user', password: 'secret', scope: 'all' }), config);
   for (const resolver of [...config.dns.nameserver, ...config.dns['proxy-server-nameserver']]) assert.match(resolver, /#B 网络出口$/);
   assert.ok(config.rules.includes('PROCESS-NAME,bridge-net.exe,DIRECT'));
+  const system = clashProfile({ port: 12345, username: 'user', password: 'secret', system: true });
+  assert.ok(system.rules.includes('PROCESS-NAME,tailscaled.exe,DIRECT'));
+  assert.ok(system.rules.includes('IP-CIDR,100.64.0.0/10,DIRECT,no-resolve'));
   assert.equal(config.rules.some((rule) => /^MATCH,DIRECT|^GEOIP,.*DIRECT/.test(rule)), false);
   assert.throws(() => clashProfile({ port: 0, username: 'user', password: 'secret' }), /尚未就绪/);
-});
-
-test('Claude-only profile pins service, content and telemetry traffic to B while ordinary traffic and DNS stay direct', () => {
-  const config = clashProfile({ port: 12345, username: 'user', password: 'secret', scope: 'claude' });
-  const suffixes = ['claude.ai', 'claude.com', 'claude.app', 'anthropic.com', 'claudeusercontent.com', 'claudemcpcontent.com'];
-  const telemetry = ['http-intake.logs.us5.datadoghq.com', 'browser-intake-us5-datadoghq.com'];
-  const loopback = config.rules.indexOf('IP-CIDR,127.0.0.0/8,DIRECT,no-resolve');
-  const helper = config.rules.indexOf('PROCESS-NAME,bridge-net.exe,DIRECT');
-  for (const domain of suffixes) {
-    const index = config.rules.indexOf(`DOMAIN-SUFFIX,${domain},B 网络出口`);
-    assert.ok(index >= 0 && index < helper && index < loopback, 'Claude domains must be matched before process and address direct exceptions');
-  }
-  for (const domain of telemetry) {
-    const index = config.rules.indexOf(`DOMAIN,${domain},B 网络出口`);
-    assert.ok(index >= 0 && index < helper && index < loopback);
-  }
-  assert.equal(config.rules.at(-1), 'MATCH,DIRECT');
-  assert.equal(config.rules.filter((rule) => rule.endsWith(',B 网络出口')).length, suffixes.length + telemetry.length);
-  assert.equal(config.rules.some((rule) => /github|npmjs|googleapis|cloudflare|jsdelivr|DOMAIN-SUFFIX,datadoghq/u.test(rule)), false);
-  assert.equal(config['proxy-groups'], undefined); assert.equal(config['rule-providers'], undefined);
-  assert.deepEqual(config.dns.nameserver, ['223.5.5.5#DIRECT', '119.29.29.29#DIRECT']);
-  assert.deepEqual(config.dns['proxy-server-nameserver'], config.dns.nameserver);
-  assert.equal(config.dns['fake-ip-filter-mode'], 'whitelist');
-  assert.deepEqual(config.dns['fake-ip-filter'].sort(), [...suffixes.map((domain) => `+.${domain}`), ...telemetry].sort());
-  for (const resolver of [...config.dns.nameserver, ...config.dns['proxy-server-nameserver']]) assert.match(resolver, /#DIRECT$/);
-  assert.deepEqual(Object.keys(config.dns['nameserver-policy']).sort(), [...suffixes.map((domain) => `+.${domain}`), ...telemetry].sort());
-  for (const resolvers of Object.values(config.dns['nameserver-policy'])) {
-    assert.ok(resolvers.length > 0); for (const resolver of resolvers) assert.match(resolver, /#B 网络出口$/);
-  }
-  assert.equal(config.dns.fallback, undefined); assert.equal(config.dns['fallback-filter'], undefined);
-  assert.equal(config.sniffer.enable, true); assert.equal(config.sniffer['parse-pure-ip'], true);
-  assert.equal(config.sniffer['override-destination'], true);
-  assert.deepEqual(Object.keys(config.sniffer.sniff).sort(), ['HTTP', 'QUIC', 'TLS']);
-  assert.equal(config.tun.enable, true); assert.equal(config.tun['strict-route'], true);
-  const system = clashProfile({ port: 12345, username: 'user', password: 'secret', system: true, scope: 'claude' });
-  assert.ok(system.rules.indexOf('DOMAIN-SUFFIX,claude.app,B 网络出口') < system.rules.indexOf('PROCESS-NAME,tailscaled.exe,DIRECT'));
-  assert.ok(system.rules.includes('IP-CIDR,100.64.0.0/10,DIRECT,no-resolve'));
-  assert.throws(() => clashProfile({ port: 12345, username: 'user', password: 'secret', scope: 'unknown' }), /配置范围/);
 });
 
 test('subscription URLs authenticate independently, reject cross-origin access and return full or node-only profiles', { timeout: 15000 }, async (t) => {
@@ -116,26 +80,29 @@ test('subscription URLs authenticate independently, reject cross-origin access a
   assert.notEqual(config.proxies[0].password, token);
 });
 
-test('Claude subscription uses the existing local authorization and remains available when B is offline', { timeout: 15000 }, async (t) => {
+test('removed subscription URLs return 404 without switching clients to a full profile', { timeout: 15000 }, async (t) => {
   const fixture = await paired(t), { host, client, a } = fixture;
-  assert.equal(a.app.proxy.status().claudeSubscriptionUrl, '');
+  const removed = `${a.base}/clash/${a.app.proxy.subscriptionToken}/claude.yaml`;
+  const assertRemoved = async () => {
+    for (const requestHeaders of [{}, headers]) {
+      const response = await fetch(removed, { headers: requestHeaders });
+      assert.equal(response.status, 404);
+      assert.equal(response.redirected, false);
+      const body = await response.json();
+      assert.equal(body.proxies, undefined); assert.equal(body.rules, undefined);
+      assert.match(body.error, /订阅不存在/);
+    }
+    for (const route of ['/api/proxy', '/api/status']) {
+      const body = await (await a.request(route)).json();
+      assert.equal(Object.hasOwn(route === '/api/status' ? body.proxy : body, 'claudeSubscriptionUrl'), false);
+    }
+  };
+  await assertRemoved();
   await enable(fixture);
-  const status = await (await a.request('/api/status')).json(), url = status.proxy.claudeSubscriptionUrl;
-  assert.equal(url, status.proxy.subscriptionUrl.replace('/config.yaml', '/claude.yaml'));
-  const response = await fetch(url); assert.equal(response.status, 200);
-  assert.match(response.headers.get('content-type'), /application\/yaml/);
-  const config = await response.json();
-  assert.equal(config.rules.at(-1), 'MATCH,DIRECT');
-  assert.ok(config.rules.includes('DOMAIN-SUFFIX,anthropic.com,B 网络出口'));
-  const full = await (await fetch(status.proxy.subscriptionUrl)).json();
-  assert.deepEqual(config.proxies, full.proxies); assert.equal(full.rules.at(-1), 'MATCH,B 网络出口');
-  assert.equal((await fetch(url.replace(a.app.proxy.subscriptionToken, 'a'.repeat(43)))).status, 401);
-  assert.equal((await fetch(url, { headers: { Origin: 'https://example.invalid' } })).status, 403);
+  await assertRemoved();
   await host.stopPeer(); await until(() => !client.peer.state.online);
-  const offline = await (await a.request('/api/proxy')).json();
-  assert.equal(offline.state, 'blocked'); assert.equal(offline.claudeSubscriptionUrl, url);
-  const retained = await fetch(url); assert.equal(retained.status, 200);
-  assert.deepEqual((await retained.json()).rules, config.rules);
+  await assertRemoved();
+  assert.equal((await fetch(removed.replace('/claude.yaml', '/unknown.yaml'))).status, 404);
 });
 
 test('proxy status has no system protection state and removed protection APIs are unavailable', async (t) => {

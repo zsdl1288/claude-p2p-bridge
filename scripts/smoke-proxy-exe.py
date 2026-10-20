@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from build_support import ROOT, VERSION
-from test_support import TemporaryTestDirectory
+from test_support import TemporaryTestDirectory, available_port_pair, management_port
 
 
 EXECUTABLE = ROOT / "bin/bridge-engine.exe"
@@ -30,22 +30,6 @@ def request(base, route, body=None, token=None):
         base + route, data=None if body is None else json.dumps(body).encode(), headers=headers)
     with OPENER.open(req, timeout=5) as response:
         return json.load(response)
-
-
-def available_port():
-    while True:
-        with socket.socket() as model_probe, socket.socket() as management_probe:
-            model_probe.bind(("127.0.0.1", 0))
-            port = model_probe.getsockname()[1]
-            try:
-                management_probe.bind(("127.0.0.1", management_port(port)))
-            except OSError:
-                continue
-            return port
-
-
-def management_port(port):
-    return 65534 if port == 65535 else port + 1
 
 
 def wait_for(read, condition, description, timeout=25):
@@ -132,7 +116,7 @@ def main():
     env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
     with TemporaryTestDirectory("proxy-exe-smoke-") as directory:
         def start(name, port=None):
-            port = port or available_port()
+            port = port or available_port_pair()
             base = f"http://127.0.0.1:{management_port(port)}"
             model_ports[base] = port
             process = subprocess.Popen(
@@ -143,10 +127,12 @@ def main():
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError(f"{name} exited before startup")
+                    raise RuntimeError(f"{name} exited before startup (exit {process.returncode})")
                 try:
                     assert request(base, "/health")["version"] == VERSION
                     token = request(base, "/api/bootstrap")["token"]
+                    if token != (directory / name / "api-token").read_text(encoding="utf-8").strip():
+                        raise ValueError("Readiness response belongs to another test profile")
                     clients.append((base, token))
                     initial = wait_for(lambda: request(base, "/api/status", token=token),
                                        lambda state: state["identity"]["loaded"], "Identity preferences did not load")

@@ -51,7 +51,12 @@
     <section id="proxy" class="page-panel" aria-label="网络代理" hidden>
       <section class="card proxy-card"><div class="card-heading"><div><h2 id="proxy-heading">网络代理</h2></div><span class="proxy-badge" id="proxy-state">正在读取状态</span></div><p class="proxy-message" id="proxy-message" role="status" aria-live="polite">正在读取代理状态…</p>
         <div id="proxy-host-panel" hidden><h3>B · 共享本机网络</h3><p class="field-hint">允许已配对的 A 使用本机网络出口，与 Claude 服务分别控制。私网中其他在线节点不会自动获得共享权限。</p><button type="button" class="primary" id="proxy-sharing" disabled>开启共享本机网络</button><h3 class="list-heading">已配对的调用端</h3><div id="proxy-clients"><p class="empty">尚无调用端连接。</p></div></div>
-        <div id="proxy-client-panel" hidden><h3>A · 本机与服务端</h3><div id="proxy-device-list"></div><p class="field-hint">启用本地节点后，将所选订阅作为完整配置导入 Mihomo / Clash Meta，保持 Clash TUN 运行。关闭指向本机 Clash 的系统代理和代理脚本。</p><div class="form-actions"><button type="button" class="primary" id="proxy-enable" disabled>启用本地 Clash 节点</button><button type="button" class="secondary" id="copy-claude-subscription" disabled>复制 Claude 专用配置</button></div><p class="field-hint">Claude 专用配置将 Claude 流量固定经 B，其他网站直连；B 掉线时 Claude 请求失败，无直连回退。</p><label for="proxy-subscription">全量配置订阅 <span>仅供本机使用，请妥善保管</span></label><div class="proxy-subscription-row"><input id="proxy-subscription" readonly spellcheck="false" placeholder="启用本地节点后生成"><button type="button" class="secondary" id="copy-subscription" disabled>复制全量订阅</button></div><p class="field-hint">全量配置将互联网流量固定经 B。B 掉线后入口保持运行并拒绝请求，B 恢复后自动重连。导入完整配置可同时设置节点和 DNS。</p>
+        <div id="proxy-client-panel" hidden>
+          <h3>A · 本机与服务端</h3><div id="proxy-device-list"></div>
+          <p class="field-hint">启用本地节点后，将订阅作为完整配置导入 Mihomo / Clash Meta，保持 Clash TUN 运行。关闭指向本机 Clash 的系统代理和代理脚本。</p>
+          <div class="form-actions"><button type="button" class="primary" id="proxy-enable" disabled>启用本地 Clash 节点</button></div>
+          <label for="proxy-subscription">完整配置订阅 <span>仅供本机使用，请妥善保管</span></label><div class="proxy-subscription-row"><input id="proxy-subscription" readonly spellcheck="false" placeholder="启用本地节点后生成"><button type="button" class="secondary" id="copy-subscription" disabled>复制订阅地址</button></div>
+          <p class="field-hint">配置将互联网流量固定经 B。B 掉线后入口保持运行并拒绝请求，B 恢复后自动重连。导入完整配置可同时设置节点和 DNS。</p>
         </div><p class="field-hint" id="proxy-detail"></p>
       </section>
     </section>
