@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bridge · 私有设备桥接</title><link rel="stylesheet" href="/style.css"><script src="/app.js" type="module"></script></head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#connection"><span class="brand-icon">↗</span> bridge<span class="brand-dot">.</span></a>
+    <div class="space-label">WORKSPACE / 工作空间</div>
+    <nav aria-label="功能导航">
+      <button class="nav active" data-page="connection" aria-controls="connection" type="button"><span>◈</span> 设备与配对</button>
+      <button class="nav" data-page="api" aria-controls="api" type="button" disabled><span>⌘</span> 模型 API</button>
+      <button class="nav" data-page="proxy" aria-controls="proxy" type="button" disabled><span>⇄</span> 网络代理</button>
+      <button class="nav" data-page="activity" aria-controls="activity" type="button"><span>≡</span> 运行记录</button>
+    </nav>
+    <div class="sidebar-bottom"><button class="settings-link" data-page="settings" aria-controls="settings" type="button">⚙ 设置</button><div id="sidebar-identity">尚未选择身份</div><div class="version" id="app-version">EMBEDDED BRIDGE</div></div>
+  </aside>
+  <main>
+    <header><div class="breadcrumb">控制台 <span>/</span> <span id="breadcrumb-page">设备与配对</span></div><div class="header-actions"><span class="pill" id="mode">TAILSCALE MODE</span><button type="button" id="quit-client" class="text-button">退出客户端</button></div></header>
+    <section class="page-heading"><div><div class="eyebrow">PRIVATE DEVICES. CONNECTED.</div><h1 id="page-title">设备与配对</h1><p id="page-description">先确定本机身份，再连接私有网络并完成设备授权。</p></div><div class="status-label"><span class="small-dot" id="top-dot"></span><span id="top-status">正在连接本地服务</span></div></section>
+
+    <section id="connection" class="page-panel" aria-label="设备与配对">
+      <section class="card identity-card"><div class="card-heading"><div><span class="section-number">01</span><h2>选择本机身份</h2></div><span class="tiny-tag" id="identity-lock">尚未选择</span></div>
+        <div class="role-options"><button type="button" id="tab-client" class="role-option" aria-pressed="false" disabled><strong>A · 调用端</strong><span>连接一台 B，使用其模型服务或网络出口</span></button><button type="button" id="tab-host" class="role-option" aria-pressed="false" disabled><strong>B · 服务端</strong><span>为已配对的 A 提供模型服务或网络出口</span></button></div>
+        <p class="field-hint" id="identity-message">选择身份后才能连接私有网络。</p><p class="field-hint">连接中、已连接及临时掉线期间身份均锁定。主动退出私有网络后才能切换；切换身份将撤销原配对，需要重新授权。</p>
+      </section>
+      <section class="network-bar" aria-label="私有网络状态"><div><strong>连接私有网络</strong><p id="network-status">正在读取组网状态…</p><p class="network-note">两端登录同一 Tailscale 账号。退出私网保留登录身份，且不会自动撤除系统断线保护。</p><a id="network-auth-link" target="_blank" rel="noreferrer" hidden>在浏览器完成账号登录 ↗</a></div><div class="network-actions"><button type="button" class="primary" id="network-login" disabled>连接私有网络</button><button type="button" class="secondary" id="refresh-network" disabled>刷新设备</button><button type="button" class="secondary" id="network-disconnect" disabled>退出私有网络</button></div></section>
+      <section class="card devices-card"><div class="card-heading"><div><span class="section-number">02</span><h2>网络中的设备</h2></div><span class="subtle">本机固定在首位</span></div><div id="peer-list"><p class="empty">连接后显示本机及私有网络中的其他设备。</p></div><p class="field-hint" id="selected-peer">设备在线只表示私网可达，使用业务还需要配对授权。</p></section>
+      <section class="card setup-card"><div class="card-heading"><div><span class="section-number">03</span><h2 id="pairing-heading">设备配对</h2></div><button type="button" class="text-button" id="forget-pair" hidden>忘记配对</button></div>
+        <p class="field-hint" id="pairing-note">完成配对后，模型 API 与网络代理页面将分别解锁。</p>
+        <div class="network-actions pairing-actions"><button type="button" class="secondary" id="resume-pair" hidden>恢复配对连接</button><button type="button" class="secondary" id="pause-pair" hidden>暂停配对连接</button></div>
+        <p class="empty" id="choose-role-hint">请先选择身份并连接私有网络。</p>
+        <form id="client-form" hidden><label for="invitation">B 端配对码</label><textarea id="invitation" rows="4" placeholder="粘贴 p2pcc://pair/…" required spellcheck="false"></textarea><p class="field-hint">一台 A 只连接一台 B。配对独立于 Claude 配置；B 未启用模型服务时仍可提供网络共享。</p><button class="primary wide" type="submit">配对并连接 B <span>↗</span></button></form>
+        <form id="host-form" hidden><p class="card-intro">创建服务身份和配对码后，分别前往“模型 API”或“网络代理”开启所需业务。</p><details><summary>私网监听设置</summary><div class="two-cols"><div><label for="tailscale-ip">本机 Tailscale IPv4</label><select id="tailscale-ip"><option value="">请先连接私有网络</option></select></div><div><label for="bridge-port">桥接端口</label><input id="bridge-port" type="number" min="1" max="65535" value="3211" required></div></div></details><button class="primary wide" type="submit" id="create-pair">创建服务与配对码 <span>＋</span></button></form>
+        <div id="pairing-output" class="pairing-output" hidden><div class="pairing-title"><strong>将配对码交给 A 授权连接</strong><button type="button" class="text-button" id="copy-invite">复制</button></div><code id="pairing-code"></code><p>重新创建或忘记配对会撤销原授权；正常重启沿用原配对。请妥善保管配对码。</p></div>
+      </section>
+    </section>
+
+    <section id="api" class="page-panel" aria-label="Claude 模型 API" hidden>
+      <section class="card"><div class="card-heading"><div><h2 id="model-heading">Claude 模型服务</h2></div><span class="proxy-badge" id="model-state">尚未启用</span></div><p id="model-message" class="proxy-message" aria-live="polite">正在读取 Claude 状态…</p>
+        <div id="model-host-panel" hidden><p class="card-intro">B 使用本机已安装并登录的官方 Claude Code。保存配置后启用模型服务；停止模型服务不会关闭网络共享或撤销配对。</p>
+          <form id="model-form"><label for="claude-command">Claude 程序</label><div class="inline-field"><input id="claude-command" value="claude" required placeholder="claude 或程序完整路径"><button id="probe" type="button" class="secondary">检测 Claude</button></div><p class="field-hint" id="probe-result">请在 B 的官方 Claude Code 中完成登录；检测程序可用性不等于验证模型调用。</p><label for="workspace">Claude 运行目录</label><input id="workspace" required placeholder="例如 E:\projects\my-app"><p class="field-hint">主模型模式禁用 B 的本地工具。该目录用于启动 Claude；A 的 Harness 在 A 执行自己的工具与文件操作。</p>
+            <details><summary>执行限制与兼容任务配置</summary><div class="two-cols"><div><label for="model-timeout">执行超时（秒）</label><input id="model-timeout" type="number" min="1" max="3600" value="600" required></div><div><label for="model-turns">Claude 内部轮数上限</label><input id="model-turns" type="number" min="3" max="200" value="30" required></div></div><label for="profile">旧任务接口在 B 的工具权限</label><select id="profile"><option value="read">读取 · Read / Glob / Grep</option><option value="edit">编辑 · 增加 Edit / Write</option><option value="develop">开发 · 增加 Bash 命令</option></select><p class="field-hint">仅影响兼容的 /v1/run；主模型 API 始终禁用 B 的本地工具。模型结构化输出至少需要 3 轮。</p></details>
+            <div class="form-actions"><button class="primary" type="submit">保存并启用 Claude 服务</button><button class="secondary" id="model-disable" type="button">停止 Claude 服务</button></div>
+          </form>
+        </div>
+        <div id="model-client-panel" hidden><p class="card-intro">将以下信息填写到 A 本机 Harness 的 OpenAI Chat Completions 提供商。远端 Claude 是否可用由 B 单独控制。</p><div class="endpoint"><span>BASE</span><code id="api-base-url"></code><button type="button" class="text-button" id="copy-url">复制 Base URL</button></div><div class="token-row"><div><label>本机 API Key</label><code id="api-token">••••••••••••••••••••••••</code></div><button type="button" class="secondary" id="copy-token">复制 API Key</button></div><label for="model-id">模型 ID</label><select id="model-id"><option value="claude-code">claude-code · B 的默认模型</option><option value="claude-code-sonnet">claude-code-sonnet</option><option value="claude-code-opus">claude-code-opus</option></select><p class="field-hint">API Key 仅用于本机桥接鉴权，不能替代 B 的 Claude 登录。支持 GET /v1/models 与 POST /v1/chat/completions；工具在 A 执行。</p><details><summary>模型调用示例</summary><div class="code-top"><span>cURL · 模型对话</span><button type="button" id="copy-example">复制示例</button></div><pre id="api-example"></pre></details>
+          <form id="model-test-form"><label for="model-test-prompt">测试远端 Claude</label><div class="test-input-row"><input id="model-test-prompt" value="请用一句话介绍你能提供什么帮助。" required><button type="submit" class="primary" id="model-test-submit">发送测试</button><button type="button" class="secondary" id="model-test-cancel" hidden>取消</button></div></form><pre class="test-output" id="model-test-output">B 开启 Claude 服务后，可在这里验证模型调用。</pre><p class="field-hint">回复按完整一轮返回；取消或断线不会自动重发请求。</p>
+        </div>
+      </section>
+    </section>
+
+    <section id="proxy" class="page-panel" aria-label="网络代理" hidden>
+      <section class="card proxy-card"><div class="card-heading"><div><h2 id="proxy-heading">网络代理</h2></div><span class="proxy-badge" id="proxy-state">正在读取状态</span></div><p class="proxy-message" id="proxy-message" role="status" aria-live="polite">正在读取代理状态…</p>
+        <div id="proxy-host-panel" hidden><h3>B · 共享本机网络</h3><p class="field-hint">允许已配对的 A 使用本机网络出口，与 Claude 服务分别控制。私网中其他在线节点不会自动获得共享权限。</p><button type="button" class="primary" id="proxy-sharing" disabled>开启共享本机网络</button><h3 class="list-heading">已配对的调用端</h3><div id="proxy-clients"><p class="empty">尚无调用端连接。</p></div></div>
+        <div id="proxy-client-panel" hidden><h3>A · 本机与服务端</h3><div id="proxy-device-list"></div><p class="field-hint">启用本地节点后，将订阅作为完整配置导入 Mihomo / Clash Meta，只开启 TUN。关闭指向本机 Clash 的系统代理和代理脚本。</p><button type="button" class="primary" id="proxy-enable" disabled>启用本地 Clash 节点</button><label for="proxy-subscription">完整配置订阅 <span>仅供本机使用，请妥善保管</span></label><div class="proxy-subscription-row"><input id="proxy-subscription" readonly spellcheck="false" placeholder="启用本地节点后生成"><button type="button" class="secondary" id="copy-subscription" disabled>复制订阅地址</button></div><p class="field-hint">B 掉线后入口保持运行并拒绝请求，B 恢复后自动重连。只导入节点列表不能保证 DNS 和断线保护。</p>
+          <div class="proxy-guard"><h3>本机系统断线保护</h3><p id="proxy-guard-state" aria-live="polite">正在读取保护状态…</p><p class="field-hint">先开启 ClaudeBridgeTun，再启用系统保护。以下操作需要 Windows 管理员授权。保护生效后，即使 Clash 或桥接客户端退出也保持阻断。</p><div class="proxy-guard-actions"><button type="button" class="secondary" id="proxy-guard" disabled>启用 / 刷新系统保护（UAC）</button><button type="button" class="secondary" id="proxy-guard-verify" disabled>检查系统保护（UAC）</button><button type="button" class="secondary" id="proxy-guard-disable" disabled>关闭保护并恢复直连（UAC）</button></div></div>
+        </div><p class="field-hint" id="proxy-detail"></p>
+      </section>
+    </section>
+
+    <section id="activity" class="page-panel" aria-label="运行记录" hidden><section class="card"><div class="card-heading"><div><h2>最近的运行记录</h2></div></div><div id="logs" class="logs"><p class="empty">等待设备连接，记录会显示在这里。</p></div></section></section>
+    <section id="settings" class="page-panel" aria-label="设置" hidden>
+      <section class="card"><div class="card-heading"><div><h2>后台运行</h2></div></div><p class="card-intro">关闭浏览器页面后，本地服务继续运行。桌面版的“收起到托盘”和“Windows 登录后自动在后台运行”位于主窗口左下角的“设置”。</p><a class="secondary" href="/licenses" target="_blank" rel="noreferrer">开源许可</a></section>
+      <section class="card settings-guard"><div class="card-heading"><div><h2>本机断线保护恢复</h2></div></div><p id="settings-guard-state" class="proxy-message" aria-live="polite">正在读取保护状态…</p><p class="field-hint">此入口始终可用。退出私网、忘记配对或切换身份均不会自动撤除持久保护；明确关闭保护后，本机才恢复直连。状态未验证时，请检查或明确关闭。</p><div class="proxy-guard-actions"><button type="button" class="secondary" id="settings-guard-verify" disabled>检查系统保护（UAC）</button><button type="button" class="secondary" id="settings-guard-disable" disabled>关闭保护并恢复直连（UAC）</button></div></section>
+    </section>
+    <footer>BRIDGE / 私有设备之间的一座桥 <span>Tailscale · 模型服务 · 网络共享</span></footer>
+  </main><div id="toast" class="toast" role="status" hidden></div>
+</body></html>

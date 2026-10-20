@@ -1,0 +1,127 @@
+package netcore
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"sync"
+	"time"
+)
+
+type request struct {
+	ID     uint64          `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+type response struct {
+	ID     uint64 `json:"id"`
+	Result any    `json:"result,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Private stdio RPC: no control port, auth keys, or login URLs on command lines.
+func Run(input io.Reader, output io.Writer) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	encoder := json.NewEncoder(output)
+	var writeMu sync.Mutex
+	write := func(r response) { writeMu.Lock(); defer writeMu.Unlock(); encoder.Encode(r) }
+	var manager *Manager
+	var pending sync.WaitGroup
+	defer func() {
+		cancel()
+		if manager != nil {
+			manager.Close()
+		}
+		pending.Wait()
+	}()
+	for scanner.Scan() {
+		var req request
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			return err
+		}
+		if req.Method == "init" {
+			if manager != nil {
+				write(response{ID: req.ID, Error: "already initialized"})
+				continue
+			}
+			var config Config
+			err := json.Unmarshal(req.Params, &config)
+			if err == nil {
+				manager, err = New(config)
+			}
+			if err != nil {
+				write(response{ID: req.ID, Error: err.Error()})
+			} else {
+				write(response{ID: req.ID, Result: map[string]bool{"ready": true}})
+			}
+			continue
+		}
+		if manager == nil {
+			write(response{ID: req.ID, Error: "initialize network core first"})
+			continue
+		}
+		pending.Add(1)
+		go func(req request) {
+			defer pending.Done()
+			callCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+			defer stop()
+			var result any
+			var err error
+			var params struct {
+				Port           int    `json:"port"`
+				TargetPort     int    `json:"targetPort"`
+				Host           string `json:"host"`
+				ID             string `json:"id"`
+				Data           string `json:"data"`
+				MaxConnections int    `json:"maxConnections"`
+			}
+			if len(req.Params) > 0 {
+				err = json.Unmarshal(req.Params, &params)
+			}
+			if err == nil {
+				switch req.Method {
+				case "status":
+					result, err = manager.Status(callCtx)
+				case "login":
+					result, err = manager.Login(callCtx)
+				case "connect":
+					result, err = manager.Connect(callCtx)
+				case "disconnect":
+					result, err = manager.Disconnect(callCtx)
+				case "protect", "unprotect":
+					var input, output []byte
+					input, err = base64.StdEncoding.DecodeString(params.Data)
+					if err == nil {
+						output, err = protectState(input, req.Method == "unprotect")
+						clear(input)
+					}
+					if err == nil {
+						result = map[string]string{"data": base64.StdEncoding.EncodeToString(output)}
+						clear(output)
+					}
+				case "listen":
+					result, err = manager.Listen(callCtx, params.Port, params.TargetPort, params.MaxConnections)
+				case "dial":
+					result, err = manager.Dial(callCtx, params.Host, params.Port, params.MaxConnections)
+				case "release":
+					manager.Release(params.ID)
+					result = map[string]bool{"released": true}
+				default:
+					err = errors.New("unknown network method")
+				}
+			}
+			if err != nil {
+				write(response{ID: req.ID, Error: err.Error()})
+			} else {
+				write(response{ID: req.ID, Result: result})
+			}
+		}(req)
+	}
+	return scanner.Err()
+}

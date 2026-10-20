@@ -1,0 +1,12 @@
+node_modules/
+.bridge/
+.env
+*.log
+coverage/
+__pycache__/
+*.pyc
+release/
+.tools/
+.cache/
+bin/
+native/cmd/bridge/runtime.zip

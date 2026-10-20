@@ -1,0 +1,158 @@
+//go:build windows
+
+package netcore
+
+import (
+	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// These tests never open the filtering engine, launch UAC or add policy rules.
+func TestGuardWindowsX64ABI(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("x64 ABI")
+	}
+	if unsafe.Sizeof(guardFilter{}) != 200 || unsafe.Offsetof(guardFilter{}.Action) != 128 || unsafe.Offsetof(guardFilter{}.Context) != 152 || unsafe.Offsetof(guardFilter{}.EffectiveWeight) != 184 {
+		t.Fatal("FWPM_FILTER0 layout mismatch")
+	}
+	if unsafe.Sizeof(guardSublayer{}) != 72 || unsafe.Offsetof(guardSublayer{}.Weight) != 64 {
+		t.Fatal("FWPM_SUBLAYER0 layout mismatch")
+	}
+	if unsafe.Sizeof(guardCondition{}) != 40 || unsafe.Offsetof(guardCondition{}.Value) != 24 {
+		t.Fatal("FWPM_FILTER_CONDITION0 layout mismatch")
+	}
+	if unsafe.Sizeof(guardShellInfo{}) != 112 || unsafe.Offsetof(guardShellInfo{}.Process) != 104 {
+		t.Fatal("SHELLEXECUTEINFOW layout mismatch")
+	}
+}
+
+func TestGuardElevationHasNoPathOrShellInput(t *testing.T) {
+	if _, err := guardElevatedParameters("run", "profile-a"); err == nil {
+		t.Fatal("arbitrary operation should not request UAC")
+	}
+	if _, err := guardElevatedParameters("enable", "a\";whoami"); err == nil {
+		t.Fatal("unsafe profile")
+	}
+	if value, err := guardElevatedParameters("enable", "profile-a"); err != nil || value != "--network-guard enable --guard-id profile-a" {
+		t.Fatal(value, err)
+	}
+	if value, err := guardElevatedParameters("status", "profile-a"); err != nil || value != "--network-guard status --guard-id profile-a" {
+		t.Fatal(value, err)
+	}
+	for _, value := range []string{"", "../path", "a;whoami", "ffffffff"} {
+		if _, err := guardReplyName(value); err == nil {
+			t.Fatal("unsafe reply pipe identifier")
+		}
+	}
+}
+
+func TestGuardFilterUsesMaskEqualityAndDetectsTampering(t *testing.T) {
+	appBytes := []byte{1, 2, 3, 0}
+	app := guardBlob{Size: uint32(len(appBytes)), Data: &appBytes[0]}
+	for _, rule := range guardRules() {
+		built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, rule, &app, 0x123400005678)
+		if !guardEqualFilter(&built.filter, &built.filter) {
+			t.Fatal("own filter did not verify", rule.id)
+		}
+		if built.filter.Provider != nil || built.filter.Flags != guardPersistent {
+			t.Fatal("policy must persist without a service-dependent provider")
+		}
+		if built.filter.ConditionCount != 0 {
+			conditions := unsafe.Slice(built.filter.Conditions, int(built.filter.ConditionCount))
+			for _, condition := range conditions {
+				if condition.Match != 0 && condition.Match != 6 {
+					t.Fatal("unsupported condition comparison")
+				}
+			}
+		}
+		changed := built.filter
+		changed.Flags |= guardDisabled
+		if guardEqualFilter(&changed, &built.filter) {
+			t.Fatal("disabled filter was accepted")
+		}
+		changed = built.filter
+		changed.Action.Type = 0
+		if guardEqualFilter(&changed, &built.filter) {
+			t.Fatal("changed action was accepted")
+		}
+	}
+}
+
+func TestGuardPermitsOriginalTargetsOnlyOnExactTunLUID(t *testing.T) {
+	const luid = uint64(0x123400005678)
+	seen := map[windows.GUID]bool{}
+	for _, rule := range guardRules() {
+		if !rule.tun {
+			continue
+		}
+		built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, rule, nil, luid)
+		if built.filter.ConditionCount != 1 {
+			t.Fatal("TUN permit must be conditional")
+		}
+		condition := *built.filter.Conditions
+		if condition.Key != guardCondInterface || condition.Match != 0 || condition.Value.Type != guardUint64 || *(*uint64)(unsafe.Pointer(condition.Value.Value)) != luid {
+			t.Fatal("TUN permit could allow a physical interface")
+		}
+		if built.filter.Action.Type != guardPermit || rule.weight <= 800 || rule.weight >= 900 {
+			t.Fatal("TUN traffic or DNS would be blocked before entering the tunnel")
+		}
+		seen[built.filter.Layer] = true
+	}
+	if len(seen) != 4 {
+		t.Fatal("TUN exceptions must cover inbound/outbound IPv4/IPv6")
+	}
+}
+
+func TestGuardAdministratorReplyCannotImplyAnUnverifiedState(t *testing.T) {
+	valid := []byte(`{"supported":true,"profileId":"profile-a","enabled":true,"state":"enabled","filterCount":46,"expectedFilters":46}`)
+	if result, err := guardDecodeReply(valid, "profile-a"); err != nil || !result.Enabled {
+		t.Fatal(result, err)
+	}
+	if _, err := guardDecodeReply(valid, "other-profile"); err == nil {
+		t.Fatal("wrong-profile reply accepted")
+	}
+	for _, reply := range [][]byte{[]byte(`{"supported":true,"profileId":"other","enabled":false,"state":"disabled"}`), []byte(`{"supported":true,"profileId":"profile-a","enabled":true,"state":"disabled"}`), []byte(`{"supported":true,"profileId":"profile-a","enabled":true,"state":"enabled","filterCount":45,"expectedFilters":46}`), []byte(`{"error":"access denied","status":{"profileId":"profile-a","state":"unknown"}}`), []byte(`invalid`)} {
+		if _, err := guardDecodeReply(reply, "profile-a"); err == nil {
+			t.Fatal("unverified or wrong-profile reply accepted")
+		}
+	}
+}
+
+func TestGuardReplyPipeReturnsRealLocalClientPID(t *testing.T) {
+	pipe, nonce, err := guardCreateReplyPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(pipe)
+	connectErr := windows.ConnectNamedPipe(pipe, nil)
+	if connectErr != nil && connectErr != windows.ERROR_PIPE_LISTENING && connectErr != windows.ERROR_PIPE_CONNECTED {
+		t.Fatal(connectErr)
+	}
+	name, _ := guardReplyName(nonce)
+	pipeName, _ := windows.UTF16PtrFromString(name)
+	client, err := windows.CreateFile(pipeName, windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(client)
+	var pid uint32
+	if err := windows.GetNamedPipeClientProcessId(pipe, &pid); err != nil || pid != windows.GetCurrentProcessId() {
+		t.Fatal("local client process identity was not verified", pid, err)
+	}
+	payload := []byte(`{"supported":true,"profileId":"profile-a","state":"disabled","enabled":false,"filterCount":0,"expectedFilters":46}`)
+	var written uint32
+	if err := windows.WriteFile(client, payload, &written, nil); err != nil || written != uint32(len(payload)) {
+		t.Fatal(written, err)
+	}
+	buffer := make([]byte, 4096)
+	var done uint32
+	err = windows.ReadFile(pipe, buffer, &done, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := guardDecodeReply(buffer[:done], "profile-a"); err != nil || result.State != "disabled" {
+		t.Fatal(result, err)
+	}
+}

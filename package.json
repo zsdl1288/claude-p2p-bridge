@@ -1,0 +1,20 @@
+{
+  "name": "claude-p2p-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Native C++ Windows desktop and tray client with embedded Tailscale and a local Claude Code API.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "demo": "node scripts/demo.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "check": "node scripts/check.js",
+    "build:windows": "python scripts/build_windows.py"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  }
+}
