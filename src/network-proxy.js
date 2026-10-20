@@ -9,6 +9,8 @@ import { rejectUpgrade } from './http-upgrade.js';
 const DATA = 1, FIN = 2, DATAGRAM = 3;
 const MAX_FRAME = 128 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
 const FAILURE = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+const CAPACITY_CODE = 'PROXY_CAPACITY';
+const CAPACITY_MESSAGE = '代理连接数已达上限，请等待空闲连接释放后重试';
 
 function ipv6Bytes(host) {
   let text = host.toLowerCase();
@@ -83,7 +85,7 @@ function udpKey(host, port) { return `${net.isIP(host) === 6 ? ipv6Bytes(host).t
 /** Independent proxy sockets never use the model channel or its request queue. */
 export class NetworkProxy extends EventEmitter {
   constructor({ bridge, listenPort = 0, username = randomId(12), password = randomId(24), allowPrivateTargets = false,
-    maxConnections = 128, maxPerSession = 64, maxUdpTargets = 128, bytesPerSecond = 32 * 1024 * 1024,
+    maxConnections = 384, maxPerSession = 256, maxUdpTargets = 128, bytesPerSecond = 32 * 1024 * 1024,
     handshakeMs = 10000, heartbeatMs = 10000, udpIdleMs = 60000, resolve = lookup } = {}) {
     super();
     if (!bridge) throw new Error('缺少桥接实例');
@@ -92,7 +94,7 @@ export class NetworkProxy extends EventEmitter {
     Object.assign(this, { bridge, listenPort, username, password, allowPrivateTargets, maxConnections, maxPerSession, maxUdpTargets, bytesPerSecond, handshakeMs, heartbeatMs, udpIdleMs, resolve });
     this.enabled = false; this.sharing = false; this.flows = new Set(); this.localSockets = new Set();
     this.sessionBuckets = new WeakMap();
-    this.uploadBytes = 0; this.downloadBytes = 0; this.error = null;
+    this.uploadBytes = 0; this.downloadBytes = 0; this.error = null; this.lastError = null;
     this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME, perMessageDeflate: false });
     this.onPeerState = () => this.prune();
     this.bridge.on?.('state', this.onPeerState);
@@ -127,10 +129,23 @@ export class NetworkProxy extends EventEmitter {
     return { enabled: this.enabled, sharing: this.sharing, listening: Boolean(this.server?.listening), listenPort: this.port || this.listenPort,
       username: this.username, password: this.password, online: available,
       blocked: Boolean(this.enabled && !available), connections: this.flows.size,
+      connectionLimit: peer?.role === 'client' ? Math.min(this.maxConnections, this.maxPerSession) : this.maxConnections,
+      sessionConnectionLimit: this.maxPerSession, lastError: this.lastError,
       uploadBytes: this.uploadBytes, downloadBytes: this.downloadBytes, clients, error: this.error };
+  }
+  capacityError() {
+    const first = this.lastError?.code !== CAPACITY_CODE;
+    this.lastError = { code: CAPACITY_CODE, message: CAPACITY_MESSAGE, at: new Date().toISOString() };
+    if (first) this.bridge.log?.(CAPACITY_MESSAGE);
+    this.emit('state');
+    return Object.assign(new Error(CAPACITY_MESSAGE), { code: CAPACITY_CODE });
+  }
+  clearCapacityError() {
+    if (this.lastError) { this.lastError = null; this.emit('state'); }
   }
   configure({ enabled = this.enabled, sharing = this.sharing } = {}) {
     if (typeof enabled !== 'boolean' || typeof sharing !== 'boolean') throw new Error('网络共享开关无效');
+    if (enabled !== this.enabled || sharing !== this.sharing) this.lastError = null;
     this.enabled = enabled; this.sharing = sharing; this.prune(); this.emit('state'); return this.status();
   }
   peerChanged() { this.prune(); this.emit('state'); }
@@ -206,7 +221,9 @@ export class NetworkProxy extends EventEmitter {
     if (this.closed || peer !== this.bridge.peer || peer?.role !== 'host' || req.url !== `/network/${peer.pairing.room}` || req.headers.origin ||
       !equalSecret(req.headers.authorization, `Bearer ${digest(`p2pcc-network-v1:${peer.pairing.room}:${peer.pairing.secret}`)}`)) { rejectUpgrade(socket, 401, 'Unauthorized'); return true; }
     if (!this.sharing) { rejectUpgrade(socket, 403, 'Sharing disabled'); return true; }
-    if (this.flows.size >= this.maxConnections) { rejectUpgrade(socket, 429, 'Connection limit'); return true; }
+    // The embedded listener permits 512 transports, including control/model
+    // channels. Keep the proxy's global bound below that transport ceiling.
+    if (this.flows.size >= this.maxConnections) { this.capacityError(); rejectUpgrade(socket, 429, 'Connection limit'); return true; }
     // Reserve the slot before asynchronous authentication and destination lookup.
     this.wss.handleUpgrade(req, socket, head, (ws) => this.acceptRemote(ws, peer)); return true;
   }
@@ -221,15 +238,17 @@ export class NetworkProxy extends EventEmitter {
         const msg = JSON.parse(raw.toString());
         const connection = [...peer.connections].find((candidate) => peer.isConnected(candidate) && equalSecret(msg.session, candidate.session));
         if (msg.v !== 1 || !connection || !['tcp', 'udp'].includes(msg.command)) throw new Error('网络代理身份验证失败');
-        if ([...this.flows].filter((item) => item !== flow && item.connection === connection).length >= this.maxPerSession) throw new Error('代理连接数超限');
+        authenticated = true;
+        if ([...this.flows].filter((item) => item !== flow && item.connection === connection).length >= this.maxPerSession) throw this.capacityError();
         flow.connection = connection; flow.session = connection.session; flow.pending = false;
         if (!this.valid(flow)) throw new Error('网络共享已停用');
-        authenticated = true;
         if (msg.command === 'tcp') await this.hostTcp(flow, msg);
         else await this.hostUdp(flow);
+        this.clearCapacityError();
         clearTimeout(deadline);
       } catch (error) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ok: false, error: authenticated ? error.message : '代理授权失败' }), () => flow.close());
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ok: false, error: authenticated ? error.message : '代理授权失败',
+          ...(authenticated && error.code === CAPACITY_CODE ? { code: CAPACITY_CODE } : {}) }), () => flow.close());
         else flow.close();
       }
     });
@@ -319,7 +338,8 @@ export class NetworkProxy extends EventEmitter {
     flow.ws.send(JSON.stringify({ ok: true }));
   }
   acceptLocal(socket) {
-    if (this.closed || !this.enabled || this.bridge.remoteSharing === false || this.bridge.peer?.role !== 'client' || !this.bridge.peer.state.online || this.localSockets.size >= this.maxConnections) return socket.destroy();
+    if (this.closed || !this.enabled || this.bridge.remoteSharing === false || this.bridge.peer?.role !== 'client' || !this.bridge.peer.state.online) return socket.destroy();
+    if (this.localSockets.size >= this.maxConnections) { this.capacityError(); return socket.destroy(); }
     this.localSockets.add(socket);
     socket.on('error', () => {}); socket.on('close', () => this.localSockets.delete(socket));
     let buffer = Buffer.alloc(0), phase = 'greeting';
@@ -367,7 +387,8 @@ export class NetworkProxy extends EventEmitter {
   }
   async openClient(socket, command, address, rest) {
     const peer = this.bridge.peer, connection = peer?.clientConnection;
-    if (!this.enabled || this.bridge.remoteSharing === false || peer?.role !== 'client' || !peer.isConnected(connection) || this.flows.size >= this.maxConnections) throw new Error('B 未连接');
+    if (!this.enabled || this.bridge.remoteSharing === false || peer?.role !== 'client' || !peer.isConnected(connection)) throw new Error('B 未连接');
+    if (this.flows.size >= Math.min(this.maxConnections, this.maxPerSession)) throw this.capacityError();
     const resource = peer.dialResource;
     const host = resource ? '127.0.0.1' : peer.pairing.host, port = resource?.port || peer.pairing.port;
     const ws = new WebSocket(`ws://${net.isIP(host) === 6 ? `[${host}]` : host}:${port}/network/${peer.pairing.room}`, {
@@ -390,11 +411,20 @@ export class NetworkProxy extends EventEmitter {
         const timer = setTimeout(() => reject(new Error('B 代理握手超时')), this.handshakeMs); timer.unref(); flow.timers.add(timer);
         const fail = () => { clearTimeout(timer); reject(new Error('B 代理不可用')); };
         ws.once('error', fail); ws.once('close', fail);
+        ws.once('unexpected-response', (_request, response) => {
+          response.resume(); clearTimeout(timer);
+          reject(response.statusCode === 429 ? this.capacityError() : new Error('B 拒绝代理连接'));
+        });
         ws.once('open', () => { if (!this.valid(flow)) return fail(); ws.send(JSON.stringify({ v: 1, session: flow.session, command, host: address.host, port: address.port })); });
         ws.once('message', (raw, binary) => {
           waitingAck = false;
           clearTimeout(timer); ws.off('error', fail); ws.off('close', fail);
-          try { if (binary || !JSON.parse(raw.toString()).ok || !this.valid(flow)) return reject(new Error('B 拒绝代理')); resolve(); } catch { reject(new Error('B 握手无效')); }
+          try {
+            if (binary || !this.valid(flow)) return reject(new Error('B 握手无效'));
+            const reply = JSON.parse(raw.toString());
+            if (reply.ok !== true) return reject(reply.code === CAPACITY_CODE ? this.capacityError() : new Error('B 拒绝代理'));
+            this.clearCapacityError(); resolve();
+          } catch { reject(new Error('B 握手无效')); }
         });
       });
       if (command === 'tcp') {

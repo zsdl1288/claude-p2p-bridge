@@ -105,6 +105,61 @@ test('B sharing control broadcasts truthfully to A and model access remains inde
   assert.equal((await a.request('/api/proxy', { enabled: 'yes' })).status, 400);
 });
 
+test('capacity rejections remain visible through both status APIs without blocking an online node', { timeout: 15000 }, async (t) => {
+  const fixture = await paired(t), { host, client, a, b } = fixture;
+  host.networkProxy.maxConnections = 3; host.networkProxy.maxPerSession = 1;
+  client.networkProxy.maxConnections = 4; client.networkProxy.maxPerSession = 2;
+  await enable(fixture); await until(() => client.remoteSharing === true);
+  const targets = new Set();
+  const target = net.createServer((socket) => {
+    targets.add(socket); socket.on('error', () => {}); socket.on('close', () => targets.delete(socket));
+  });
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { for (const socket of targets) socket.destroy(); await new Promise((resolve) => target.close(resolve)); });
+  const read = async (socket, count) => {
+    for (;;) {
+      const bytes = socket.read(count);
+      if (bytes) return bytes;
+      if (socket.destroyed || socket.readableEnded) throw new Error('SOCKS connection closed before reply');
+      await once(socket, 'readable', { signal: AbortSignal.timeout(5000) });
+    }
+  };
+  const socks = async () => {
+    const proxy = client.networkProxy;
+    const socket = net.createConnection({ host: '127.0.0.1', port: proxy.port });
+    socket.on('error', () => {}); t.after(() => socket.destroy()); await once(socket, 'connect');
+    socket.write(Buffer.from([5, 1, 2])); assert.deepEqual(await read(socket, 2), Buffer.from([5, 2]));
+    const username = Buffer.from(proxy.username), password = Buffer.from(proxy.password);
+    socket.write(Buffer.concat([Buffer.from([1, username.length]), username, Buffer.from([password.length]), password]));
+    assert.deepEqual(await read(socket, 2), Buffer.from([1, 0]));
+    const port = target.address().port;
+    socket.write(Buffer.from([5, 1, 0, 1, 127, 0, 0, 1, port >> 8, port & 255]));
+    return { socket, reply: await read(socket, 10) };
+  };
+  const first = await socks(); assert.equal(first.reply[1], 0);
+  const rejected = await socks(); assert.equal(rejected.reply[1], 1);
+  const capacityMessage = '代理连接数已达上限，请等待空闲连接释放后重试';
+  const subscription = a.app.proxy.status().subscriptionUrl;
+  for (const route of ['/api/status', '/api/proxy']) {
+    const body = await (await a.request(route)).json(), proxy = route === '/api/status' ? body.proxy : body;
+    assert.equal(proxy.connectionLimit, 2); assert.equal(proxy.sessionConnectionLimit, 2);
+    assert.equal(proxy.lastError.code, 'PROXY_CAPACITY'); assert.equal(proxy.lastError.message, capacityMessage);
+    assert.ok(Number.isFinite(Date.parse(proxy.lastError.at)));
+    assert.equal(proxy.message, capacityMessage); assert.equal(proxy.online, true); assert.equal(proxy.state, 'ready');
+    assert.equal(proxy.enabled, true); assert.equal(proxy.sharing, true); assert.equal(proxy.subscriptionUrl, subscription);
+  }
+  const hostStatus = await (await b.request('/api/proxy')).json();
+  assert.equal(hostStatus.connectionLimit, 3); assert.equal(hostStatus.sessionConnectionLimit, 1);
+  assert.equal((await fetch(subscription)).status, 200);
+  first.socket.resume(); first.socket.end(); await until(() => host.networkProxy.flows.size === 0 && client.networkProxy.flows.size === 0);
+  const recovered = await socks(); assert.equal(recovered.reply[1], 0);
+  for (const route of ['/api/status', '/api/proxy']) {
+    const body = await (await a.request(route)).json(), proxy = route === '/api/status' ? body.proxy : body;
+    assert.equal(proxy.lastError, null); assert.equal(proxy.state, 'ready'); assert.equal(proxy.online, true);
+    assert.match(proxy.message, /B 出口已连接/); assert.notEqual(proxy.message, capacityMessage);
+  }
+});
+
 test('B outage retains importable subscription, blocks local node and reconnects with a fresh session', { timeout: 15000 }, async (t) => {
   const fixture = await paired(t), { host, client, a, hostInput } = fixture; await enable(fixture);
   const subscription = a.app.proxy.status().subscriptionUrl, pairing = { ...host.peer.pairing }, session = client.peer.session;

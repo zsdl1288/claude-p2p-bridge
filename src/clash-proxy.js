@@ -103,8 +103,10 @@ export class ClashProxy {
     else if (enabled) { phase = online ? 'ready' : 'blocked'; message = online ? 'B 出口已连接；请在 Clash 导入完整配置并开启 TUN。' : this.bridge.remoteSharing === false ? 'B 未开启网络共享，代理流量已阻断。' : 'B 已断开或正在恢复，代理流量已阻断，等待自动重连。'; }
     else if (role === 'client') message = '启用本地节点后，可将完整配置订阅导入 Mihomo / Clash Meta 客户端。';
     if (this.error) { phase = enabled ? 'blocked' : 'disabled'; message = this.error; }
+    if (online && phase === 'ready' && state.lastError?.code === 'PROXY_CAPACITY') message = '代理连接数已达上限，请等待空闲连接释放后重试';
     return { enabled, sharing, online, state: phase, message, port: state.listenPort,
       connections: state.connections, uploadBytes: state.uploadBytes, downloadBytes: state.downloadBytes,
+      connectionLimit: state.connectionLimit, sessionConnectionLimit: state.sessionConnectionLimit, lastError: state.lastError || null,
       subscriptionUrl: enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}/config.yaml` : '',
       clients: state.clients || [], devices: this.devices(state.clients || []), guard: this.guardState };
   }

@@ -530,7 +530,10 @@ class Application {
         std::wstring state = host ? (sharing ? L"本机网络共享已开启" : L"本机网络共享未开启") : phase == "ready" && proxy.value("online", false) ? L"B 出口已连接" : phase == "blocked" ? L"B 不可用 · 代理请求已阻断" : phase == "waiting" ? L"等待 B · 自动重连中" : L"代理未启用";
         Text(proxyMessage_, state + L"\r\n" + Wide(proxy.value("message", "")));
         const std::wstring endpoint = host ? L"B 网络共享" : L"A → B 独立代理连接";
-        Text(proxyDetails_, endpoint + L" · 活跃连接 " + std::to_wstring(proxy.value("connections", 0)) + (sharing ? L" · B 共享已开启" : L" · B 共享已关闭"));
+        std::wstring connections = std::to_wstring(proxy.value("connections", 0));
+        if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() > 0)
+            connections += L" / " + std::to_wstring(proxy["connectionLimit"].get<int>());
+        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + (sharing ? L" · B 共享已开启" : L" · B 共享已关闭"));
         Text(PROXY_ENABLE, proxy.value("enabled", false) ? L"关闭本地 Clash 节点" : L"启用本地 Clash 节点");
         Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 A 使用本机网络");
         auto subscription = proxy.value("subscriptionUrl", "");

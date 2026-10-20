@@ -280,7 +280,8 @@ function renderProxy(proxy = {}, ui = state()) {
   const unavailable = actionBusy || proxyBusy || !localAvailable || !guard.supported;
   $('proxy-guard').disabled = unavailable || ui.role !== 'client' || !ui.proxy || !proxy.enabled;
   for (const id of ['proxy-guard-verify', 'proxy-guard-disable', 'settings-guard-verify', 'settings-guard-disable']) $(id).disabled = unavailable;
-  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${proxy.connections || 0} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
+  const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : ''}`;
+  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
 }
 async function proxyAction(route, body) {
   if (actionBusy || proxyBusy || !localAvailable) return;
