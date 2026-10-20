@@ -22,6 +22,8 @@ engine = root / "bin/bridge-engine.exe"
 temporary = TemporaryTestDirectory("desktop-smoke-")
 directory = temporary.path
 desktop = None
+desktop_namespace = "smoke-" + os.urandom(12).hex()
+desktop_class = "ClaudeBridge.Desktop.Test." + desktop_namespace
 processes = []
 clients = []
 model_urls = {}
@@ -35,6 +37,86 @@ kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
 kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 kernel32.CloseHandle.restype = wintypes.BOOL
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+window_callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = (window_callback, wintypes.LPARAM)
+user32.EnumWindows.restype = wintypes.BOOL
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.GetDlgItem.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.GetDlgItem.restype = wintypes.HWND
+for name in ("IsWindow", "IsWindowEnabled", "IsWindowVisible"):
+    getattr(user32, name).argtypes = (wintypes.HWND,)
+    getattr(user32, name).restype = wintypes.BOOL
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.SendMessageTimeoutW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                      wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t))
+user32.SendMessageTimeoutW.restype = ctypes.c_size_t
+
+
+def fixture_window(process, class_name):
+    found = []
+
+    @window_callback
+    def visit(window, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == process.pid:
+            name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(window, name, len(name))
+            if name.value == class_name:
+                found.append(window)
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found[0] if found else None
+
+
+def owned_fixture_window(process, window):
+    owner = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+    assert process in processes and process.poll() is None and user32.IsWindow(window) and owner.value == process.pid, "Refusing to control a window outside this live test fixture"
+    return window
+
+
+def wait_ui(process, read, description):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        assert process.poll() is None, f"Fixture exited while waiting for {description}: {process.returncode}"
+        value = read()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise TimeoutError(description)
+
+
+def fixture_control(process, window, control_id):
+    child = user32.GetDlgItem(owned_fixture_window(process, window), control_id)
+    return owned_fixture_window(process, child)
+
+
+def fixture_message(process, window, message, wparam=0, lparam=0):
+    result = ctypes.c_size_t()
+    if not user32.SendMessageTimeoutW(owned_fixture_window(process, window), message, wparam, lparam, 2, 2000, ctypes.byref(result)):
+        raise RuntimeError("Fixture window did not respond within two seconds")
+    return result.value
+
+
+def click_fixture(process, window, control_id):
+    child = fixture_control(process, window, control_id)
+    assert user32.IsWindowVisible(child) and user32.IsWindowEnabled(child), f"Fixture control {control_id} is unavailable"
+    fixture_message(process, window, 0x0111, control_id, child)  # WM_COMMAND / BN_CLICKED
+
+
+def fixture_text(process, window, control_id):
+    buffer = ctypes.create_unicode_buffer(16384)
+    fixture_message(process, fixture_control(process, window, control_id), 0x000D, len(buffer), ctypes.addressof(buffer))  # WM_GETTEXT
+    return buffer.value
+
+
+def diagnostic_sample_time(process, window):
+    text = fixture_text(process, window, 241)
+    return next((line for line in text.splitlines() if line.startswith("采样时间：") and "—" not in line), "")
 
 
 def request(base, route, body=None, token=None):
@@ -193,7 +275,7 @@ try:
     assert failed_ini.read_bytes() == saved_ini, "Failed desktop startup overwrote settings before loading them"
     assert list(failed_profile.iterdir()) == [failed_ini], "Failed UI initialization started the background engine"
     print("PASS: a late native UI creation failure preserves existing desktop settings and starts no engine.", flush=True)
-    desktop = build_fixture(output_directory=directory / "desktop-fixture")
+    desktop = build_fixture(name=desktop_namespace, output_directory=directory / "desktop-fixture")
     legacy_engine = directory / "embedded/engine" / version / "bridge-engine.exe"
     legacy_engine.parent.mkdir(parents=True)
     legacy_engine.write_bytes(b"locked old engine cache")
@@ -215,6 +297,43 @@ try:
     assert not (directory / "duplicate").exists(), "Second launch wrote a profile before taking the user-wide single-instance lock"
     request(base, "/api/shutdown", {}, token)
     processes[-1].wait(timeout=15)
+    # Only the namespaced desktop/PID launched here is controlled. Demo mode
+    # unlocks the proxy page without Tailscale login, internet or Claude calls.
+    diagnostics_base, diagnostics_token = start("diagnostics-ui", demo=True, desktop_mode=True)
+    diagnostics_process = processes[-1]
+    connect_identity(diagnostics_base, diagnostics_token, "host")
+    request(diagnostics_base, "/api/host", {"tailscaleIp": "127.0.0.1", "bridgePort": 0}, diagnostics_token)
+    main_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, desktop_class), "namespaced desktop window")
+    user32.ShowWindow(owned_fixture_window(diagnostics_process, main_window), 4)  # SW_SHOWNOACTIVATE
+    wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 103)), "proxy page authorization")
+    click_fixture(diagnostics_process, main_window, 103)  # NAV_PROXY
+    click_fixture(diagnostics_process, main_window, 240)  # NETWORK_DIAGNOSTICS
+    diagnostics_class = desktop_class + ".NetworkDiagnostics"
+    diagnostics_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, diagnostics_class), "network diagnostics window")
+    unavailable = wait_ui(diagnostics_process, lambda: (text if "数据状态：不可用" in (text := fixture_text(diagnostics_process, diagnostics_window, 241)) else None), "unavailable diagnostic snapshot")
+    assert "TCP 重传：—" in unavailable and "重传不等于公网丢包率" in unavailable, unavailable
+    first_sample = diagnostic_sample_time(diagnostics_process, diagnostics_window)
+    assert first_sample, "The unavailable snapshot must retain its real capture timestamp"
+    wait_ui(diagnostics_process, lambda: (sample if (sample := diagnostic_sample_time(diagnostics_process, diagnostics_window)) and sample != first_sample else None), "automatic diagnostic refresh without clicking refresh")
+    wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, diagnostics_window, 242)), "diagnostic refresh readiness")
+    click_fixture(diagnostics_process, diagnostics_window, 242)  # DIAGNOSTICS_REFRESH
+    wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, diagnostics_window, 242)), "manual diagnostic refresh completion")
+    assert "数据状态：不可用" in fixture_text(diagnostics_process, diagnostics_window, 241)
+    click_fixture(diagnostics_process, diagnostics_window, 243)  # DIAGNOSTICS_CLOSE
+    assert not user32.IsWindow(diagnostics_window), "Closing diagnostics retained its window"
+    time.sleep(2.2)  # Cross one automatic refresh interval after dismissal.
+    assert diagnostics_process.poll() is None and not fixture_window(diagnostics_process, diagnostics_class), "Automatic refresh revived closed diagnostics or crashed the fixture"
+    # Closing immediately after another open also exercises a snapshot/close
+    # race. A later reply must not recreate the dismissed diagnostics window.
+    click_fixture(diagnostics_process, main_window, 240)
+    diagnostics_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, diagnostics_class), "reopened diagnostics window")
+    click_fixture(diagnostics_process, diagnostics_window, 243)
+    time.sleep(0.2)
+    assert diagnostics_process.poll() is None and not fixture_window(diagnostics_process, diagnostics_class), "A late diagnostic reply revived its window or crashed the fixture"
+    click_fixture(diagnostics_process, main_window, 240)
+    stop(diagnostics_base, diagnostics_token, diagnostics_process)
+    assert diagnostics_process.returncode == 0, "Exiting with a diagnostics window failed"
+    print("PASS: namespaced desktop diagnostics shows unavailable counters, updates capture time automatically, supports manual refresh, stays closed across its refresh interval and exits cleanly.", flush=True)
     # Reuse the extracted runtime and shut down as soon as its API appears,
     # before the native desktop necessarily finishes its own bootstrap poll.
     for _ in range(3):

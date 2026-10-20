@@ -5,9 +5,9 @@ from pathlib import Path
 import tempfile
 import zipfile
 if __package__:
-    from .build_support import ROOT, VERSION, source_manifest, verify_build_record, verify_source_version
+    from .build_support import ROOT, VERSION, checked_path, cleanup_release, source_manifest, verify_build_record, verify_source_version
 else:
-    from build_support import ROOT, VERSION, source_manifest, verify_build_record, verify_source_version
+    from build_support import ROOT, VERSION, checked_path, cleanup_release, source_manifest, verify_build_record, verify_source_version
 
 
 def package_source(root=ROOT, version=VERSION):
@@ -15,7 +15,7 @@ def package_source(root=ROOT, version=VERSION):
     verify_source_version(root, version)
     sources = source_manifest(root)
     verified = verify_build_record(root, version, sources)
-    release = root / 'release'
+    release = checked_path(root / 'release')
     release.mkdir(exist_ok=True)
     target = release / f'claude-p2p-bridge-{version}.zip'
     with tempfile.NamedTemporaryFile(prefix=target.name + '.', suffix='.tmp', dir=release, delete=False) as stream:
@@ -35,6 +35,10 @@ def package_source(root=ROOT, version=VERSION):
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+    if verified:
+        removed = cleanup_release(root, version, sources)
+        if removed:
+            print(f'Release cleanup: removed {len(removed)} old or duplicate files.')
     return target, len(sources), verified
 
 

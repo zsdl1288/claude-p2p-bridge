@@ -13,7 +13,7 @@ import { sendJson as json, readJsonObject as readBody } from './http.js';
 import { ClashProxy } from './clash-proxy.js';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
-const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
+const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/network-diagnostics.js': ['network-diagnostics.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
 const modelPaths = new Set(['/v1/chat/completions', '/v1/models', '/v1/responses', '/v1/messages']);
 const tokenLoads = new Map();
 export function getApiToken(directory) {

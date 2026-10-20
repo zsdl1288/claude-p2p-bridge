@@ -1,9 +1,11 @@
 import { pages, uiState, allowedPage, deviceIdentity, deviceConnection } from './ui-state.js';
+import { networkDiagnosticsView } from './network-diagnostics.js';
 
 const $ = (id) => document.getElementById(id);
 let token, apiBase, currentStatus, lastConfig, lastInvitation, selectedPeer, toastTimer, lastError, lastModels, selectedModelId = '';
 let page = 'connection', actionBusy = false, proxyBusy = false, polling = false, networkPolling = false, localAvailable = false, modelTest, mutation = 0;
 let proxyStatus = {};
+let diagnosticsOpen = false, diagnosticsRequest = null, diagnosticsTimer = null;
 const retiredInstances = new Set();
 const roleName = (role) => role === 'host' ? 'B · 服务端' : role === 'client' ? 'A · 调用端' : '尚未选择身份';
 const state = () => uiState(currentStatus, actionBusy || proxyBusy || !localAvailable);
@@ -27,7 +29,9 @@ function readInvitation(invitation) {
 }
 function navigate(next, updateHash = true) {
   const access = state();
+  const previousPage = page;
   page = allowedPage(next, { ...access, model: access.model || currentStatus?.modelApi?.listening === true });
+  if (previousPage === 'proxy' && page !== 'proxy') retireNetworkDiagnostics();
   for (const [key, content] of Object.entries(pages)) {
     $(key).hidden = page !== key;
     for (const button of document.querySelectorAll(`[data-page="${key}"]`)) {
@@ -303,6 +307,70 @@ $('proxy-sharing').onclick = () => proxyAction('/api/proxy', { sharing: !proxySt
 $('proxy-enable').onclick = () => proxyAction('/api/proxy', { enabled: !proxyStatus.enabled });
 $('copy-subscription').onclick = () => { if (proxyStatus.subscriptionUrl) copy(proxyStatus.subscriptionUrl); };
 
+function renderDiagnosticsControls() {
+  $('network-diagnostics-panel').hidden = !diagnosticsOpen;
+  $('network-diagnostics-open').setAttribute('aria-expanded', String(diagnosticsOpen));
+  $('network-diagnostics-open').disabled = !localAvailable || !state().proxy;
+  $('network-diagnostics-refresh').disabled = Boolean(diagnosticsRequest) || !localAvailable || !state().proxy;
+}
+function renderDiagnostics(snapshot) {
+  const view = networkDiagnosticsView(snapshot);
+  $('network-diagnostics-status').textContent = view.message;
+  $('network-diagnostics-time').textContent = view.capturedAt;
+  $('network-diagnostics-tcp').replaceChildren();
+  for (const counter of view.tcp) {
+    const item = document.createElement('div');
+    const label = document.createElement('dt'); label.textContent = counter.label;
+    const value = document.createElement('dd'); value.textContent = counter.value;
+    item.append(label, value); $('network-diagnostics-tcp').append(item);
+  }
+  $('network-diagnostics-totals').replaceChildren();
+  for (const total of view.totals) {
+    const item = document.createElement('p');
+    item.textContent = `${total.label}：${total.bytes} · ${total.packets} 包`;
+    $('network-diagnostics-totals').append(item);
+  }
+  $('network-diagnostics-paths').replaceChildren();
+  for (const path of view.paths) {
+    const row = document.createElement('tr');
+    for (const text of [path.label, path.inboundBytes, path.inboundPackets, path.outboundBytes, path.outboundPackets]) {
+      const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+    }
+    $('network-diagnostics-paths').append(row);
+  }
+}
+function retireNetworkDiagnostics() {
+  diagnosticsOpen = false;
+  if (diagnosticsTimer !== null) clearInterval(diagnosticsTimer);
+  diagnosticsTimer = null;
+  const controller = diagnosticsRequest; diagnosticsRequest = null; controller?.abort();
+  renderDiagnostics(null); renderDiagnosticsControls();
+}
+async function refreshNetworkDiagnostics() {
+  if (!diagnosticsOpen || diagnosticsRequest || !localAvailable || !state().proxy) return;
+  const controller = diagnosticsRequest = new AbortController();
+  $('network-diagnostics-status').textContent = '正在更新本机网络诊断…'; renderDiagnosticsControls();
+  try {
+    const snapshot = await (await api('/api/network/diagnostics', undefined, controller.signal)).json();
+    if (diagnosticsRequest === controller && diagnosticsOpen) renderDiagnostics(snapshot);
+  } catch (error) {
+    if (diagnosticsRequest === controller && diagnosticsOpen) renderDiagnostics({ available: false, message: `读取网络诊断失败：${error.message}` });
+  } finally {
+    if (diagnosticsRequest === controller) { diagnosticsRequest = null; renderDiagnosticsControls(); }
+  }
+}
+$('network-diagnostics-open').onclick = () => {
+  if ($('network-diagnostics-open').disabled || diagnosticsOpen) return;
+  diagnosticsOpen = true;
+  renderDiagnostics({ available: false, message: '正在读取本机网络诊断…' });
+  const timer = diagnosticsTimer = setInterval(() => {
+    if (diagnosticsTimer === timer) return refreshNetworkDiagnostics();
+  }, 2000);
+  return refreshNetworkDiagnostics();
+};
+$('network-diagnostics-refresh').onclick = refreshNetworkDiagnostics;
+$('network-diagnostics-close').onclick = retireNetworkDiagnostics;
+
 function render(status) {
   if (!status) return;
   const previousInstance = currentStatus?.instanceId, instance = status.instanceId;
@@ -312,14 +380,16 @@ function render(status) {
     retiredInstances.add(previousInstance);
     if (retiredInstances.size > 8) retiredInstances.delete(retiredInstances.values().next().value);
     ++mutation;
-    retireModelTest(); $('probe-result').textContent = '';
+    retireModelTest(); retireNetworkDiagnostics(); $('probe-result').textContent = '';
   }
   const previousRole = currentStatus?.identity?.role || currentStatus?.role;
   const previousConnection = currentStatus?.controlConnectionId;
   const wasListening = currentStatus?.modelApi?.listening === true;
   currentStatus = status;
   const ui = state();
-  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); $('probe-result').textContent = ''; navigate('connection'); }
+  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); retireNetworkDiagnostics(); $('probe-result').textContent = ''; navigate('connection'); }
+  if (!ui.proxy) retireNetworkDiagnostics();
+  else renderDiagnosticsControls();
   for (const key of ['api', 'proxy']) { const button = document.querySelector(`[data-page="${key}"]`); button.disabled = key === 'api' ? !ui.model && status.modelApi?.listening !== true : !ui.proxy; button.title = button.disabled ? '完成设备配对后可用' : ''; }
   if (!ui.model || ui.role !== 'client' || previousConnection !== status.controlConnectionId) retireModelTest();
   if (wasListening && status.modelApi?.listening !== true && modelTest) {

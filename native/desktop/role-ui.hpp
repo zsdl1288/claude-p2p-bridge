@@ -3,6 +3,20 @@
 #include "vendor/json.hpp"
 
 namespace DesktopAccess {
+inline std::wstring DisplayRoleNames(std::wstring text) {
+    const auto ascii = [](wchar_t c) { return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_'; };
+    for (size_t i = 0; i < text.size(); ++i) {
+        if ((text[i] != L'A' && text[i] != L'B') || (i && ascii(text[i - 1])) || (i + 1 < text.size() && ascii(text[i + 1]))) continue;
+        const std::wstring role = text[i] == L'A' ? L"调用端" : L"服务端";
+        size_t length = 1;
+        for (const auto* suffix : {L" · 调用端", L" · 服务端", L" 调用端", L" 服务端", L" 端", L"端"}) {
+            const std::wstring value = suffix;
+            if (text.compare(i + 1, value.size(), value) == 0) { length += value.size(); break; }
+        }
+        text.replace(i, length, role); i += role.size() - 1;
+    }
+    return text;
+}
 struct State {
     std::string role;
     bool loaded = false, locked = true, networkReady = false, model = false, proxy = false;
@@ -30,8 +44,8 @@ inline State FromStatus(const nlohmann::json& status, bool demo = false) {
 
 inline std::string PairingRecoveryHint(const nlohmann::json& pairing, bool desiredOnline) {
     const auto phase = pairing.value("state", "");
+    if (phase == "invalid" || phase == "expired" || phase == "revoked" || phase == "error" || (pairing.value("saved", false) && !pairing.value("valid", true))) return "请粘贴服务端的新配对码重新配对。";
     if (!desiredOnline || phase == "network-disconnected") return "已保存；重新连接私有网络后恢复，当前不会自动联网。";
-    if (phase == "error") return "可忘记配对后重新设置。";
     if (phase == "paused") return "配对已暂停；可恢复，身份仍锁定。";
     return "已保存 · 临时掉线后自动恢复";
 }

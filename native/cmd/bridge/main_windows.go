@@ -159,7 +159,7 @@ func showError(message string) {
 
 func main() {
 	exitCode := 1
-	// Register this first so process and log handles are closed before a
+	// Register this first so process handles and cleanup finish before a
 	// nonzero exit is returned to the native owner.
 	defer func() {
 		if exitCode != 0 {
@@ -222,6 +222,11 @@ func main() {
 		showError(err.Error())
 		return
 	}
+	if err := removeLegacyClientLog(dataDir); err != nil {
+		showError("清理旧运行记录失败：" + err.Error())
+		return
+	}
+	defer removeLegacyClientLog(dataDir)
 	runtimeDir, err := extract(dataDir)
 	if err != nil {
 		showError("解包运行组件失败：" + err.Error())
@@ -238,13 +243,8 @@ func main() {
 	cmd := exec.Command(filepath.Join(runtimeDir, "runtime", "node.exe"), args...)
 	cmd.Dir = runtimeDir
 	cmd.Env = append(os.Environ(), "BRIDGE_NET_HELPER="+self, "BRIDGE_NET_HELPER_ARGS=[\"--network-mode\"]")
-	logFile, err := os.OpenFile(filepath.Join(dataDir, "client.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		showError(err.Error())
-		return
-	}
-	defer logFile.Close()
-	cmd.Stdout, cmd.Stderr = logFile, logFile
+	// Leave console output unset so os/exec connects it to the null device.
+	// Avoid both a persistent client.log and copy pipes inherited by helpers.
 	hide(cmd)
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -306,7 +306,7 @@ func main() {
 	}
 	if waitError != nil {
 		if !*noBrowser {
-			showError("客户端未能启动或意外退出，请检查本机端口是否占用。\n日志：" + filepath.Join(dataDir, "client.log"))
+			showError("客户端未能启动或意外退出，请检查本机端口是否占用，然后重新启动客户端。")
 		}
 		return
 	}

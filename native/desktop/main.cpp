@@ -4,8 +4,12 @@
 #include "startup.hpp"
 #include "profile-lock.hpp"
 #include "model-api.hpp"
+#include "network-diagnostics.hpp"
 #include "options.hpp"
 #include "role-ui.hpp"
+#include "theme.hpp"
+#include "connection-status.hpp"
+#include "pairing-ui.hpp"
 #include "single-instance.hpp"
 #include "job-lifecycle.hpp"
 #include <uxtheme.h>
@@ -18,9 +22,7 @@
 #endif
 
 namespace {
-constexpr COLORREF BACKGROUND = RGB(245, 246, 249), SIDEBAR = RGB(23, 30, 42);
-constexpr COLORREF INK = RGB(31, 42, 58), MUTED = RGB(104, 116, 134), ACCENT = RGB(178, 82, 57);
-constexpr COLORREF LINE = RGB(225, 229, 235), GREEN = RGB(28, 119, 93);
+constexpr UINT_PTR DIAGNOSTICS_TIMER = 1;
 #if BRIDGE_DIAGNOSTICS_BUILD
 constexpr wchar_t APP_TITLE[] = L"Claude Bridge · 本地诊断版";
 #else
@@ -30,7 +32,7 @@ using Options = DesktopCli::Options;
 struct Reply { std::string kind; Json data; std::string text, requestId; uint64_t viewEpoch = 0; };
 struct Widget {
     HWND window; int page, role, x, y, w, h, font; bool right = false, stretch = false, taller = false;
-    bool sidebar = false, muted = false, edit = false;
+    bool sidebar = false, muted = false, edit = false, bottom = false;
 };
 
 class Application {
@@ -38,19 +40,30 @@ class Application {
     DesktopSingleInstance::Names instanceNames_;
     std::unique_ptr<DesktopSingleInstance::Instance> instanceLock_;
     std::wstring className_; std::vector<Widget> widgets_;
-    HFONT fonts_[4]{}; HBRUSH background_, white_, sidebar_;
+    HFONT fonts_[4]{}, iconFont_ = nullptr;
+    HBRUSH background_ = nullptr, surface_ = nullptr, sidebar_ = nullptr, input_ = nullptr;
+    bool dark_ = false;
+    DesktopTheme::Palette colors_ = DesktopTheme::Colors(false);
+    DesktopConnectionStatus::Tone statusTone_ = DesktopConnectionStatus::Tone::Waiting;
+    HWND hovered_ = nullptr;
     UINT dpi_ = 96, taskbarMessage_ = 0; bool trayAdded_ = false, trayTipShown_ = false;
     int page_ = 0, role_ = 0; bool busy_ = false, testing_ = false, proxyAvailable_ = false, statusAvailable_ = false, settingsLoaded_ = false;
     uint64_t viewEpoch_ = 0, lastStatusRevision_ = 0;
     std::atomic<bool> stopping_{false}, ready_{false};
     std::mutex engineMutex_; KernelHandle process_, job_, wake_;
-    std::thread pollThread_, actionThread_, testThread_;
+    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_;
+    HWND diagnosticsWindow_ = nullptr, diagnosticsOutput_ = nullptr, diagnosticsRefresh_ = nullptr, diagnosticsClose_ = nullptr;
+    HFONT diagnosticsFont_ = nullptr;
+    bool diagnosticsBusy_ = false, diagnosticsReadPending_ = false;
+    uint64_t diagnosticsEpoch_ = 0;
     std::string token_, authUrl_, requestId_, invitation_, lastDevices_, lastProxyDevices_, lastConfig_, lastModels_, observedRole_, testScope_;
     std::vector<std::wstring> modelIds_;
     std::wstring selectedModel_;
     Json status_, proxy_ = Json::object(); HWND heading_ = nullptr, description_ = nullptr, state_ = nullptr;
     HWND identityMessage_ = nullptr, networkMessage_ = nullptr, connectionHint_ = nullptr, peerList_ = nullptr, proxyPeerList_ = nullptr, activity_ = nullptr;
     HWND startupHint_ = nullptr, modelStatus_ = nullptr, hostModelStatus_ = nullptr;
+    HWND pairingCaption_ = nullptr;
+    bool pairingSummaryShown_ = false;
     HWND proxyMessage_ = nullptr, proxyDetails_ = nullptr;
 
     Json Object(const Json& value, const char* key) const {
@@ -67,7 +80,11 @@ class Application {
 
     int S(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
     HWND Item(int id) const { return GetDlgItem(window_, id); }
-    void Text(HWND target, const std::wstring& value) { if (ControlText(target) != value) SetWindowTextW(target, value.c_str()); }
+    void Text(HWND target, const std::wstring& value) {
+        const bool message = target == description_ || target == state_ || target == identityMessage_ || target == networkMessage_ || target == connectionHint_ || target == modelStatus_ || target == hostModelStatus_ || target == proxyMessage_ || target == proxyDetails_ || target == activity_;
+        const auto display = message ? DesktopAccess::DisplayRoleNames(value) : value;
+        if (ControlText(target) != display) SetWindowTextW(target, display.c_str());
+    }
     void Text(int id, const std::wstring& value) {
         if (id != TEST_OUTPUT) { Text(Item(id), value); return; }
         std::wstring lines; lines.reserve(value.size());
@@ -96,18 +113,83 @@ class Application {
         if (number < minimum || number > maximum) throw std::runtime_error(error);
         return number;
     }
-    void Message(const std::wstring& text, bool error = false) { MessageBoxW(window_, text.c_str(), APP_TITLE, error ? MB_ICONERROR : MB_ICONINFORMATION); }
-    void Report(const std::wstring& text) { Text(state_, text); }
+    void Message(const std::wstring& text, bool error = false) { MessageBoxW(window_, DesktopAccess::DisplayRoleNames(text).c_str(), APP_TITLE, error ? MB_ICONERROR : MB_ICONINFORMATION); }
+    // Short operation feedback must not replace the durable connection indicator.
+    void Report(const std::wstring& text) { Text(description_, text); }
+    void SetStatus(const std::wstring& text, DesktopConnectionStatus::Tone tone) {
+        statusTone_ = tone; Text(state_, text); PositionStatus();
+        InvalidateRect(state_, nullptr, TRUE);
+    }
+    void PositionStatus() {
+        if (!state_) return;
+        RECT client; GetClientRect(window_, &client);
+        auto dc = GetDC(state_); auto oldFont = SelectObject(dc, fonts_[3]);
+        auto text = ControlText(state_); SIZE size{};
+        GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+        SelectObject(dc, oldFont); ReleaseDC(state_, dc);
+        const int width = std::clamp(static_cast<int>(size.cx) + S(42), S(150), S(396));
+        SetWindowPos(state_, nullptr, client.right - S(24) - width, S(32), width, S(34), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    static LRESULT CALLBACK ControlProc(HWND child, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR data) {
+        auto self = reinterpret_cast<Application*>(data);
+        if (GetDlgCtrlID(child) == STARTUP_ENABLE) {
+            if (message == WM_PAINT) { self->DrawCheckbox(child); return 0; }
+            if (message == WM_ERASEBKGND) return 1;
+        }
+        if (message == WM_MOUSEMOVE) {
+            if (self->hovered_ != child) {
+                auto previous = self->hovered_; self->hovered_ = child;
+                if (previous) InvalidateRect(previous, nullptr, FALSE);
+                InvalidateRect(child, nullptr, FALSE);
+                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, child, 0}; TrackMouseEvent(&tracking);
+            }
+        } else if (message == WM_MOUSELEAVE) {
+            if (self->hovered_ == child) self->hovered_ = nullptr;
+            InvalidateRect(child, nullptr, FALSE);
+        } else if (message == WM_SETFOCUS || message == WM_KILLFOCUS) {
+            auto result = DefSubclassProc(child, message, wParam, lParam);
+            RedrawWindow(child, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME); return result;
+        } else if (message == WM_NCPAINT && (GetWindowLongPtrW(child, GWL_STYLE) & WS_BORDER)) {
+            auto result = DefSubclassProc(child, message, wParam, lParam);
+            auto dc = GetWindowDC(child); RECT rect; GetWindowRect(child, &rect);
+            OffsetRect(&rect, -rect.left, -rect.top);
+            auto brush = CreateSolidBrush(GetFocus() == child ? self->colors_.muted : self->colors_.line);
+            FrameRect(dc, &rect, brush); DeleteObject(brush); ReleaseDC(child, dc); return result;
+        }
+        return DefSubclassProc(child, message, wParam, lParam);
+    }
+    void DrawCheckbox(HWND child) {
+        PAINTSTRUCT ps; auto dc = BeginPaint(child, &ps); RECT rect; GetClientRect(child, &rect);
+        FillRect(dc, &rect, surface_);
+        const bool enabled = IsWindowEnabled(child), checked = SendMessageW(child, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        auto ink = enabled ? colors_.ink : colors_.disabledInk;
+        RECT box{0, (rect.bottom - S(14)) / 2, S(14), (rect.bottom + S(14)) / 2};
+        auto pen = CreatePen(PS_SOLID, 1, enabled ? colors_.muted : colors_.line);
+        auto brush = CreateSolidBrush(checked ? colors_.primary : colors_.input);
+        auto oldPen = SelectObject(dc, pen); auto oldBrush = SelectObject(dc, brush);
+        RoundRect(dc, box.left, box.top, box.right, box.bottom, S(4), S(4));
+        if (checked) {
+            auto check = CreatePen(PS_SOLID, std::max(1, S(2)), colors_.primaryInk); SelectObject(dc, check);
+            MoveToEx(dc, S(3), box.top + S(7), nullptr); LineTo(dc, S(6), box.top + S(10)); LineTo(dc, S(11), box.top + S(4));
+            SelectObject(dc, pen); DeleteObject(check);
+        }
+        SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); DeleteObject(brush);
+        auto oldFont = SelectObject(dc, fonts_[0]); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, ink);
+        auto text = ControlText(child); rect.left += S(23);
+        DrawTextW(dc, text.c_str(), -1, &rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (GetFocus() == child && !(SendMessageW(child, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) DrawFocusRect(dc, &rect);
+        SelectObject(dc, oldFont); EndPaint(child, &ps);
+    }
     HWND Add(const wchar_t* type, const wchar_t* text, int id, int x, int y, int w, int h,
              int page = -1, int role = 0, DWORD style = 0, int font = 0,
              bool right = false, bool stretch = false, bool taller = false) {
         const bool edit = wcscmp(type, L"EDIT") == 0 || wcscmp(type, L"COMBOBOX") == 0;
-        DWORD extra = edit ? WS_EX_CLIENTEDGE : 0;
-        HWND child = CreateWindowExW(extra, type, text, WS_CHILD | WS_VISIBLE | style,
+        HWND child = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style | (edit ? WS_BORDER : 0),
                                      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
         if (!child) throw std::runtime_error(WindowsError("创建桌面控件"));
         widgets_.push_back({child, page, role, x, y, w, h, font, right, stretch, taller, false, false, edit});
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(fonts_[font]), FALSE);
+        SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(this));
         return child;
     }
     HWND Label(const wchar_t* text, int x, int y, int w, int h, int page = -1, int role = 0, int font = 0, bool muted = false) {
@@ -117,8 +199,8 @@ class Application {
     HWND Button(const wchar_t* text, int id, int x, int y, int w, int h, int page = -1, int role = 0, bool right = false) {
         return Add(L"BUTTON", text, id, x, y, w, h, page, role, WS_TABSTOP | BS_OWNERDRAW, 1, right);
     }
-    HWND Edit(const wchar_t* text, int id, int x, int y, int w, int h, int page, int role = 0, bool multiline = false, bool readOnly = false, bool stretch = false, bool taller = false) {
-        DWORD style = WS_TABSTOP | (multiline ? ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN : ES_AUTOHSCROLL);
+    HWND Edit(const wchar_t* text, int id, int x, int y, int w, int h, int page, int role = 0, bool multiline = false, bool readOnly = false, bool stretch = false, bool taller = false, bool scroll = true) {
+        DWORD style = WS_TABSTOP | (multiline ? ES_MULTILINE | ES_AUTOVSCROLL | (scroll ? WS_VSCROLL : 0) | ES_WANTRETURN : ES_AUTOHSCROLL);
         if (readOnly) style |= ES_READONLY;
         auto child = Add(L"EDIT", text, id, x, y, w, h, page, role, style, 0, false, stretch, taller);
         SendMessageW(child, EM_SETLIMITTEXT, multiline ? 2 * 1024 * 1024 : 4096, 0);
@@ -127,6 +209,9 @@ class Application {
     }
     void Fonts() {
         for (auto& font : fonts_) { if (font) DeleteObject(font); font = nullptr; }
+        if (iconFont_) DeleteObject(iconFont_);
+        iconFont_ = CreateFontW(-S(17), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
         const int size[] = {14, 14, 28, 12};
         for (int i = 0; i < 4; ++i) fonts_[i] = CreateFontW(-S(size[i]), 0, 0, 0, i == 1 || i == 2 ? FW_SEMIBOLD : FW_NORMAL,
                                                           FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -141,13 +226,14 @@ class Application {
         for (auto& item : widgets_) {
             int x = item.x + (item.right ? extraW : 0), y = item.y;
             int height = item.h;
-            if (item.window == proxyPeerList_ && role_ == 2) { y = 346; height = 270; }
             if (item.sidebar && item.y > 600) y += extraH;
             if (item.page == -2) y += extraH;
+            if (item.bottom) y += extraH;
             defer = DeferWindowPos(defer, item.window, nullptr, S(x), S(y), S(item.w + (item.stretch ? extraW : 0)),
                                    S(height + (item.taller ? extraH : 0)), SWP_NOZORDER | SWP_NOACTIVATE);
         }
         if (defer) EndDeferWindowPos(defer);
+        PositionStatus();
         if (peerList_) ListView_SetColumnWidth(peerList_, 0, S(210 + extraW));
         if (proxyPeerList_) ListView_SetColumnWidth(proxyPeerList_, 0, S(230 + extraW));
         InvalidateRect(window_, nullptr, TRUE);
@@ -159,7 +245,7 @@ class Application {
             if (visible) InvalidateRect(item.window, nullptr, TRUE);
         }
         const wchar_t* titles[] = {L"设备与配对", L"模型 API", L"运行记录", L"网络代理", L"设置"};
-        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用 B 的 Claude；工具、文件和命令由调用端执行。", L"查看私有网络、配对及两项业务的运行记录。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接 B，提供网络共享节点。", L"管理后台运行、开机启动与开源许可。"};
+        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用服务端的 Claude；工具、文件和命令由调用端执行。", L"仅显示本次运行的记录；退出客户端后清空，不保存到磁盘。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接服务端，提供网络共享节点。", L"管理后台运行、开机启动与开源许可。"};
         Text(heading_, titles[page_]); Text(description_, descriptions[page_]);
         InvalidateRect(window_, nullptr, TRUE);
     }
@@ -173,14 +259,15 @@ class Application {
         Button(L"模型 API", NAV_API, 16, 214, 152, 40); widgets_.back().sidebar = true;
         Button(L"运行记录", NAV_LOGS, 16, 262, 152, 40); widgets_.back().sidebar = true;
         Button(L"网络代理", NAV_PROXY, 16, 310, 152, 40); widgets_.back().sidebar = true;
-        Button(L"设置", NAV_SETTINGS, 20, 680, 144, 36); widgets_.back().sidebar = true;
+        Button(L"深色模式", THEME_TOGGLE, 16, 634, 152, 36); widgets_.back().sidebar = true;
+        Button(L"设置", NAV_SETTINGS, 16, 680, 152, 36); widgets_.back().sidebar = true;
         Label((L"C++ DESKTOP / v" + Wide(BRIDGE_VERSION)).c_str(), 24, 730, 152, 18, -1, 0, 3, true); widgets_.back().sidebar = true;
         heading_ = Label(L"设备与配对", 208, 28, 380, 40, -1, 0, 2);
-        state_ = Label(L"正在启动内置服务…", 670, 42, 346, 28, -1, 0, 0); widgets_.back().right = true;
+        state_ = Add(L"STATIC", L"正在启动内置服务…", CONNECTION_STATUS, 670, 32, 346, 34, -1, 0, SS_OWNERDRAW, 3, true);
         description_ = Label(L"", 208, 78, 808, 24, -1, 0, 0, true); widgets_.back().stretch = true;
         Label(L"本机身份", 228, 130, 400, 24, 0, 0, 1);
-        Button(L"我是 A · 调用端", ROLE_CLIENT, 228, 164, 188, 34, 0);
-        Button(L"我是 B · 服务端", ROLE_HOST, 428, 164, 188, 34, 0);
+        Button(L"我是调用端", ROLE_CLIENT, 228, 164, 188, 34, 0);
+        Button(L"我是服务端", ROLE_HOST, 428, 164, 188, 34, 0);
         identityMessage_ = Label(L"请选择身份；连接私有网络后锁定。", 228, 210, 520, 26, 0, 0, 3, true); widgets_.back().stretch = true;
         Button(L"连接私有网络", NETWORK_CONNECT, 774, 130, 218, 34, 0, 0, true);
         Button(L"刷新设备", NETWORK_REFRESH, 774, 174, 104, 32, 0, 0, true);
@@ -188,46 +275,47 @@ class Application {
         Button(L"退出私网 / 解锁身份", NETWORK_DISCONNECT, 774, 218, 218, 32, 0, 0, true);
         networkMessage_ = Label(L"正在读取私有网络状态…", 228, 248, 520, 36, 0, 0, 3, true); widgets_.back().stretch = true;
         Label(L"设备配对", 228, 330, 200, 24, 0, 0, 1);
-        Button(L"忘记配对", PAIR_DISCONNECT, 466, 326, 92, 30, 0);
-        Label(L"粘贴 B 服务端的配对码", 228, 372, 330, 22, 0, 1, 3, true);
-        Edit(L"", INVITATION, 228, 404, 330, 140, 0, 1, true);
-        Button(L"配对并连接 B", PAIR_JOIN, 228, 562, 330, 38, 0, 1);
-        Label(L"本机只连接一个 B。配对加密保存在本机，\r\n临时掉线或重启后按原身份自动恢复。", 228, 622, 330, 44, 0, 1, 3, true);
-        Label(L"先创建服务身份，再将配对码发送给 A。\r\nClaude 和网络共享可在各自页面单独开启。", 228, 374, 330, 48, 0, 2, 3, true);
-        Button(L"创建服务身份与配对码", PAIR_HOST, 228, 440, 330, 38, 0, 2);
-        Edit(L"创建服务身份后生成配对码", PAIR_CODE, 228, 498, 330, 100, 0, 2, true, true);
-        Button(L"复制配对码", COPY_INVITE, 228, 620, 330, 34, 0, 2);
+        pairingCaption_ = Label(L"粘贴服务端的配对码", 228, 372, 330, 22, 0, 1, 3, true);
+        Edit(L"", INVITATION, 228, 404, 330, 164, 0, 1, true, false, false, true, false); widgets_.back().font = 3;
+        SendMessageW(Item(INVITATION), WM_SETFONT, reinterpret_cast<WPARAM>(fonts_[3]), FALSE);
+        Button(L"配对并连接服务端", PAIR_JOIN, 228, 588, 330, 40, 0, 1); widgets_.back().bottom = true;
+        Label(L"每台调用端连接一个服务端。配对加密保存在本机，\r\n暂停或临时掉线会保留配对信息。", 228, 650, 330, 52, 0, 1, 3, true); widgets_.back().bottom = true;
+        Label(L"先创建服务身份，再将配对码发送给调用端。\r\nClaude 和网络共享可在各自页面单独开启。", 228, 374, 330, 48, 0, 2, 3, true);
+        Button(L"创建服务身份与配对码", PAIR_HOST, 228, 440, 330, 40, 0, 2);
+        Edit(L"创建服务身份后生成配对码", PAIR_CODE, 228, 500, 330, 128, 0, 2, true, true, false, true, false); widgets_.back().font = 3;
+        SendMessageW(Item(PAIR_CODE), WM_SETFONT, reinterpret_cast<WPARAM>(fonts_[3]), FALSE);
+        Button(L"复制配对码", COPY_INVITE, 228, 650, 200, 36, 0, 2); widgets_.back().bottom = true;
+        Button(L"忘记配对", PAIR_DISCONNECT, 440, 650, 118, 36, 0, 2); widgets_.back().bottom = true;
         Label(L"网络中的设备", 614, 330, 382, 24, 0, 0, 1);
-        peerList_ = Add(WC_LISTVIEWW, L"", 0, 614, 368, 382, 148, 0, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true);
+        peerList_ = Add(WC_LISTVIEWW, L"", 0, 614, 368, 382, 212, 0, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true, true);
         ListView_SetExtendedListViewStyle(peerList_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         const wchar_t* columns[] = {L"设备 / 身份", L"虚拟 IP", L"连接"}; const int widths[] = {210, 104, 64};
         for (int i = 0; i < 3; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(columns[i]); column.cx = S(widths[i]); ListView_InsertColumn(peerList_, i, &column); }
-        Label(L"连接提示", 614, 556, 382, 24, 0, 0, 1);
-        connectionHint_ = Label(L"请选择身份并连接私有网络。\r\n私网在线与桥接配对是两个独立状态。", 614, 590, 382, 48, 0, 0, 3, true); widgets_.back().stretch = true;
-        Button(L"恢复配对连接", PAIR_RESUME, 614, 646, 182, 30, 0);
-        Button(L"暂停配对连接", PAIR_PAUSE, 810, 646, 186, 30, 0, 0, true);
+        Label(L"连接管理", 614, 624, 382, 24, 0, 0, 1); widgets_.back().bottom = true;
+        connectionHint_ = Label(L"请选择身份并连接私有网络。\r\n私网在线与桥接配对是两个独立状态。", 614, 654, 382, 32, 0, 0, 3, true); widgets_.back().stretch = true; widgets_.back().bottom = true;
+        Button(L"暂停配对连接", PAIR_TOGGLE, 614, 692, 382, 32, 0); widgets_.back().stretch = true; widgets_.back().bottom = true;
 
-        Label(L"A · Claude 模型调用", 228, 132, 540, 24, 1, 1, 1);
+        Label(L"调用端 · Claude 模型调用", 228, 132, 540, 24, 1, 1, 1);
         Button(L"开启模型 API", MODEL_API_TOGGLE, 784, 128, 208, 30, 1, 1, true);
         Label(L"Base URL · OpenAI 兼容接口", 228, 164, 540, 20, 1, 1, 3, true);
-        Edit(DesktopModelApi::BaseUrl(options_.port).c_str(), API_ENDPOINT, 228, 188, 540, 30, 1, 1, false, true, true);
-        Button(L"复制 Base URL", COPY_ENDPOINT, 784, 188, 208, 30, 1, 1, true);
-        Label(L"API Key · 仅供本机调用，以 Bearer 方式认证", 228, 230, 540, 20, 1, 1, 3, true);
-        auto apiToken = Edit(L"", API_TOKEN, 228, 254, 540, 30, 1, 1, false, true, true);
+        Edit(DesktopModelApi::BaseUrl(options_.port).c_str(), API_ENDPOINT, 228, 188, 540, 32, 1, 1, false, true, true);
+        Button(L"复制 Base URL", COPY_ENDPOINT, 784, 188, 208, 32, 1, 1, true);
+        Label(L"API Key · 仅供本机调用，以 Bearer 方式认证", 228, 236, 540, 20, 1, 1, 3, true);
+        auto apiToken = Edit(L"", API_TOKEN, 228, 260, 540, 32, 1, 1, false, true, true);
         SendMessageW(apiToken, EM_SETPASSWORDCHAR, L'\x25CF', 0);
-        Button(L"复制 API Key", COPY_TOKEN, 784, 254, 208, 30, 1, 1, true);
-        Label(L"B 端可用模型 · Model ID", 228, 296, 540, 20, 1, 1, 3, true);
-        Add(L"COMBOBOX", L"", API_MODEL, 228, 320, 540, 250, 1, 1, WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, false, true);
-        Button(L"刷新模型列表", MODELS_REFRESH, 784, 290, 208, 26, 1, 1, true);
-        Button(L"复制 Model ID", COPY_MODEL, 784, 320, 208, 30, 1, 1, true);
-        modelStatus_ = Label(L"正在读取 Claude 模型服务状态…", 228, 358, 540, 50, 1, 1, 3, true); widgets_.back().stretch = true;
-        Button(L"复制模型 API 示例", COPY_EXAMPLE, 784, 364, 208, 30, 1, 1, true);
-        Label(L"Claude 调用测试", 228, 436, 500, 24, 1, 1, 1);
-        Edit(L"请用一句话说明你能提供什么帮助", TEST_PROMPT, 228, 472, 620, 48, 1, 1, true, false, true);
-        Button(L"发送测试", TEST_SEND, 864, 472, 128, 26, 1, 1, true);
-        Button(L"取消调用", TEST_CANCEL, 864, 504, 128, 24, 1, 1, true);
-        Edit(L"开启模型 API 并连接 B 后可测试；每次测试都是独立请求。", TEST_OUTPUT, 228, 542, 764, 124, 1, 1, true, true, true, true);
-        Label(L"B · Claude 服务配置", 228, 132, 540, 24, 1, 2, 1);
+        Button(L"复制 API Key", COPY_TOKEN, 784, 260, 208, 32, 1, 1, true);
+        Label(L"服务端可用模型 · Model ID", 228, 308, 540, 20, 1, 1, 3, true);
+        Add(L"COMBOBOX", L"", API_MODEL, 228, 332, 420, 250, 1, 1, WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, false, true);
+        Button(L"刷新列表", MODELS_REFRESH, 664, 332, 112, 32, 1, 1, true);
+        Button(L"复制 Model ID", COPY_MODEL, 792, 332, 200, 32, 1, 1, true);
+        modelStatus_ = Label(L"正在读取 Claude 模型服务状态…", 228, 380, 764, 38, 1, 1, 3, true); widgets_.back().stretch = true;
+        Label(L"Claude 调用测试", 228, 470, 500, 24, 1, 1, 1);
+        Button(L"复制 PowerShell 示例", COPY_EXAMPLE, 784, 466, 208, 32, 1, 1, true);
+        Edit(L"请用一句话说明你能提供什么帮助", TEST_PROMPT, 228, 512, 620, 56, 1, 1, true, false, true);
+        Button(L"发送测试", TEST_SEND, 864, 512, 128, 32, 1, 1, true);
+        Button(L"取消调用", TEST_CANCEL, 864, 552, 128, 28, 1, 1, true);
+        Edit(L"开启模型 API 并连接服务端后可测试；每次测试都是独立请求。", TEST_OUTPUT, 228, 600, 764, 116, 1, 1, true, true, true, true);
+        Label(L"服务端 · Claude 服务配置", 228, 132, 540, 24, 1, 2, 1);
         Label(L"Claude 程序路径或命令（claude 自动检测）", 228, 176, 540, 20, 1, 2, 3, true);
         Edit(L"claude", CLAUDE_COMMAND, 228, 204, 540, 30, 1, 2, false, false, true);
         Button(L"检测 Claude", PROBE_CLAUDE, 784, 204, 208, 30, 1, 2, true);
@@ -238,33 +326,36 @@ class Application {
         Edit(L"600", MODEL_TIMEOUT, 228, 364, 250, 30, 1, 2);
         Label(L"单次最多推理轮数", 512, 336, 250, 20, 1, 2, 3, true);
         Edit(L"30", MODEL_MAX_TURNS, 512, 364, 250, 30, 1, 2);
-        Label(L"先安装并登录 Claude Code，再开启模型服务。\r\n模型请求由已配对的 A 发起；网络共享可独立开启或关闭。", 228, 426, 764, 48, 1, 2, 0, true); widgets_.back().stretch = true;
+        Label(L"先安装并登录 Claude Code，再开启模型服务。\r\n模型请求由已配对的 调用端 发起；网络共享可独立开启或关闭。", 228, 426, 764, 48, 1, 2, 0, true); widgets_.back().stretch = true;
         Button(L"保存配置并开启模型服务", MODEL_ENABLE, 228, 496, 354, 38, 1, 2);
         Button(L"关闭模型服务", MODEL_DISABLE, 600, 496, 240, 38, 1, 2);
         Label(L"服务状态", 228, 572, 700, 24, 1, 2, 1);
         // A 与 B 使用不同控件，角色切换时不会残留另一端的配置或提示。
         hostModelStatus_ = Label(L"尚未开启模型服务。", 228, 608, 764, 52, 1, 2, 0, true); widgets_.back().stretch = true;
 
-        Label(L"最近活动", 228, 132, 500, 24, 2, 0, 1);
+        Label(L"本次会话记录", 228, 132, 500, 24, 2, 0, 1);
         Button(L"打开数据目录", OPEN_DATA, 840, 128, 152, 32, 2, 0, true);
         activity_ = Edit(L"等待设备连接，记录会显示在这里。", 0, 228, 180, 764, 484, 2, 0, true, true, true, true);
-        Label(L"A · Clash 订阅节点", 228, 132, 600, 24, 3, 1, 1);
-        Label(L"B · 共享本机网络", 228, 132, 600, 24, 3, 2, 1);
-        proxyMessage_ = Label(L"正在读取代理状态…", 228, 168, 764, 40, 3, 0, 0); widgets_.back().stretch = true;
-        proxyDetails_ = Label(L"", 228, 214, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
-        proxyPeerList_ = Add(WC_LISTVIEWW, L"", 0, 228, 246, 764, 76, 3, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true);
+        Label(L"调用端 · 本地代理节点", 228, 132, 540, 24, 3, 1, 1);
+        Label(L"服务端 · 网络共享", 228, 132, 540, 24, 3, 2, 1);
+        Button(L"网络诊断", NETWORK_DIAGNOSTICS, 840, 128, 152, 30, 3, 0, true);
+        proxyMessage_ = Label(L"正在读取代理状态…", 228, 172, 764, 44, 3, 0, 0); widgets_.back().stretch = true;
+        proxyDetails_ = Label(L"", 228, 224, 440, 42, 3, 0, 3, true); widgets_.back().stretch = true;
+        Button(L"启用本地 Clash 节点", PROXY_ENABLE, 690, 224, 302, 36, 3, 1, true);
+        Button(L"开启本机网络共享", PROXY_SHARING, 690, 224, 302, 36, 3, 2, true);
+        Label(L"设备与代理连接", 228, 312, 700, 24, 3, 0, 1);
+        Label(L"查看已配对设备的在线状态、活跃连接和累计流量。", 228, 344, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
+        proxyPeerList_ = Add(WC_LISTVIEWW, L"", 0, 228, 380, 764, 184, 3, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true, true);
         ListView_SetExtendedListViewStyle(proxyPeerList_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         const wchar_t* proxyColumns[] = {L"设备 / 身份", L"虚拟 IP", L"代理状态", L"连接 / 已传输"};
         const int proxyWidths[] = {230, 132, 160, 238};
         for (int i = 0; i < 4; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(proxyColumns[i]); column.cx = S(proxyWidths[i]); ListView_InsertColumn(proxyPeerList_, i, &column); }
-        Button(L"启用本地 Clash 节点", PROXY_ENABLE, 228, 334, 764, 32, 3, 1); widgets_.back().stretch = true;
-        Button(L"允许已配对的 A 使用本机网络", PROXY_SHARING, 228, 252, 420, 36, 3, 2);
-        Label(L"已配对设备与网络使用情况", 228, 310, 700, 24, 3, 2, 1);
-        Label(L"Clash 完整配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
-        Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 404, 556, 30, 3, 1, false, true, true);
-        Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
-        Label(L"导入完整配置并开启 Clash TUN，保持本客户端运行；关闭 Clash 的系统代理 / 代理脚本。\r\nB 断开时不回退直连。旧版系统保护如需清除，请使用离线网络恢复工具。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
-        Label(L"设备在线表示配对连接可用；“使用中”表示该设备正连接网络共享。\r\n停止共享仅关闭代理连接，不会中断 Claude 模型服务。", 228, 634, 764, 42, 3, 2, 3, true); widgets_.back().stretch = true;
+        Label(L"Clash 配置订阅", 228, 612, 580, 24, 3, 1, 1); widgets_.back().bottom = true;
+        Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 646, 556, 34, 3, 1, false, true, true); widgets_.back().bottom = true;
+        Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 646, 192, 34, 3, 1, true); widgets_.back().bottom = true;
+        Label(L"导入完整配置并开启 Clash TUN；服务端断开时不回退直连。请保持本客户端运行。", 228, 696, 764, 24, 3, 1, 3, true); widgets_.back().stretch = true; widgets_.back().bottom = true;
+        Label(L"共享说明", 228, 612, 580, 24, 3, 2, 1); widgets_.back().bottom = true;
+        Label(L"只有已配对的调用端可以使用本机网络出口。\r\n“使用中”表示正在连接网络共享；停止共享不会中断 Claude 模型服务。", 228, 652, 764, 52, 3, 2, 0, true); widgets_.back().stretch = true; widgets_.back().bottom = true;
         Label(L"后台运行", 228, 132, 540, 24, 4, 0, 1);
         Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, 172, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
         Button(L"收起到托盘", MINIMIZE_TRAY, 228, 224, 220, 34, 4);
@@ -313,7 +404,59 @@ class Application {
         GetPrivateProfileStringW(L"host", L"claude", L"claude", buffer, 4096, ini.c_str()); Text(CLAUDE_COMMAND, buffer);
         GetPrivateProfileStringW(L"host", L"timeoutSeconds", L"600", buffer, 4096, ini.c_str()); Text(MODEL_TIMEOUT, buffer);
         GetPrivateProfileStringW(L"host", L"maxTurns", L"30", buffer, 4096, ini.c_str()); Text(MODEL_MAX_TURNS, buffer);
+        GetPrivateProfileStringW(L"appearance", L"theme", L"light", buffer, 4096, ini.c_str());
+        dark_ = std::wstring_view(buffer) == L"dark"; ApplyTheme();
         settingsLoaded_ = true;
+    }
+    static LRESULT CALLBACK HeaderProc(HWND header, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR data) {
+        auto self = reinterpret_cast<Application*>(data);
+        if (message == WM_PAINT) {
+            PAINTSTRUCT ps; auto dc = BeginPaint(header, &ps); RECT client; GetClientRect(header, &client);
+            FillRect(dc, &client, self->surface_); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, self->colors_.muted);
+            auto oldFont = SelectObject(dc, self->fonts_[3]);
+            for (int i = 0; i < Header_GetItemCount(header); ++i) {
+                RECT rect; Header_GetItemRect(header, i, &rect); wchar_t text[128]{};
+                HDITEMW item{}; item.mask = HDI_TEXT; item.pszText = text; item.cchTextMax = 128;
+                Header_GetItem(header, i, &item); rect.left += self->S(5); rect.right -= self->S(4);
+                DrawTextW(dc, text, -1, &rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            RECT line{0, client.bottom - 1, client.right, client.bottom}; auto brush = CreateSolidBrush(self->colors_.line);
+            FillRect(dc, &line, brush); DeleteObject(brush); SelectObject(dc, oldFont); EndPaint(header, &ps); return 0;
+        }
+        if (message == WM_ERASEBKGND) return 1;
+        return DefSubclassProc(header, message, wParam, lParam);
+    }
+    void ApplyTheme() {
+        colors_ = DesktopTheme::Colors(dark_);
+        for (auto brush : {background_, surface_, sidebar_, input_}) if (brush) DeleteObject(brush);
+        background_ = CreateSolidBrush(colors_.background); surface_ = CreateSolidBrush(colors_.surface);
+        sidebar_ = CreateSolidBrush(colors_.sidebar); input_ = CreateSolidBrush(colors_.input);
+        Text(THEME_TOGGLE, dark_ ? L"浅色模式" : L"深色模式");
+        DesktopTheme::NativeControls(window_, dark_, true);
+        DesktopTheme::TitleBar(window_, dark_, colors_);
+        for (const auto& widget : widgets_) {
+            DesktopTheme::NativeControls(widget.window, dark_);
+            if (widget.edit) SetWindowTheme(widget.window, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        }
+        // The native checkbox text must follow our palette in both themes.
+        SetWindowTheme(Item(STARTUP_ENABLE), L"", L"");
+        for (auto list : {peerList_, proxyPeerList_}) if (list) {
+            SetWindowTheme(list, L"", L"");
+            ListView_SetBkColor(list, colors_.surface); ListView_SetTextBkColor(list, colors_.surface); ListView_SetTextColor(list, colors_.ink);
+            auto header = ListView_GetHeader(list);
+            SetWindowSubclass(header, HeaderProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        }
+        if (diagnosticsWindow_) {
+            DesktopTheme::TitleBar(diagnosticsWindow_, dark_, colors_);
+            SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            RedrawWindow(diagnosticsWindow_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+        }
+        RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+    void ToggleTheme() {
+        dark_ = !dark_; ApplyTheme();
+        if (!WritePrivateProfileStringW(L"appearance", L"theme", dark_ ? L"dark" : L"light", (options_.directory / L"desktop.ini").c_str()))
+            Message(L"外观已切换，但无法保存；下次启动将使用原来的主题。", true);
     }
     void SaveSettings() {
         // WM_CREATE can fail after some inputs exist but before LoadSettings.
@@ -329,34 +472,70 @@ class Application {
         PAINTSTRUCT ps; HDC dc = BeginPaint(window_, &ps); RECT client; GetClientRect(window_, &client);
         FillRect(dc, &client, background_); RECT side{0, 0, S(184), client.bottom}; FillRect(dc, &side, sidebar_);
         int width = MulDiv(client.right, 96, dpi_), height = MulDiv(client.bottom, 96, dpi_);
-        HPEN pen = CreatePen(PS_SOLID, 1, LINE); auto oldPen = SelectObject(dc, pen); auto oldBrush = SelectObject(dc, white_);
-        auto card = [&](int x, int y, int w, int h) { RoundRect(dc, S(x), S(y), S(x + w), S(y + h), S(12), S(12)); };
+        HPEN pen = CreatePen(PS_SOLID, 1, colors_.line); auto oldPen = SelectObject(dc, pen); auto oldBrush = SelectObject(dc, surface_);
+        MoveToEx(dc, S(184) - 1, 0, nullptr); LineTo(dc, S(184) - 1, client.bottom);
+        MoveToEx(dc, S(24), client.bottom - S(140), nullptr); LineTo(dc, S(160), client.bottom - S(140));
+        auto card = [&](int x, int y, int w, int h) { RoundRect(dc, S(x), S(y), S(x + w), S(y + h), S(20), S(20)); };
         int extraW = std::max(0, width - 1040), extraH = std::max(0, height - 760);
-        if (page_ == 0) { card(208, 112, 808 + extraW, 184); card(208, 312, 370, 374); card(594, 312, 422 + extraW, 220); card(594, 540, 422 + extraW, 146); }
-        if (page_ == 1) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 300); card(208, 420, 808 + extraW, 266 + extraH); } }
+        if (page_ == 0) { card(208, 112, 808 + extraW, 184); card(208, 312, 370, 424 + extraH); card(594, 312, 422 + extraW, 284 + extraH); card(594, 612 + extraH, 422 + extraW, 124); }
+        if (page_ == 1) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 322); card(208, 450, 808 + extraW, 286 + extraH); } }
         if (page_ == 2) card(208, 112, 808 + extraW, 574 + extraH);
-        if (page_ == 3) card(208, 112, 808 + extraW, role_ == 2 ? 574 + extraH : 362);
+        if (page_ == 3) { card(208, 112, 808 + extraW, 168); card(208, 296, 808 + extraW, 288 + extraH); card(208, 600 + extraH, 808 + extraW, 136); }
         if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 86); }
         SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); EndPaint(window_, &ps);
     }
     void DrawButton(DRAWITEMSTRUCT* draw) {
         int id = static_cast<int>(draw->CtlID);
+        if (draw->hwndItem == state_) { DrawStatus(draw); return; }
         if (draw->CtlType != ODT_BUTTON) return;
-        bool nav = id >= NAV_CONNECTION && id <= NAV_SETTINGS, side = nav;
+        bool nav = id >= NAV_CONNECTION && id <= NAV_SETTINGS, side = nav || id == THEME_TOGGLE;
         bool selected = (nav && page_ == id - NAV_CONNECTION) || (id == ROLE_CLIENT && role_ == 1) || (id == ROLE_HOST && role_ == 2);
         bool primary = id == PAIR_JOIN || id == PAIR_HOST || id == NETWORK_CONNECT || id == TEST_SEND;
         bool disabled = draw->itemState & ODS_DISABLED;
-        COLORREF fill = side ? (selected ? RGB(43, 54, 73) : SIDEBAR) : primary ? ACCENT : selected ? RGB(249, 234, 228) : RGB(255, 255, 255);
-        if (draw->itemState & ODS_SELECTED) fill = side ? RGB(51, 64, 84) : primary ? RGB(150, 64, 44) : RGB(237, 240, 244);
-        if (disabled && !side) fill = RGB(238, 240, 243);
-        HPEN pen = CreatePen(PS_SOLID, 1, side ? fill : selected || primary ? ACCENT : LINE);
+        const bool hover = hovered_ == draw->hwndItem && !disabled;
+        const auto pairingUi = DesktopPairingUi::FromStatus(status_);
+        const bool danger = id == PAIR_DISCONNECT || (id == PAIR_JOIN && pairingSummaryShown_) || id == NETWORK_DISCONNECT || id == MODEL_DISABLE || id == TEST_CANCEL;
+        const bool pause = id == PAIR_TOGGLE && !pairingUi.resume;
+        const bool resume = id == PAIR_TOGGLE && pairingUi.resume;
+        COLORREF fill = side ? (selected ? colors_.button : hover ? colors_.hover : colors_.sidebar) : danger ? colors_.redFill : pause ? colors_.yellowFill : resume || selected ? colors_.greenFill : primary ? colors_.primary : hover ? colors_.buttonHover : colors_.button;
+        COLORREF edge = side ? fill : danger ? colors_.redLine : pause ? colors_.yellowLine : resume || selected ? colors_.greenLine : primary ? fill : colors_.buttonLine;
+        COLORREF ink = side ? selected ? colors_.buttonInk : colors_.ink : danger ? colors_.red : pause ? colors_.yellow : resume || selected ? colors_.green : primary ? colors_.primaryInk : colors_.buttonInk;
+        if ((draw->itemState & ODS_SELECTED) && !disabled) fill = colors_.buttonHover;
+        if (disabled && !side) { fill = selected ? colors_.greenFill : colors_.disabled; edge = selected ? colors_.greenLine : colors_.buttonLine; ink = selected ? colors_.green : colors_.disabledInk; }
+        FillRect(draw->hDC, &draw->rcItem, side ? sidebar_ : surface_);
+        HPEN pen = CreatePen(PS_SOLID, 1, edge);
         HBRUSH brush = CreateSolidBrush(fill); auto oldPen = SelectObject(draw->hDC, pen); auto oldBrush = SelectObject(draw->hDC, brush);
-        RoundRect(draw->hDC, draw->rcItem.left, draw->rcItem.top, draw->rcItem.right, draw->rcItem.bottom, S(7), S(7));
-        SetBkMode(draw->hDC, TRANSPARENT); SetTextColor(draw->hDC, disabled ? RGB(153, 160, 171) : side || primary ? RGB(249, 250, 252) : selected ? ACCENT : INK);
-        auto oldFont = SelectObject(draw->hDC, fonts_[1]); auto text = ControlText(draw->hwndItem);
-        RECT rect = draw->rcItem; DrawTextW(draw->hDC, text.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        if (draw->itemState & ODS_FOCUS) { InflateRect(&rect, -S(3), -S(3)); DrawFocusRect(draw->hDC, &rect); }
+        RoundRect(draw->hDC, draw->rcItem.left, draw->rcItem.top, draw->rcItem.right, draw->rcItem.bottom, S(14), S(14));
+        SetBkMode(draw->hDC, TRANSPARENT); SetTextColor(draw->hDC, disabled && side ? colors_.disabledInk : ink);
+        auto oldFont = SelectObject(draw->hDC, GetParent(draw->hwndItem) == diagnosticsWindow_ ? diagnosticsFont_ : selected ? fonts_[1] : fonts_[0]);
+        auto text = ControlText(draw->hwndItem); RECT rect = draw->rcItem;
+        if (side) {
+            const wchar_t* glyph = id == NAV_CONNECTION ? L"\xE968" : id == NAV_API ? L"\xE943" : id == NAV_LOGS ? L"\xE81C" : id == NAV_PROXY ? L"\xE774" : id == NAV_SETTINGS ? L"\xE713" : dark_ ? L"\xE706" : L"\xE708";
+            RECT icon = rect; icon.left += S(14); icon.right = icon.left + S(20);
+            SelectObject(draw->hDC, iconFont_); DrawTextW(draw->hDC, glyph, -1, &icon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(draw->hDC, selected ? fonts_[1] : fonts_[0]); rect.left += S(46); rect.right -= S(8);
+        }
+        DrawTextW(draw->hDC, text.c_str(), -1, &rect, (side ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if ((draw->itemState & ODS_FOCUS) && !(draw->itemState & ODS_NOFOCUSRECT)) { rect = draw->rcItem; InflateRect(&rect, -S(4), -S(4)); DrawFocusRect(draw->hDC, &rect); }
         SelectObject(draw->hDC, oldFont); SelectObject(draw->hDC, oldPen); SelectObject(draw->hDC, oldBrush); DeleteObject(pen); DeleteObject(brush);
+    }
+    void DrawStatus(DRAWITEMSTRUCT* draw) {
+        const bool green = statusTone_ == DesktopConnectionStatus::Tone::Connected, red = statusTone_ == DesktopConnectionStatus::Tone::Error;
+        auto ink = green ? colors_.green : red ? colors_.red : colors_.yellow;
+        auto fill = green ? colors_.greenFill : red ? colors_.redFill : colors_.yellowFill;
+        auto edge = green ? colors_.greenLine : red ? colors_.redLine : colors_.yellowLine;
+        auto dc = draw->hDC; RECT rect = draw->rcItem; FillRect(dc, &rect, background_);
+        auto pen = CreatePen(PS_SOLID, 1, edge); auto brush = CreateSolidBrush(fill);
+        auto oldPen = SelectObject(dc, pen); auto oldBrush = SelectObject(dc, brush);
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, S(18), S(18));
+        auto dot = CreateSolidBrush(ink); SelectObject(dc, dot); SelectObject(dc, GetStockObject(NULL_PEN));
+        const int x = rect.left + S(12), y = (rect.top + rect.bottom - S(8)) / 2;
+        Ellipse(dc, x, y, x + S(8), y + S(8));
+        SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(dot); DeleteObject(brush); DeleteObject(pen);
+        auto oldFont = SelectObject(dc, fonts_[3]); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, ink);
+        rect.left += S(28); rect.right -= S(13); auto text = ControlText(state_);
+        DrawTextW(dc, text.c_str(), -1, &rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, oldFont);
     }
     void Tray(bool add, bool balloon = false) {
         NOTIFYICONDATAW icon{}; icon.cbSize = sizeof(icon); icon.hWnd = window_; icon.uID = 1;
@@ -383,8 +562,8 @@ class Application {
     void TrayMenu() {
         HMENU menu = CreatePopupMenu(); AppendMenuW(menu, MF_STRING, TRAY_RESTORE, L"打开主窗口");
         AppendMenuW(menu, MF_STRING, TRAY_HIDE, L"收起到托盘"); AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (IsWindowEnabled(Item(PAIR_RESUME)) ? 0 : MF_GRAYED), PAIR_RESUME, L"恢复配对连接");
-        AppendMenuW(menu, MF_STRING | (IsWindowEnabled(Item(PAIR_PAUSE)) ? 0 : MF_GRAYED), PAIR_PAUSE, L"暂停配对连接（保留身份）");
+        const auto pairingUi = DesktopPairingUi::FromStatus(status_);
+        AppendMenuW(menu, MF_STRING | (IsWindowEnabled(Item(PAIR_TOGGLE)) ? 0 : MF_GRAYED), PAIR_TOGGLE, pairingUi.resume ? L"恢复配对连接" : L"暂停配对连接（保留身份）");
         AppendMenuW(menu, MF_STRING | (IsWindowEnabled(Item(PAIR_DISCONNECT)) ? 0 : MF_GRAYED), PAIR_DISCONNECT, L"忘记配对");
         AppendMenuW(menu, MF_STRING | (IsWindowEnabled(Item(NETWORK_DISCONNECT)) ? 0 : MF_GRAYED), NETWORK_DISCONNECT, L"退出私网 / 解锁身份");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr); AppendMenuW(menu, MF_STRING, TRAY_EXIT, L"退出客户端");
@@ -467,12 +646,12 @@ class Application {
                         // The local API can receive a shutdown request before
                         // this startup poll has finished its first bootstrap.
                         if (exitCode == 0) { PostMessageW(window_, MSG_EXIT, 0, 0); return; }
-                        throw std::runtime_error("内置引擎启动失败，请在数据目录查看 client.log，或检查端口是否被占用");
+                        throw std::runtime_error("内置引擎启动失败，请检查本机端口是否被占用，或重新启动客户端");
                     }
                 }
                 if (WaitForSingleObject(wake_.value, 100) == WAIT_OBJECT_0) return;
             }
-            if (!started) { if (!stopping_) throw std::runtime_error("内置引擎启动超时，请检查 client.log"); return; }
+            if (!started) { if (!stopping_) throw std::runtime_error("内置引擎启动超时，请检查本机端口是否被占用，或重新启动客户端"); return; }
             int count = 0;
             while (!stopping_) {
                 if (EngineExited()) { PostMessageW(window_, MSG_EXIT, 0, 0); return; }
@@ -494,13 +673,14 @@ class Application {
         const auto role = Role();
         const bool locked = RoleLocked();
         const bool networkReady = Access().networkReady;
+        const auto pairingUi = DesktopPairingUi::FromStatus(status_);
         EnableWindow(Item(ROLE_CLIENT), enabled && !locked && !testing_);
         EnableWindow(Item(ROLE_HOST), enabled && !locked && !testing_);
         EnableWindow(Item(NETWORK_CONNECT), enabled && !role.empty() && !locked);
         EnableWindow(Item(NETWORK_DISCONNECT), enabled && locked);
         EnableWindow(Item(NETWORK_REFRESH), enabled && locked);
         EnableWindow(Item(NETWORK_LOGIN), enabled && locked && !authUrl_.empty());
-        EnableWindow(Item(PAIR_JOIN), enabled && role == "client" && networkReady);
+        EnableWindow(Item(PAIR_JOIN), enabled && role == "client" && (pairingUi.valid || (networkReady && pairingUi.editable)));
         EnableWindow(Item(PAIR_HOST), enabled && role == "host" && networkReady);
         EnableWindow(Item(PROBE_CLAUDE), enabled && role == "host" && Capability("model"));
         EnableWindow(Item(MODEL_ENABLE), enabled && role == "host" && Capability("model"));
@@ -509,6 +689,7 @@ class Application {
             (ModelApi().value("listening", false) || (enabled && Capability("model") && role == "client")));
         EnableWindow(Item(NAV_API), ready_ && (Capability("model") || ModelApi().value("listening", false)));
         EnableWindow(Item(NAV_PROXY), ready_ && Capability("proxy"));
+        EnableWindow(Item(NETWORK_DIAGNOSTICS), ready_ && !stopping_);
         EnableWindow(Item(COPY_INVITE), enabled && !invitation_.empty());
         EnableWindow(Item(COPY_TOKEN), ready_ && Capability("model"));
         EnableWindow(Item(COPY_EXAMPLE), ready_ && Capability("model") && ModelsReady());
@@ -518,12 +699,10 @@ class Application {
         bool online = role == "client" && Model().value("online", false) && Model().value("available", false);
         EnableWindow(Item(TEST_SEND), ready_ && !busy_ && ModelApi().value("listening", false) && Capability("model") && online && ModelsReady() && !testing_);
         EnableWindow(Item(TEST_CANCEL), testing_ && !requestId_.empty() && !busy_);
-        auto pairing = status_.is_object() ? status_.value("pairing", Json::object()) : Json::object();
-        bool saved = pairing.is_object() && pairing.value("saved", false);
-        bool paused = pairing.is_object() && pairing.value("state", "") == "paused";
-        EnableWindow(Item(PAIR_DISCONNECT), enabled && saved);
-        EnableWindow(Item(PAIR_RESUME), enabled && saved && networkReady && (paused || !status_.value("online", false)));
-        EnableWindow(Item(PAIR_PAUSE), enabled && saved && !paused);
+        EnableWindow(Item(PAIR_DISCONNECT), enabled && pairingUi.canForget);
+        EnableWindow(Item(INVITATION), !busy_);
+        EnableWindow(Item(PAIR_TOGGLE), enabled && pairingUi.canToggle && (!pairingUi.resume || networkReady));
+        Text(PAIR_TOGGLE, pairingUi.resume ? L"恢复配对连接" : L"暂停配对连接");
         EnableWindow(Item(PROXY_ENABLE), enabled && proxyAvailable_ && Capability("proxy") && role == "client");
         EnableWindow(Item(PROXY_SHARING), enabled && proxyAvailable_ && Capability("proxy") && role == "host");
         EnableWindow(Item(COPY_SUBSCRIPTION), enabled && proxyAvailable_ && !proxy_.value("subscriptionUrl", "").empty());
@@ -535,17 +714,17 @@ class Application {
         const auto phase = proxy.value("state", "disabled");
         const bool host = Role() == "host";
         const bool sharing = proxy.value("sharing", false);
-        std::wstring state = host ? (sharing ? L"本机网络共享已开启" : L"本机网络共享未开启") : phase == "ready" && proxy.value("online", false) ? L"B 出口已连接" : phase == "blocked" ? L"B 不可用 · 代理请求已阻断" : phase == "waiting" ? L"等待 B · 自动重连中" : L"代理未启用";
+        std::wstring state = host ? (sharing ? L"本机网络共享已开启" : L"本机网络共享未开启") : phase == "ready" && proxy.value("online", false) ? L"服务端 出口已连接" : phase == "blocked" ? L"服务端 不可用 · 代理请求已阻断" : phase == "waiting" ? L"等待 服务端 · 自动重连中" : L"代理未启用";
         Text(proxyMessage_, state + L"\r\n" + Wide(proxy.value("message", "")));
-        const std::wstring endpoint = host ? L"B 网络共享" : L"A → B 独立代理连接";
+        const std::wstring endpoint = host ? L"服务端网络共享" : L"调用端 → 服务端";
         std::wstring connections = std::to_wstring(proxy.value("connections", 0));
         if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() > 0)
             connections += L" / " + std::to_wstring(proxy["connectionLimit"].get<int>());
         else if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() == 0)
             connections += L"（不设数量上限）";
-        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + (sharing ? L" · B 共享已开启" : L" · B 共享已关闭"));
+        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + L"\r\n" + (sharing ? L"服务端网络共享已开启" : L"服务端网络共享已关闭"));
         Text(PROXY_ENABLE, proxy.value("enabled", false) ? L"关闭本地 Clash 节点" : L"启用本地 Clash 节点");
-        Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 A 使用本机网络");
+        Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 调用端 使用本机网络");
         auto subscription = proxy.value("subscriptionUrl", "");
         Text(PROXY_SUBSCRIPTION, subscription.empty() ? L"启用本地节点后生成" : Wide(subscription));
         RenderDevices(proxyPeerList_, proxy.value("devices", Json::array()), lastProxyDevices_, true);
@@ -562,7 +741,7 @@ class Application {
             auto name = Wide(device.value("name", "未命名设备"));
             auto role = device.value("role", Json());
             std::wstring identity = self ? L"本机" : L"";
-            const auto roleText = role == "host" ? L"B 服务端" : role == "client" ? L"A 调用端" : L"";
+            const auto roleText = role == "host" ? L"服务端" : role == "client" ? L"调用端" : L"";
             if (*roleText) { if (!identity.empty()) identity += L" · "; identity += roleText; }
             if (!identity.empty()) name = identity + L"｜" + name;
             auto address = Wide(device.value("address", "")); if (address.empty()) address = L"尚未分配";
@@ -574,7 +753,7 @@ class Application {
             if (proxy) {
                 const auto bytes = device.value("uploadBytes", uint64_t{0}) + device.value("downloadBytes", uint64_t{0});
                 std::wostringstream usage; usage << device.value("connections", 0) << L" 个 / ";
-                if (bytes < 1024) usage << bytes << L" B";
+                if (bytes < 1024) usage << bytes << L" 字节";
                 else usage << std::fixed << std::setprecision(1) << (static_cast<double>(bytes) / (bytes < 1024 * 1024 ? 1024.0 : 1024.0 * 1024.0)) << (bytes < 1024 * 1024 ? L" KiB" : L" MiB");
                 auto text = usage.str(); ListView_SetItemText(list, row, 3, text.data());
             }
@@ -610,17 +789,17 @@ class Application {
                 if (id == selectedModel_) selected = static_cast<int>(modelIds_.size());
                 modelIds_.push_back(id);
             }
-            if (modelIds_.empty()) SendMessageW(Item(API_MODEL), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"等待 B 端模型列表"));
+            if (modelIds_.empty()) SendMessageW(Item(API_MODEL), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"等待 服务端模型列表"));
             else selectedModel_ = modelIds_[selected];
             SendMessageW(Item(API_MODEL), CB_SETCURSEL, selected, 0); lastModels_ = serialized;
         }
         const auto phase = model.value("modelsState", "unavailable");
-        if (Role() == "client" && !status_.value("online", false)) return L"B 未连接，模型列表暂不可用；连接后自动更新。";
-        if (phase == "loading") return L"正在从 B 获取 Claude 模型列表…";
+        if (Role() == "client" && !status_.value("online", false)) return L"服务端 未连接，模型列表暂不可用；连接后自动更新。";
+        if (phase == "loading") return L"正在从 服务端 获取 Claude 模型列表…";
         if (phase == "error") return L"获取模型列表失败：" + Wide(model.value("modelsError", "请刷新重试。"));
         if (phase == "ready") return L"已获取 " + std::to_wstring(modelIds_.size()) + L" 个模型，请在上方选择。";
         const auto error = model.value("modelsError", "");
-        return error.empty() ? L"模型列表暂不可用，请开启 B 的 Claude 服务后刷新。" : Wide(error);
+        return error.empty() ? L"模型列表暂不可用，请开启 服务端 的 Claude 服务后刷新。" : Wide(error);
     }
     void RenderStatus(const Json& status) {
         auto revision = status.value("revision", uint64_t{0});
@@ -632,7 +811,8 @@ class Application {
         const auto role = Role();
         bool online = status.value("online", false);
         int connectedClients = status.value("connectedClients", 0);
-        Report(online ? (role == "host" ? L"B 服务端 · " + std::to_wstring(connectedClients) + L" 个 A 已连接" : L"A 调用端 · 已配对连接") : !role.empty() ? (RoleLocked() ? L"身份已锁定 · 等待连接" : L"私有网络已退出") : L"请选择本机身份");
+        const auto badge = DesktopConnectionStatus::FromStatus(status, options_.demo);
+        SetStatus(badge.text, badge.tone);
         auto pairing = status.value("pairing", Json::object());
         auto model = Model();
         const auto modelsMessage = RenderModels(model);
@@ -654,6 +834,13 @@ class Application {
         if (roleChanged) { role_ = role == "host" ? 2 : role == "client" ? 1 : 0; page_ = 0; lastProxyDevices_.clear(); }
         if ((page_ == 1 && !Capability("model") && !listening) || (page_ == 3 && !Capability("proxy"))) page_ = 0;
         observedRole_ = role;
+        const auto pairingUi = DesktopPairingUi::FromStatus(status);
+        SendMessageW(Item(INVITATION), EM_SETREADONLY, !pairingUi.editable, 0);
+        if (pairingUi.valid) Text(INVITATION, pairingUi.detail);
+        else if (pairingSummaryShown_ || roleChanged) Text(INVITATION, L"");
+        pairingSummaryShown_ = pairingUi.valid;
+        Text(pairingCaption_, pairingUi.valid ? L"已保存的配对信息" : pairing.value("state", "") == "invalid" || pairing.value("state", "") == "error" ? L"配对已失效，请粘贴新的服务端配对码" : L"粘贴服务端的配对码");
+        Text(PAIR_JOIN, pairingUi.valid ? L"忘记配对" : L"配对并连接服务端");
         if (pairing.is_object()) Text(PAIR_HOST, pairing.value("saved", false) && role == "host" ? L"重新创建服务身份与配对码" : L"创建服务身份与配对码");
         invitation_ = status.value("invitation", Json()).is_string() ? status["invitation"].get<std::string>() : "";
         Text(PAIR_CODE, invitation_.empty() ? L"创建服务身份后生成配对码" : Wide(invitation_));
@@ -670,7 +857,7 @@ class Application {
         if (pairing.is_object() && (pairing.value("saved", false) || pairing.value("state", "none") == "error")) {
             hint = Wide(pairing.value("message", "")) + L"\r\n" + Wide(DesktopAccess::PairingRecoveryHint(pairing, identity.value("desiredOnline", false)));
         }
-        if (role == "host" && online) hint = L"已配对连接 " + std::to_wstring(connectedClients) + L" 个 A。\r\n模型服务与网络共享可分别启停。\r\n退出私网后才可切换身份。";
+        if (role == "host" && online) hint = L"已连接 " + std::to_wstring(connectedClients) + L" 个调用端。\r\n模型服务与网络共享可分别启停。";
         Text(connectionHint_, hint);
         if (status.contains("logs")) {
             std::wstring logs;
@@ -694,7 +881,7 @@ class Application {
         auto model = Utf8(SelectedModel()); if (model.empty()) throw std::runtime_error("请先获取 B 端模型列表并选择模型");
         Json body = {{"model", model}, {"messages", Json::array({{{"role", "user"}, {"content", prompt}}})}, {"stream", true}};
         if (testThread_.joinable()) testThread_.join();
-        testing_ = true; requestId_.clear(); Text(TEST_OUTPUT, L"正在调用 B 的 Claude…"); UpdateButtons();
+        testing_ = true; requestId_.clear(); Text(TEST_OUTPUT, L"正在调用 服务端 的 Claude…"); UpdateButtons();
         testThread_ = std::thread([this, body, epoch = viewEpoch_] {
             std::string output, id; bool done = false;
             try {
@@ -725,11 +912,27 @@ class Application {
         });
     }
     void OnReply(const Reply& reply) {
-        if (reply.kind == "ready") { Text(API_TOKEN, Wide(token_)); Report(L"服务已就绪 · 尚未配对"); UpdateButtons(); return; }
-        if (reply.kind == "startup-error") { Report(L"启动失败"); Message(Wide(reply.text), true); return; }
+        if (reply.kind == "diagnostics" || reply.kind == "diagnostics-error") {
+            diagnosticsBusy_ = false;
+            if (diagnosticsThread_.joinable()) diagnosticsThread_.join();
+            if (!diagnosticsWindow_) return;
+            if (diagnosticsReadPending_) { diagnosticsReadPending_ = false; ReadNetworkDiagnostics(); return; }
+            if (reply.viewEpoch != diagnosticsEpoch_) return;
+            const auto diagnostics = reply.kind == "diagnostics" ? reply.data : Json{{"available", false}, {"message", "读取失败：" + reply.text}};
+            DWORD selectionStart = 0, selectionEnd = 0;
+            SendMessageW(diagnosticsOutput_, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+            const auto firstLine = SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0);
+            Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format(diagnostics));
+            SendMessageW(diagnosticsOutput_, EM_SETSEL, selectionStart, selectionEnd);
+            SendMessageW(diagnosticsOutput_, EM_LINESCROLL, 0, firstLine - SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0));
+            EnableWindow(diagnosticsRefresh_, ready_ && !stopping_);
+            return;
+        }
+        if (reply.kind == "ready") { Text(API_TOKEN, Wide(token_)); SetStatus(L"服务已就绪 · 正在读取身份", DesktopConnectionStatus::Tone::Waiting); UpdateButtons(); return; }
+        if (reply.kind == "startup-error") { SetStatus(L"本机服务启动失败", DesktopConnectionStatus::Tone::Error); Message(Wide(reply.text), true); return; }
         if (reply.kind == "poll-error") {
-            Report(L"本机服务暂时不可用"); proxyAvailable_ = false; statusAvailable_ = false;
-            Text(modelStatus_, L"本地桥接服务不可用，当前无法读取 B 的模型列表。\r\n等待服务恢复后自动更新。");
+            SetStatus(L"本机服务暂时不可用", DesktopConnectionStatus::Tone::Error); proxyAvailable_ = false; statusAvailable_ = false;
+            Text(modelStatus_, L"本地桥接服务不可用，当前无法读取 服务端 的模型列表。\r\n等待服务恢复后自动更新。");
             Text(proxyMessage_, L"本地桥接服务不可用 · 请检查后台进程。\r\n代理连接状态无法确认，等待服务恢复。");
             UpdateButtons(); return;
         }
@@ -766,7 +969,7 @@ class Application {
         IFileDialog* dialog = nullptr;
         if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) throw std::runtime_error("无法打开目录选择器");
         DWORD flags; dialog->GetOptions(&flags); dialog->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"选择 B 端的 Claude 项目目录");
+        dialog->SetTitle(L"选择 服务端的 Claude 项目目录");
         if (SUCCEEDED(dialog->Show(window_))) {
             IShellItem* item = nullptr; if (SUCCEEDED(dialog->GetResult(&item))) {
                 PWSTR path = nullptr; if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) { Text(WORKSPACE, path); CoTaskMemFree(path); SaveSettings(); }
@@ -774,6 +977,146 @@ class Application {
             }
         }
         dialog->Release();
+    }
+    void DiagnosticsFont() {
+        const auto dpi = GetDpiForWindow(diagnosticsWindow_);
+        auto font = CreateFontW(-MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        if (!font) throw std::runtime_error(WindowsError("创建诊断窗口字体"));
+        for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        if (diagnosticsFont_) DeleteObject(diagnosticsFont_);
+        diagnosticsFont_ = font;
+    }
+    void LayoutDiagnostics() {
+        if (!diagnosticsWindow_) return;
+        RECT rect; GetClientRect(diagnosticsWindow_, &rect);
+        const auto dpi = GetDpiForWindow(diagnosticsWindow_);
+        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        const int margin = scale(18), buttonW = scale(104), buttonH = scale(32), gap = scale(12);
+        const int footer = rect.bottom - margin - buttonH;
+        MoveWindow(diagnosticsOutput_, margin, margin, std::max(0, static_cast<int>(rect.right) - margin * 2), std::max(0, footer - margin - gap), TRUE);
+        MoveWindow(diagnosticsRefresh_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW * 2 - gap), footer, buttonW, buttonH, TRUE);
+        MoveWindow(diagnosticsClose_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW), footer, buttonW, buttonH, TRUE);
+    }
+    void ReadNetworkDiagnostics(bool automatic = false) {
+        if (!diagnosticsWindow_ || stopping_) return;
+        if (diagnosticsBusy_) {
+            if (automatic) return;
+            diagnosticsReadPending_ = true;
+            Text(diagnosticsOutput_, L"正在等待前次读取结束，再获取本次诊断采样…");
+            EnableWindow(diagnosticsRefresh_, FALSE);
+            return;
+        }
+        if (!ready_) {
+            Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format({{"available", false}, {"message", "本地服务尚未就绪，请稍后手动刷新。"}}));
+            return;
+        }
+        if (diagnosticsThread_.joinable()) diagnosticsThread_.join();
+        const auto epoch = ++diagnosticsEpoch_;
+        diagnosticsBusy_ = true; EnableWindow(diagnosticsRefresh_, FALSE);
+        if (!automatic) Text(diagnosticsOutput_, L"正在读取本机节点网络诊断…\r\n窗口打开期间每 2 秒自动刷新，仅读取已有计数，不发起测速。\r\n\r\n本机节点启动以来累计，包含模型和代理；重传不等于公网丢包率。");
+        try {
+            diagnosticsThread_ = std::thread([this, epoch] {
+                try { Post({"diagnostics", Api(ControlPort(), token_, L"/api/network/diagnostics", nullptr, 5000), {}, {}, epoch}); }
+                catch (const std::exception& error) { Post({"diagnostics-error", {}, error.what(), {}, epoch}); }
+            });
+        } catch (const std::exception& error) {
+            diagnosticsBusy_ = false; EnableWindow(diagnosticsRefresh_, TRUE);
+            Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format({{"available", false}, {"message", "读取失败：" + std::string(error.what())}}));
+        }
+    }
+    LRESULT HandleDiagnostics(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_CREATE: {
+            diagnosticsOutput_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_OUTPUT), instance_, nullptr);
+            diagnosticsRefresh_ = CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_REFRESH), instance_, nullptr);
+            diagnosticsClose_ = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_CLOSE), instance_, nullptr);
+            if (!diagnosticsOutput_ || !diagnosticsRefresh_ || !diagnosticsClose_) throw std::runtime_error(WindowsError("创建诊断窗口控件"));
+            for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) {
+                SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(this));
+                DesktopTheme::NativeControls(child, dark_);
+            }
+            DesktopTheme::TitleBar(window, dark_, colors_);
+            SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            SendMessageW(diagnosticsOutput_, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
+            DiagnosticsFont(); LayoutDiagnostics(); return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == DIAGNOSTICS_REFRESH && HIWORD(wParam) == BN_CLICKED) ReadNetworkDiagnostics();
+            else if (LOWORD(wParam) == DIAGNOSTICS_CLOSE || LOWORD(wParam) == IDCANCEL) DestroyWindow(window);
+            return 0;
+        case WM_CLOSE: DestroyWindow(window); return 0;
+        case WM_TIMER:
+            if (wParam == DIAGNOSTICS_TIMER && !diagnosticsBusy_ && !stopping_) ReadNetworkDiagnostics(true);
+            return 0;
+        case WM_SIZE: LayoutDiagnostics(); return 0;
+        case WM_DPICHANGED: {
+            auto rect = reinterpret_cast<RECT*>(lParam);
+            SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            DiagnosticsFont(); LayoutDiagnostics(); return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            const auto dpi = GetDpiForWindow(window);
+            RECT rect{0, 0, MulDiv(580, dpi, 96), MulDiv(350, dpi, 96)};
+            AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, dpi);
+            reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
+        }
+        case WM_DRAWITEM: DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)); return TRUE;
+        case WM_ERASEBKGND: {
+            RECT rect; GetClientRect(window, &rect); FillRect(reinterpret_cast<HDC>(wParam), &rect, surface_); return 1;
+        }
+        case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT:
+            SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
+            return reinterpret_cast<LRESULT>(input_);
+        case WM_DESTROY:
+            KillTimer(window, DIAGNOSTICS_TIMER);
+            ++diagnosticsEpoch_; diagnosticsReadPending_ = false;
+            diagnosticsWindow_ = diagnosticsOutput_ = diagnosticsRefresh_ = diagnosticsClose_ = nullptr;
+            if (diagnosticsFont_) { DeleteObject(diagnosticsFont_); diagnosticsFont_ = nullptr; }
+            return 0;
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+    static LRESULT CALLBACK DiagnosticsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        auto self = reinterpret_cast<Application*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) {
+            self = static_cast<Application*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+            self->diagnosticsWindow_ = window; SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (!self) return DefWindowProcW(window, message, wParam, lParam);
+        try { return self->HandleDiagnostics(window, message, wParam, lParam); }
+        catch (const std::exception& error) {
+            if (self->diagnosticsOutput_) self->Text(self->diagnosticsOutput_, L"网络诊断不可用：" + Wide(error.what()));
+            return message == WM_CREATE ? -1 : 0;
+        }
+    }
+    void OpenNetworkDiagnostics() {
+        if (!ready_ || stopping_) return;
+        if (diagnosticsWindow_) { ShowWindow(diagnosticsWindow_, SW_RESTORE); SetForegroundWindow(diagnosticsWindow_); return; }
+        const auto name = className_ + L".NetworkDiagnostics";
+        WNDCLASSEXW type{}; type.cbSize = sizeof(type);
+        if (!GetClassInfoExW(instance_, name.c_str(), &type)) {
+            type.hInstance = instance_; type.lpfnWndProc = DiagnosticsWindowProc; type.lpszClassName = name.c_str();
+            type.hCursor = LoadCursorW(nullptr, IDC_ARROW); type.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101)); type.hIconSm = type.hIcon;
+            if (!RegisterClassExW(&type)) throw std::runtime_error(WindowsError("注册诊断窗口"));
+        }
+        RECT owner; GetWindowRect(window_, &owner);
+        RECT rect{0, 0, S(840), S(640)}; const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
+        AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, extra, dpi_);
+        const int width = rect.right - rect.left, height = rect.bottom - rect.top;
+        MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
+        const int x = std::max(monitor.rcWork.left, owner.left + (owner.right - owner.left - width) / 2);
+        const int y = std::max(monitor.rcWork.top, owner.top + (owner.bottom - owner.top - height) / 2);
+        if (!CreateWindowExW(extra, name.c_str(), L"网络诊断 · 本机节点", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, width, height, window_, nullptr, instance_, this))
+            throw std::runtime_error(WindowsError("创建诊断窗口"));
+        if (!SetTimer(diagnosticsWindow_, DIAGNOSTICS_TIMER, 2000, nullptr)) {
+            const auto error = WindowsError("启动诊断自动刷新");
+            DestroyWindow(diagnosticsWindow_); throw std::runtime_error(error);
+        }
+        ShowWindow(diagnosticsWindow_, SW_SHOWNORMAL); ReadNetworkDiagnostics();
     }
     void Command(int id) {
         try {
@@ -788,11 +1131,19 @@ class Application {
             case TRAY_RESTORE: Restore(); break;
             case TRAY_EXIT: DestroyWindow(window_); break;
             case STARTUP_ENABLE: SetStartup(); break;
+            case THEME_TOGGLE: ToggleTheme(); break;
             case NETWORK_CONNECT: Action(L"/api/network/login", Json::object(), "login"); break;
             case NETWORK_DISCONNECT: Action(L"/api/network/disconnect", Json::object(), "network-disconnect"); break;
             case NETWORK_REFRESH: Action(L"/api/tailscale", Json::object(), "refresh"); break;
+            case NETWORK_DIAGNOSTICS: OpenNetworkDiagnostics(); break;
             case NETWORK_LOGIN: if (!authUrl_.empty() && SafeLoginUrl(authUrl_)) OpenLink(window_, Wide(authUrl_)); break;
-            case PAIR_JOIN: Action(L"/api/join", {{"invitation", Utf8(Value(INVITATION))}}, "join"); break;
+            case PAIR_JOIN:
+                if (IsWindowEnabled(Item(PAIR_JOIN))) {
+                    const auto pairingUi = DesktopPairingUi::FromStatus(status_);
+                    if (pairingUi.valid) Action(L"/api/disconnect", Json::object(), "disconnect");
+                    else if (pairingUi.editable) Action(L"/api/join", {{"invitation", Utf8(Value(INVITATION))}}, "join");
+                }
+                break;
             case PAIR_HOST: Action(L"/api/host", Json::object(), "host"); break;
             case MODEL_ENABLE: {
                 int seconds = ConfigNumber(MODEL_TIMEOUT, 1, 3600, "单次最长时间必须为 1–3600 秒");
@@ -804,11 +1155,17 @@ class Application {
                 if (IsWindowEnabled(Item(MODEL_API_TOGGLE))) Action(L"/api/model-api", {{"enabled", !ModelApi().value("listening", false) && !ModelApi().value("enabled", false)}}, "model-api");
                 break;
             case MODELS_REFRESH:
-                Text(modelStatus_, L"正在从 B 刷新 Claude 模型列表…");
+                Text(modelStatus_, L"正在从 服务端 刷新 Claude 模型列表…");
                 Action(L"/api/models/refresh", Json::object(), "models"); break;
             case PAIR_DISCONNECT: Action(L"/api/disconnect", Json::object(), "disconnect"); break;
             case PAIR_PAUSE: Action(L"/api/pause", Json::object(), "pause"); break;
             case PAIR_RESUME: Action(L"/api/reconnect", Json::object(), "reconnect"); break;
+            case PAIR_TOGGLE:
+                if (IsWindowEnabled(Item(PAIR_TOGGLE))) {
+                    const auto pairingUi = DesktopPairingUi::FromStatus(status_);
+                    Action(pairingUi.resume ? L"/api/reconnect" : L"/api/pause", Json::object(), pairingUi.resume ? "reconnect" : "pause");
+                }
+                break;
             case BROWSE_WORKSPACE: Browse(); break;
             case PROBE_CLAUDE: Action(L"/api/probe", {{"claudeCommand", Utf8(Value(CLAUDE_COMMAND))}}, "probe"); break;
             case PROXY_ENABLE: Action(L"/api/proxy", {{"enabled", !proxy_.value("enabled", false)}}, "proxy"); break;
@@ -830,6 +1187,7 @@ class Application {
     }
     void Stop() {
         if (stopping_.exchange(true)) return;
+        if (diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
         SaveSettings(); SetEvent(wake_.value);
         {
             std::lock_guard lock(engineMutex_);
@@ -840,7 +1198,7 @@ class Application {
             DrainOwnedJob(job_.value, process_.value);
             job_.reset();
         }
-        for (auto* thread : {&pollThread_, &actionThread_, &testThread_}) if (thread->joinable()) thread->join();
+        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_}) if (thread->joinable()) thread->join();
         if (trayAdded_) { NOTIFYICONDATAW icon{}; icon.cbSize = sizeof(icon); icon.hWnd = window_; icon.uID = 1; Shell_NotifyIconW(NIM_DELETE, &icon); trayAdded_ = false; }
         MSG message; while (PeekMessageW(&message, window_, MSG_REPLY, MSG_REPLY, PM_REMOVE)) delete reinterpret_cast<Reply*>(message.lParam);
     }
@@ -855,14 +1213,17 @@ class Application {
         case WM_PAINT: Paint(); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_DRAWITEM: DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)); return TRUE;
+        case WM_CTLCOLORLISTBOX:
+            SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
+            return reinterpret_cast<LRESULT>(input_);
         case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_CTLCOLORBTN: {
             HDC dc = reinterpret_cast<HDC>(wParam); HWND child = reinterpret_cast<HWND>(lParam);
             for (const auto& item : widgets_) if (item.window == child) {
-                SetTextColor(dc, item.sidebar ? item.muted ? RGB(155, 168, 189) : RGB(249, 250, 252) : item.muted ? MUTED : INK);
+                SetTextColor(dc, item.muted ? colors_.muted : colors_.ink);
                 SetBkMode(dc, OPAQUE);
-                COLORREF color = item.sidebar ? SIDEBAR : item.edit || item.page >= 0 ? RGB(255, 255, 255) : BACKGROUND;
+                COLORREF color = item.sidebar ? colors_.sidebar : item.edit ? colors_.input : item.page >= 0 ? colors_.surface : colors_.background;
                 SetBkColor(dc, color);
-                return reinterpret_cast<LRESULT>(item.sidebar ? sidebar_ : item.edit || item.page >= 0 ? white_ : background_);
+                return reinterpret_cast<LRESULT>(item.sidebar ? sidebar_ : item.edit ? input_ : item.page >= 0 ? surface_ : background_);
             }
             break;
         }
@@ -897,10 +1258,11 @@ public:
         instanceNames_ = DesktopSingleInstance::TestNames(BRIDGE_DESKTOP_TEST_NAMESPACE);
 #endif
         className_ = instanceNames_.windowClass;
-        background_ = CreateSolidBrush(BACKGROUND); white_ = CreateSolidBrush(RGB(255, 255, 255)); sidebar_ = CreateSolidBrush(SIDEBAR);
+        background_ = CreateSolidBrush(colors_.background); surface_ = CreateSolidBrush(colors_.surface);
+        sidebar_ = CreateSolidBrush(colors_.sidebar); input_ = CreateSolidBrush(colors_.input);
         wake_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr)); taskbarMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
     }
-    ~Application() { Stop(); for (auto font : fonts_) if (font) DeleteObject(font); DeleteObject(background_); DeleteObject(white_); DeleteObject(sidebar_); }
+    ~Application() { Stop(); for (auto font : fonts_) if (font) DeleteObject(font); if (iconFont_) DeleteObject(iconFont_); for (auto brush : {background_, surface_, sidebar_, input_}) if (brush) DeleteObject(brush); }
     int Run() {
         // The member outlives Stop(), including startup exceptions. Keep the
         // user-wide lock until every owned engine/job has finished shutting down.
@@ -928,7 +1290,10 @@ public:
         if (options_.minimized && trayAdded_) HideToTray(); else ShowWindow(window_, SW_SHOWNORMAL);
         UpdateWindow(window_); pollThread_ = std::thread([this] { Poll(); });
         MSG message;
-        while (GetMessageW(&message, nullptr, 0, 0) > 0) if (!IsDialogMessageW(window_, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (diagnosticsWindow_ && IsDialogMessageW(diagnosticsWindow_, &message)) continue;
+            if (!IsDialogMessageW(window_, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        }
         return 0;
     }
 };

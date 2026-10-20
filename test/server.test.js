@@ -43,6 +43,10 @@ test('the browser entry point and its role-state module are served together', as
   assert.equal(state.status, 200);
   assert.match(state.headers.get('content-type'), /javascript/);
   assert.match(await state.text(), /export function uiState/);
+  const diagnostics = await fetch(`${url}/network-diagnostics.js`);
+  assert.equal(diagnostics.status, 200);
+  assert.match(diagnostics.headers.get('content-type'), /javascript/);
+  assert.match(await diagnostics.text(), /export /);
 });
 
 test('network diagnostics is an authenticated read-only management snapshot with host and origin checks', async (t) => {

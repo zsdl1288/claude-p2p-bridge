@@ -56,10 +56,14 @@ test('identity is chosen before networking; B pairing does not require Claude an
   assert.equal(bridge.status().model.enabled, false);
   assert.deepEqual(bridge.status().capabilities, { model: true, proxy: true });
   const invitation = bridge.status().invitation;
+  const pairingSummary = bridge.status().pairing.summary;
   const disconnected = await bridge.disconnectNetwork();
   assert.equal(disconnected.identity.canSwitchRole, true);
   assert.equal(disconnected.network.devices[0].online, false);
   assert.equal(bridge.status().invitation, invitation);
+  assert.equal(disconnected.pairing.valid, true);
+  assert.equal(disconnected.pairing.paused, true);
+  assert.deepEqual(disconnected.pairing.summary, pairingSummary);
   assert.equal(bridge.status().identity.canSwitchRole, true);
   assert.deepEqual(bridge.status().capabilities, { model: true, proxy: true });
   await assert.rejects(bridge.resume(), /主动断开/);

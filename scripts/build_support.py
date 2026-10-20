@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / '.tools'
@@ -133,3 +134,66 @@ def verify_build_record(root, version, sources):
             or value.get('sha256') != hashlib.sha256(executable.read_bytes()).hexdigest()):
         raise ValueError('Source or EXE differs from its build record; rebuild before packaging this release')
     return True
+
+
+def cleanup_release(root, version, sources):
+    """Prune known old artifacts only after a complete, verified release exists."""
+    root = Path(root).resolve()
+    release = checked_path(root / 'release')
+    entries = [checked_path(file) for file in release.iterdir()]
+    release_name = re.compile(
+        r'^(?:ClaudeBridge-([0-9]+\.[0-9]+\.[0-9]+)-windows-x64\.(?:exe|sha256\.txt|build\.json)'
+        r'|claude-p2p-bridge-([0-9]+\.[0-9]+\.[0-9]+)\.zip)$')
+    current = tuple(map(int, version.split('.')))
+    versioned = [(file, match.group(1) or match.group(2)) for file in entries
+                 if file.is_file() and (match := release_name.fullmatch(file.name))]
+    # Repacking a historical checkout must never remove a newer release,
+    # including one whose build or source archive is not complete yet.
+    if any(tuple(map(int, value.split('.'))) > current for _, value in versioned):
+        return []
+    verify_source_version(root, version)
+    if not verify_build_record(root, version, sources):
+        raise ValueError('A verified EXE build record is required before release cleanup')
+    executable = checked_file(release / f'ClaudeBridge-{version}-windows-x64.exe')
+    checksum = checked_file(executable.with_suffix('.sha256.txt'))
+    record = checked_file(executable.with_suffix('.build.json'))
+    if json.loads(record.read_text(encoding='utf-8')).get('diagnostics'):
+        raise ValueError('A diagnostics build cannot replace the production release')
+    checksum_parts = checksum.read_text(encoding='utf-8').split()
+    if checksum_parts != [hashlib.sha256(executable.read_bytes()).hexdigest(), executable.name]:
+        raise ValueError('EXE checksum file does not match; old releases were retained')
+    archive = checked_file(release / f'claude-p2p-bridge-{version}.zip')
+    with zipfile.ZipFile(archive) as package:
+        expected = {f'claude-p2p-bridge-{version}/{name}': digest for name, digest in sources.items()}
+        if len(package.infolist()) != len(expected) or set(package.namelist()) != set(expected):
+            raise ValueError('Source archive entries differ from the build record')
+        if any(hashlib.sha256(package.read(name)).hexdigest() != digest for name, digest in expected.items()):
+            raise ValueError('Source archive content differs from the build record')
+    candidates = [checked_file(file) for file, value in versioned
+                  if tuple(map(int, value.split('.'))) < current]
+    recovery_name = 'ClaudeBridge-Network-Recovery-windows-x64'
+    recovery = release / f'{recovery_name}.zip'
+    if recovery.exists():
+        # Retain the portable recovery ZIP; remove loose copies only when the
+        # ZIP contains exactly the same usable executable, checksum and guide.
+        recovery_files = (f'{recovery_name}.exe', f'{recovery_name}.sha256.txt', 'NETWORK-RECOVERY-README.txt')
+        with zipfile.ZipFile(checked_file(recovery)) as package:
+            if len(package.infolist()) != 3 or set(package.namelist()) != set(recovery_files):
+                raise ValueError('Offline recovery archive is incomplete; old releases were retained')
+            contents = {name: package.read(name) for name in recovery_files}
+        recovery_hash = hashlib.sha256(contents[recovery_files[0]]).hexdigest()
+        if not contents[recovery_files[0]] or contents[recovery_files[1]].decode('utf-8-sig').split() != [recovery_hash, recovery_files[0]] or not contents[recovery_files[2]].strip():
+            raise ValueError('Offline recovery checksum or guide is invalid; old releases were retained')
+        for name, content in contents.items():
+            file = release / name
+            if file.exists() and checked_file(file).read_bytes() == content:
+                candidates.append(file)
+    # Preflight all candidates before the first deletion. Never recurse into
+    # diagnostics or other directories, and leave unrecognized files alone.
+    for file in candidates:
+        checked_file(file)
+    removed = []
+    for file in candidates:
+        checked_file(file).unlink()
+        removed.append(file.name)
+    return removed

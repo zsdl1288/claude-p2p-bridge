@@ -162,7 +162,9 @@ def main():
             assert node["port"] == original["port"] and node["username"] and node["password"]
             assert node["udp"] is True and config["tun"]["enable"] is True
             assert config["tun"]["device"] == "ClaudeBridgeTun" and config["tun"]["strict-route"] is True
-            assert config["rules"][-1] == "MATCH," + node["name"]
+            group = config["proxy-groups"][0]
+            assert group == {"name": "通过 B 上网", "type": "select", "proxies": [node["name"]]}
+            assert config["rules"][-1] == "MATCH," + group["name"]
             assert all(resolver.endswith("#" + node["name"]) for resolver in config["dns"]["nameserver"])
             check_private_target_denied(node)
             assert len(original["devices"]) == 2 and sum(device["self"] for device in original["devices"]) == 1, original

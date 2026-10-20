@@ -101,12 +101,14 @@ export class BridgePeer extends EventEmitter {
     this.update({ listening: true, endpoint: `${this.pairing.host}:${this.pairing.port}` });
   }
   upgrade(req, socket, head) {
-    if (this.closed || !this.wss || req.url !== this.route || req.headers.origin || !equalSecret(req.headers.authorization, `Bearer ${digest(`${this.authLabel}:${this.pairing.room}:${this.pairing.secret}`)}`)) return rejectUpgrade(socket, 401, 'Unauthorized');
+    if (this.closed || !this.wss) return rejectUpgrade(socket, 503, 'Service unavailable');
+    if (req.url !== this.route || req.headers.origin || !equalSecret(req.headers.authorization, `Bearer ${digest(`${this.authLabel}:${this.pairing.room}:${this.pairing.secret}`)}`)) return rejectUpgrade(socket, 401, 'Unauthorized');
     // Handshakes also reserve a slot, bounding unverified sockets.
     if (this.connections.size >= this.maxClients) return rejectUpgrade(socket, 409, 'Client limit reached');
     this.wss.handleUpgrade(req, socket, head, (ws) => this.bindSocket(ws));
   }
   connect() {
+    if (this.state.pairingRejected) return Promise.reject(new Error('配对已失效，请使用服务端的新配对码重新配对'));
     if (this.connecting) return this.connecting;
     if (this.isConnected(this.clientConnection)) return Promise.resolve();
     const attempt = this.connectOnce().finally(() => { if (this.connecting === attempt) this.connecting = null; });
@@ -144,7 +146,20 @@ export class BridgePeer extends EventEmitter {
     }, this.heartbeatMs);
     heartbeat.unref();
     ws.on('pong', () => { alive = true; });
-    ws.on('error', (error) => { lastError = `连接 B 端失败：${error.message}。请确认两端 Tailscale 已连接、B 正在提供服务，且 TCP ${this.pairing.port} 未被防火墙阻止`; reportError(lastError); });
+    ws.on('error', (error) => {
+      if (this.state.pairingRejected || lastError) return;
+      lastError = `连接 B 端失败：${error.message}。请确认两端 Tailscale 已连接、B 正在提供服务，且 TCP ${this.pairing.port} 未被防火墙阻止`; reportError(lastError);
+    });
+    if (this.role === 'client' && this.channel === 'control') ws.on('unexpected-response', (_request, response) => {
+      // Only a control-channel credential rejection invalidates a saved pair.
+      // Address policy (403), capacity (409) and service outages remain retryable.
+      response.resume();
+      if (response.statusCode === 401) {
+        clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
+        this.update({ pairingRejected: true });
+        fail('配对已失效（HTTP 401），请使用服务端的新配对码重新配对');
+      } else fail(`服务端暂时拒绝连接（HTTP ${response.statusCode}），正在等待恢复`);
+    });
     ws.on('message', (raw) => {
       if (this.closed || !this.connections.has(connection)) return;
       try {
@@ -203,7 +218,7 @@ export class BridgePeer extends EventEmitter {
     if (ws.readyState === WebSocket.OPEN) hello(); else ws.once('open', hello);
   }
   scheduleReconnect() {
-    if (this.closed || this.reconnectTimer || (!this.hasConnected && !this.retryInitial)) return;
+    if (this.closed || this.state.pairingRejected || this.reconnectTimer || (!this.hasConnected && !this.retryInitial)) return;
     const delay = Math.min(this.retryMs * 2 ** Math.min(this.retry++, 30), 15000);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

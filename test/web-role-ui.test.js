@@ -79,3 +79,14 @@ test('web controllers reference present, unique controls in the page template', 
   assert.equal(new Set(ids).size, ids.length, 'control IDs must be unique');
   for (const match of script.matchAll(/\$\('([^']+)'\)/g)) assert.ok(ids.includes(match[1]), `missing #${match[1]}`);
 });
+
+test('proxy diagnostics explains local cumulative scope and offers explicit refresh and close controls', async () => {
+  const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  const proxyPage = html.slice(html.indexOf('<section id="proxy"'), html.indexOf('<section id="activity"'));
+  for (const id of ['network-diagnostics-open', 'network-diagnostics-panel', 'network-diagnostics-refresh', 'network-diagnostics-close']) assert.match(proxyPage, new RegExp(`id="${id}"`));
+  assert.match(proxyPage, /包含模型和代理流量/);
+  assert.match(proxyPage, /自该节点启动以来累计/);
+  assert.match(proxyPage, /“当前已建立连接”是当前值/);
+  assert.match(proxyPage, /TCP 重传不能当作公网丢包率/);
+  assert.match(proxyPage, /打开期间每 2 秒更新，关闭即停止/);
+});

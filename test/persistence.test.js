@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
 import { Bridge } from '../src/bridge.js';
 import { PersistentBridge } from '../src/persistent-bridge.js';
 import { makePairing, encodeInvitation } from '../src/crypto.js';
 import { validateSavedPairing } from '../src/pairing-store.js';
+import { rejectUpgrade } from '../src/http-upgrade.js';
 
 class MemoryStore {
   constructor(record = null, demo = true) { this.record = record; this.demo = demo; }
@@ -38,12 +40,17 @@ test('both sides preserve the same pairing across restart; A starts first and wa
   await until(() => host.status().online);
   assert.equal(client.status().pairing.saved, true);
   assert.equal(host.status().pairing.saved, true);
+  const summary = { role: 'client', host: '127.0.0.1', port: host.peer.pairing.port, endpoint: `127.0.0.1:${host.peer.pairing.port}` };
+  assert.deepEqual(client.status().pairing.summary, summary);
+  assert.equal(client.status().pairing.valid, true);
   const original = structuredClone(hostStore.record);
   await Promise.all([client.close(), host.close()]);
   assert.deepEqual(hostStore.record, original, 'Exiting must not revoke pairing');
   client = make(clientStore); bridges.push(client); await client.start();
   await until(() => client.peer && !client.status().online);
   assert.equal(client.status().pairing.state, 'connecting');
+  assert.equal(client.status().pairing.valid, true, 'An offline server does not invalidate the saved pairing');
+  assert.deepEqual(client.status().pairing.summary, summary);
   host = make(hostStore); bridges.push(host); await host.start();
   await until(() => host.status().online && client.status().online && client.status().model.available);
   assert.equal(host.status().invitation, first.invitation, 'Restart must preserve the secret, room, address and port');
@@ -62,6 +69,9 @@ test('pause keeps credentials; resume reconnects; forgetting B revokes its liste
   await client.join({ invitation: first.invitation }); await until(() => host.status().online);
   await client.pause();
   assert.equal(client.status().pairing.state, 'paused'); assert.ok(cs.record);
+  assert.equal(client.status().pairing.paused, true);
+  assert.equal(client.status().pairing.valid, true);
+  assert.deepEqual(client.status().pairing.summary, { role: 'client', host: '127.0.0.1', port: host.peer.pairing.port, endpoint: `127.0.0.1:${host.peer.pairing.port}` });
   await new Promise((resolve) => setTimeout(resolve, 100)); assert.equal(client.peer, null);
   await client.resume(); await until(() => host.status().online && client.status().online);
   await host.pause(); assert.equal(hs.record.invitation, first.invitation);
@@ -72,6 +82,50 @@ test('pause keeps credentials; resume reconnects; forgetting B revokes its liste
   const restarted = make(hs); all.push(restarted); await restarted.start();
   await new Promise((resolve) => setTimeout(resolve, 100)); assert.equal(restarted.peer, undefined);
   await client.disconnect(); assert.equal(cs.record, null);
+});
+
+test('a revoked saved invitation becomes invalid without deleting it and a new invitation replaces it', { timeout: 10000 }, async (t) => {
+  const host = make(new MemoryStore()), store = new MemoryStore();
+  let client = make(store);
+  const bridges = [host, client];
+  t.after(async () => { for (const bridge of bridges) await bridge.close(); });
+  const first = await host.host({ bridgePort: 0 });
+  await client.join({ invitation: first.invitation });
+  const original = structuredClone(store.record), port = host.peer.pairing.port;
+  await client.close(); await host.disconnect();
+  const replacement = await host.host({ bridgePort: port });
+  assert.notEqual(replacement.invitation, first.invitation);
+  client = make(store); bridges.push(client); await client.start();
+  await until(() => client.status().pairing.state === 'invalid');
+  assert.equal(client.status().pairing.valid, false);
+  assert.equal(client.status().pairing.autoConnect, false);
+  assert.deepEqual(store.record, original, 'Invalidation must retain credentials until explicit replacement or forgetting');
+  assert.deepEqual(client.status().pairing.summary, { role: 'client', host: '127.0.0.1', port, endpoint: `127.0.0.1:${port}` });
+  await until(() => client.peer.connections.size === 0);
+  assert.equal(client.peer.reconnectTimer, null);
+  await assert.rejects(client.resume(), /配对已失效/);
+  await client.pause();
+  assert.equal(client.status().pairing.state, 'invalid', 'Pause cannot erase an earlier explicit credential rejection');
+  await client.join({ invitation: replacement.invitation });
+  assert.equal(client.status().pairing.valid, true);
+  assert.equal(client.status().pairing.state, 'connected');
+  assert.equal(store.record.invitation, replacement.invitation);
+});
+
+for (const status of [403, 409, 503]) test(`HTTP ${status} remains retryable and never invalidates saved credentials`, { timeout: 5000 }, async (t) => {
+  const server = http.createServer(); let attempts = 0;
+  server.on('upgrade', (_request, socket) => { ++attempts; rejectUpgrade(socket, status, 'Temporarily unavailable'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const invitation = encodeInvitation(makePairing('127.0.0.1', server.address().port, { allowLoopback: true }));
+  const store = new MemoryStore({ v: 2, mode: 'demo', role: 'client', invitation });
+  const client = make(store);
+  t.after(async () => { await client.close(); await new Promise((resolve) => server.close(resolve)); });
+  await client.start(); await until(() => client.peer); client.peer.retryMs = 20;
+  await until(() => attempts >= 2);
+  assert.equal(client.status().pairing.state, 'connecting');
+  assert.equal(client.status().pairing.valid, true);
+  assert.equal(client.status().pairing.saved, true);
+  assert.equal(store.record.invitation, invitation);
 });
 
 test('a queued pause supersedes an earlier resume or activation and cannot restart itself', { timeout: 10000 }, async (t) => {

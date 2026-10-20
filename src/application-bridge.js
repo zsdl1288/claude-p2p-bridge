@@ -145,8 +145,8 @@ export class ApplicationBridge extends PersistentBridge {
       model.enabled = this.modelPreferences.enabled;
       if (this.modelConfigurationError) model.message = this.modelConfigurationError;
     }
-    const pairing = { ...state.pairing, role, ready, autoConnect: Boolean(this.saved && this.intentOnline && !this.paused) };
-    if (this.saved && !this.intentOnline) Object.assign(pairing, { state: 'network-disconnected', message: '私有网络已主动断开；配对保留，重新连接后恢复' });
+    const pairing = { ...state.pairing, role, ready, autoConnect: Boolean(this.saved && state.pairing.valid && this.intentOnline && !this.paused) };
+    if (this.saved && state.pairing.valid && !this.intentOnline) Object.assign(pairing, { state: 'network-disconnected', message: '私有网络已主动断开；配对保留，重新连接后恢复' });
     return { ...state, role, model, pairing, instanceId: this.applicationInstanceId, revision: this.applicationRevision,
       identity: { role, locked: Boolean(this.roleLocked || this.intentOnline), desiredOnline: this.intentOnline,
         loaded: this.applicationReady === true,

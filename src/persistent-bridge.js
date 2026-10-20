@@ -9,9 +9,16 @@ export class PersistentBridge extends Bridge {
     this.store = store; this.restoreDelay = restoreDelay;
     this.operations = Promise.resolve(); this.generation = 0; this.restoreAttempts = 0;
     this.saved = null; this.loaded = false; this.paused = false; this.closing = false;
+    this.pairingInvalid = false;
     this.restoreMessage = ''; this.storageError = ''; this.networkResets = 0;
     this.onNetworkReset = () => { ++this.networkResets; this.recoverNetwork(); };
     this.networkAdapter?.on?.('reset', this.onNetworkReset);
+    this.on('state', () => {
+      if (!this.pairingInvalid && this.saved && this.peer?.state.pairingRejected
+          && encodeInvitation(this.peer.pairing) === this.saved.invitation) {
+        this.pairingInvalid = true; this.cancelRestore();
+      }
+    });
   }
   enqueue(task) {
     const result = this.operations.then(task);
@@ -26,6 +33,8 @@ export class PersistentBridge extends Bridge {
   status() {
     const state = super.status();
     const role = state.role || this.saved?.role || null;
+    const pair = this.saved ? parseInvitation(this.saved.invitation, { allowLoopback: this.demo }) : null;
+    const summary = pair ? { role: this.saved.role, host: pair.host, port: pair.port, endpoint: `${pair.host}:${pair.port}` } : null;
     let phase = !this.loaded ? 'loading' : 'none';
     let message = !this.loaded ? '正在读取已保存的配对' : '成功配对后会自动保存';
     if (this.saved) {
@@ -35,10 +44,12 @@ export class PersistentBridge extends Bridge {
         : this.peer?.role === 'client' ? '正在自动连接 B，等待对端上线'
         : this.restoreMessage || '正在恢复已保存的配对';
     }
+    if (this.saved && this.pairingInvalid) { phase = 'invalid'; message = '配对已失效，请使用服务端的新配对码重新配对'; }
     if (this.storageError) { phase = 'error'; message = this.storageError; }
     return { ...state, role, config: state.config || this.saved?.config || null,
       invitation: state.invitation || (this.saved?.role === 'host' ? this.saved.invitation : null),
-      pairing: { saved: Boolean(this.saved), role, state: phase, autoConnect: Boolean(this.saved), message, error: this.storageError || null } };
+      pairing: { saved: Boolean(this.saved), valid: Boolean(this.saved && !this.pairingInvalid), paused: this.paused, summary,
+        role, state: phase, autoConnect: Boolean(this.saved && !this.paused && !this.pairingInvalid), message, error: this.storageError || null } };
   }
   start() {
     if (!this.started) this.started = this.enqueue(async () => {
@@ -80,7 +91,7 @@ export class PersistentBridge extends Bridge {
     });
   }
   scheduleRestore(delay = this.restoreDelay) {
-    if (!this.saved || this.paused || this.closing || !this.canRestore()) return;
+    if (!this.saved || this.pairingInvalid || this.paused || this.closing || !this.canRestore()) return;
     clearTimeout(this.restoreTimer);
     const generation = this.generation;
     this.restoreTimer = setTimeout(() => {
@@ -90,7 +101,7 @@ export class PersistentBridge extends Bridge {
     this.restoreTimer.unref();
   }
   async restore(generation) {
-    const current = () => generation === this.generation && !this.closing && !this.paused && this.canRestore() && this.saved;
+    const current = () => generation === this.generation && !this.closing && !this.paused && !this.pairingInvalid && this.canRestore() && this.saved;
     if (!current() || this.peer) return;
     try {
       if (!this.demo) {
@@ -141,7 +152,7 @@ export class PersistentBridge extends Bridge {
         const record = { v: config ? 1 : 2, mode: this.demo ? 'demo' : 'tailscale', role,
           invitation: encodeInvitation(this.peer.pairing), ...(config ? { config } : {}) };
         this.saved = await this.store.save(record);
-        this.paused = false; this.storageError = ''; this.restoreMessage = ''; this.lastRestoreError = '';
+        this.paused = false; this.pairingInvalid = false; this.storageError = ''; this.restoreMessage = ''; this.lastRestoreError = '';
         this.log('配对已加密保存，下次打开客户端会自动连接');
         // The first listener can lose its helper while saving credentials.
         // There was no saved pairing for the reset handler to recover yet;
@@ -173,6 +184,7 @@ export class PersistentBridge extends Bridge {
       if (this.closing) throw new Error('客户端正在退出');
       if (!this.canRestore()) throw new Error('私有网络已主动断开，请先重新连接');
       if (!this.saved) throw new Error('没有可恢复的配对，请先完成一次配对');
+      if (this.pairingInvalid) throw new Error('配对已失效，请使用服务端的新配对码重新配对');
       await super.disconnect();
       this.paused = false; this.restoreMessage = ''; this.restoreAttempts = 0;
       this.scheduleRestore(0); this.emit('state'); return this.status();
@@ -187,7 +199,7 @@ export class PersistentBridge extends Bridge {
     await super.disconnect();
     try { await this.store.clear(); }
     catch { this.storageError = '配对已停止，但保存的信息未能删除，请重试“忘记配对”'; throw new Error(this.storageError); }
-    this.saved = null; this.storageError = ''; this.restoreMessage = '';
+    this.saved = null; this.pairingInvalid = false; this.storageError = ''; this.restoreMessage = '';
     this.log('已忘记配对并撤销本次服务；下次启动不会自动连接');
     return this.status();
   }
