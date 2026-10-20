@@ -37,7 +37,9 @@ type proxy struct {
 
 func newProxy(listener net.Listener, dial func(context.Context) (net.Conn, error), limits ...int) *proxy {
 	limit := 16
-	if len(limits) > 0 && limits[0] > 0 && limits[0] <= 512 {
+	// Only an explicit zero opts a data transport out of admission limits.
+	// Omitted or invalid limits retain the default for other callers.
+	if len(limits) > 0 && limits[0] >= 0 && limits[0] <= 4096 {
 		limit = limits[0]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -51,7 +53,7 @@ func newProxy(listener net.Listener, dial func(context.Context) (net.Conn, error
 			p.mu.Lock()
 			// Each client owns two sockets after dialing. Count accepted clients,
 			// while keeping both sockets in connections so revocation closes both.
-			if p.closed || p.clients >= limit {
+			if p.closed || (limit > 0 && p.clients >= limit) {
 				p.mu.Unlock()
 				incoming.Close()
 				continue

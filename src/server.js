@@ -95,11 +95,12 @@ export function createLocalServer({ port = 3210, token, bridge = new Bridge(), w
       await initialized;
       if (stopping || !ready) return reject(503, '客户端尚未就绪或正在退出', 'server_stopping');
       if (req.method === 'GET' && url.pathname === '/api/bootstrap' && req.headers['x-bridge-ui'] === '1') return json(res, 200, { token, workspace, version, api: `http://127.0.0.1:${address.port}` });
-      const subscription = url.pathname.match(/^\/clash\/([\w-]{43})\/(config|nodes)\.yaml$/);
+      const subscription = url.pathname.match(/^\/clash\/([\w-]{43})\/(config|nodes|claude)\.yaml$/);
       if (req.method === 'GET' && subscription) {
         if (!proxy || !equalSecret(subscription[1], proxy.subscriptionToken)) return reject(401, '订阅凭据无效');
-        const content = proxy.profile(subscription[2] === 'nodes');
-        res.writeHead(200, { 'Content-Type': 'application/yaml; charset=utf-8', 'Content-Disposition': 'inline; filename="ClaudeBridge-Clash.yaml"', 'Profile-Update-Interval': '12' });
+        const claudeOnly = subscription[2] === 'claude';
+        const content = proxy.profile(subscription[2] === 'nodes', claudeOnly ? 'claude' : 'all');
+        res.writeHead(200, { 'Content-Type': 'application/yaml; charset=utf-8', 'Content-Disposition': `inline; filename="${claudeOnly ? 'ClaudeBridge-Claude-only' : 'ClaudeBridge-Clash'}.yaml"`, 'Profile-Update-Interval': '12' });
         res.end(content); return;
       }
       if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return reject(401, '需要有效的 Authorization: Bearer <API_TOKEN>', 'invalid_api_key');

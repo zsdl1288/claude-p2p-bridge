@@ -128,20 +128,23 @@ test('authenticated SOCKS TCP transfers independent streams, early data and half
   assert.ok(a.uploadBytes >= payload.length && a.downloadBytes >= payload.length);
 });
 
-test('default capacity keeps 80 real TCP streams usable and releases all local and remote slots', { timeout: 15000 }, async (t) => {
+test('unbounded defaults keep 2100 real TCP streams usable and release all local and remote slots', { timeout: 30000 }, async (t) => {
   const { a, b, socks } = await setup(t), port = await tcpEcho(t);
-  assert.equal(a.status().connectionLimit, 256);
-  assert.equal(b.status().connectionLimit, 384);
-  assert.equal(b.status().sessionConnectionLimit, 256);
-  const streams = await Promise.all(Array.from({ length: 80 }, () => socks(1, { host: '127.0.0.1', port })));
-  assert.equal(a.flows.size, 80); assert.equal(b.flows.size, 80);
+  assert.equal(a.status().connectionLimit, 0);
+  assert.equal(b.status().connectionLimit, 0);
+  assert.equal(b.status().sessionConnectionLimit, 0);
+  const streams = [];
+  // Keep every stream open while filling the capacity, without exceeding the
+  // Windows listener's accept backlog in a single connection burst.
+  for (let i = 0; i < 21; ++i) streams.push(...await Promise.all(Array.from({ length: 100 }, () => socks(1, { host: '127.0.0.1', port }))));
+  assert.equal(a.flows.size, 2100); assert.equal(b.flows.size, 2100); assert.equal(a.localSockets.size, 2100);
   await Promise.all(streams.map(async ({ socket, reader, reply }, i) => {
     assert.equal(reply[1], 0, `stream ${i} must fit within the default capacity`);
     const payload = `stream-${i}`;
     socket.write(payload); assert.equal((await reader.read(Buffer.byteLength(payload))).toString(), payload);
   }));
   for (const { socket } of streams) socket.end();
-  await until(() => a.flows.size === 0 && b.flows.size === 0 && a.localSockets.size === 0);
+  await until(() => a.flows.size === 0 && b.flows.size === 0 && a.localSockets.size === 0 && b.localSockets.size === 0);
 });
 
 test('TCP target may send data immediately after connect without losing coalesced WebSocket frames', { timeout: 10000 }, async (t) => {
@@ -271,8 +274,8 @@ test('default policy rejects literal and DNS-rebound private destinations', { ti
   const rebound = await socks(1, { host: 'rebound.example', port }); assert.notEqual(rebound.reply[1], 0);
 });
 
-test('per-session limits reject excess streams without affecting an existing stream', { timeout: 10000 }, async (t) => {
-  const { a, b, socks } = await setup(t, { maxPerSession: 1 }); const port = await tcpEcho(t);
+test('per-session limits reject excess streams with an unbounded global limit', { timeout: 10000 }, async (t) => {
+  const { a, b, socks } = await setup(t, { maxConnections: 0, maxPerSession: 1 }); const port = await tcpEcho(t);
   const first = await socks(1, { host: '127.0.0.1', port }); assert.equal(first.reply[1], 0);
   const excess = await socks(1, { host: '127.0.0.1', port }); assert.notEqual(excess.reply[1], 0);
   assert.equal(a.status().lastError?.code, 'PROXY_CAPACITY');
@@ -286,8 +289,8 @@ test('per-session limits reject excess streams without affecting an existing str
   assert.equal(a.status().lastError, null); assert.equal(b.status().lastError, null);
 });
 
-test('global capacity rejection is visible on both peers and preserves established streams', { timeout: 10000 }, async (t) => {
-  const { a, b, socks } = await setup(t, { maxConnections: 1, maxPerSession: 4 }), port = await tcpEcho(t);
+test('global capacity rejection preserves established streams with an unbounded session limit', { timeout: 10000 }, async (t) => {
+  const { a, b, socks } = await setup(t, { maxConnections: 1, maxPerSession: 0 }), port = await tcpEcho(t);
   const first = await socks(1, { host: '127.0.0.1', port }); assert.equal(first.reply[1], 0);
   const excess = await socks(1, { host: '127.0.0.1', port }); assert.notEqual(excess.reply[1], 0);
   assert.equal(a.status().lastError?.code, 'PROXY_CAPACITY');
@@ -297,6 +300,26 @@ test('global capacity rejection is visible on both peers and preserves establish
   const restored = await socks(1, { host: '127.0.0.1', port }); assert.equal(restored.reply[1], 0);
   restored.socket.write('new-slot'); assert.equal((await restored.reader.read(8)).toString(), 'new-slot');
   assert.equal(a.status().lastError, null); assert.equal(b.status().lastError, null);
+});
+
+test('a zero client limit leaves the other positive limit effective', { timeout: 10000 }, async (t) => {
+  for (const options of [{ maxConnections: 0, maxPerSession: 1 }, { maxConnections: 1, maxPerSession: 0 }]) {
+    await t.test(JSON.stringify(options), async (t) => {
+      const { a, b, socks } = await setup(t, { maxConnections: 0, maxPerSession: 0 }, options), port = await tcpEcho(t);
+      assert.equal(a.status().connectionLimit, 1);
+      assert.equal(b.status().connectionLimit, 0);
+      const first = await socks(1, { host: '127.0.0.1', port }); assert.equal(first.reply[1], 0);
+      if (options.maxConnections) await assert.rejects(() => socks(1, { host: '127.0.0.1', port }));
+      else assert.notEqual((await socks(1, { host: '127.0.0.1', port })).reply[1], 0);
+      assert.equal(a.status().lastError?.code, 'PROXY_CAPACITY');
+      assert.equal(b.status().lastError, null, 'A must enforce its positive limit before opening another B flow');
+      first.socket.write('survives'); assert.equal((await first.reader.read(8)).toString(), 'survives');
+      first.socket.end(); await until(() => a.flows.size === 0 && b.flows.size === 0 && a.localSockets.size === 0);
+      const restored = await socks(1, { host: '127.0.0.1', port }); assert.equal(restored.reply[1], 0);
+      restored.socket.write('reused'); assert.equal((await restored.reader.read(6)).toString(), 'reused');
+      assert.equal(a.status().lastError, null);
+    });
+  }
 });
 
 test('uncompleted remote handshakes expire and release their connection slots', { timeout: 10000 }, async (t) => {

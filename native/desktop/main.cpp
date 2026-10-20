@@ -244,14 +244,15 @@ class Application {
         const int proxyWidths[] = {230, 132, 160, 238};
         for (int i = 0; i < 4; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(proxyColumns[i]); column.cx = S(proxyWidths[i]); ListView_InsertColumn(proxyPeerList_, i, &column); }
         Button(L"启用本地 Clash 节点", PROXY_ENABLE, 228, 334, 356, 32, 3, 1);
+        Button(L"复制 Claude 专用配置", COPY_CLAUDE_SUBSCRIPTION, 600, 334, 392, 32, 3, 1, true);
         Button(L"允许已配对的 A 使用本机网络", PROXY_SHARING, 228, 252, 420, 36, 3, 2);
         Label(L"已配对设备与网络使用情况", 228, 310, 700, 24, 3, 2, 1);
-        Label(L"Clash 完整配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
+        Label(L"Clash 全量配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
         Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 404, 556, 30, 3, 1, false, true, true);
-        Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
-        Label(L"导入完整配置，仅开启 Clash TUN（无需改网卡名）；关闭本机 Clash 的系统代理 / 代理脚本。", 228, 444, 764, 20, 3, 1, 3, true); widgets_.back().stretch = true;
+        Button(L"复制全量订阅", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
+        Label(L"Claude 专用：Claude 固定走 B，其他网站直连；保持 Clash TUN 运行，关闭系统代理 / 代理脚本。\r\nB 断时 Claude 无直连回退；切换专用配置后请明确关闭全局系统保护，否则其他网站也会被阻止。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"设备在线表示配对连接可用；“使用中”表示该设备正连接网络共享。\r\n停止共享仅关闭代理连接，不会中断 Claude 模型服务。", 228, 634, 764, 42, 3, 2, 3, true); widgets_.back().stretch = true;
-        Label(L"本机 · 系统断线保护", 228, 502, 700, 24, 3, 1, 1);
+        Label(L"全局系统保护", 228, 502, 700, 24, 3, 1, 1);
         proxyGuardMessage_ = Label(L"正在读取保护状态…", 228, 536, 764, 40, 3, 1, 3); widgets_.back().stretch = true;
         Button(L"启用 / 刷新保护（UAC）", PROXY_GUARD, 228, 584, 252, 32, 3, 1);
         Button(L"检查保护（UAC）", PROXY_GUARD_VERIFY, 492, 584, 224, 32, 3, 1);
@@ -513,6 +514,7 @@ class Application {
         EnableWindow(Item(PROXY_ENABLE), enabled && proxyAvailable_ && Capability("proxy") && role == "client");
         EnableWindow(Item(PROXY_SHARING), enabled && proxyAvailable_ && Capability("proxy") && role == "host");
         EnableWindow(Item(COPY_SUBSCRIPTION), enabled && proxyAvailable_ && !proxy_.value("subscriptionUrl", "").empty());
+        EnableWindow(Item(COPY_CLAUDE_SUBSCRIPTION), enabled && proxyAvailable_ && Capability("proxy") && role == "client" && !proxy_.value("claudeSubscriptionUrl", "").empty());
         bool guardSupported = enabled && proxyAvailable_ && guard.is_object() && guard.value("supported", false);
         EnableWindow(Item(PROXY_GUARD), guardSupported && role == "client" && Capability("proxy") && proxy_.value("enabled", false));
         EnableWindow(Item(PROXY_GUARD_VERIFY), guardSupported);
@@ -533,6 +535,8 @@ class Application {
         std::wstring connections = std::to_wstring(proxy.value("connections", 0));
         if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() > 0)
             connections += L" / " + std::to_wstring(proxy["connectionLimit"].get<int>());
+        else if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() == 0)
+            connections += L"（不设数量上限）";
         Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + (sharing ? L" · B 共享已开启" : L" · B 共享已关闭"));
         Text(PROXY_ENABLE, proxy.value("enabled", false) ? L"关闭本地 Clash 节点" : L"启用本地 Clash 节点");
         Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 A 使用本机网络");
@@ -542,7 +546,7 @@ class Application {
         const bool active = guard.is_object() && guard.value("active", false);
         const bool unknown = guard.is_object() && (guard.value("state", "") == "unknown" || guard.value("verification", "") == "unknown");
         const bool partial = guard.is_object() && guard.value("state", "") == "partial";
-        auto guardMessage = std::wstring(unknown ? L"保护状态未验证，请检查或明确关闭" : partial ? L"保护规则未通过校验" : active ? L"系统保护已验证生效" : L"系统保护未启用") + L"\r\n" + Wide(guard.is_object() ? guard.value("message", "") : "");
+        auto guardMessage = std::wstring(unknown ? L"全局保护状态未验证，请检查或明确关闭" : partial ? L"全局保护规则未通过校验" : active ? L"全局系统保护已验证生效" : L"全局系统保护未启用") + L"\r\n" + Wide(guard.is_object() ? guard.value("message", "") : "");
         Text(proxyGuardMessage_, guardMessage); Text(settingsGuardMessage_, guardMessage);
         RenderDevices(proxyPeerList_, proxy.value("devices", Json::array()), lastProxyDevices_, true);
         UpdateButtons();
@@ -675,7 +679,7 @@ class Application {
         if (actionThread_.joinable()) actionThread_.join();
         busy_ = true; UpdateButtons(); Report(L"正在处理…");
         actionThread_ = std::thread([this, route = std::move(route), body = std::move(body), kind] {
-            try { Post({kind, Api(options_.port, token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && kind == "proxy-copy") ? nullptr : &body, route == L"/api/proxy/guard" || route == L"/api/proxy/guard/verify" ? 330000 : 30000)}); }
+            try { Post({kind, Api(options_.port, token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && (kind == "proxy-copy" || kind == "proxy-copy-claude")) ? nullptr : &body, route == L"/api/proxy/guard" || route == L"/api/proxy/guard/verify" ? 330000 : 30000)}); }
             catch (const std::exception& error) { Post({"action-error", {}, error.what()}); }
         });
     }
@@ -744,12 +748,22 @@ class Application {
         }
         if (reply.kind == "probe") { Message(Wide(reply.data.value("message", "检测完成")), !reply.data.value("available", false)); return; }
         if (reply.kind == "cancel") { Report(L"已发送取消请求"); return; }
-        if (reply.kind == "proxy" || reply.kind == "proxy-copy") {
+        if (reply.kind == "proxy" || reply.kind == "proxy-copy" || reply.kind == "proxy-copy-claude") {
             RenderProxy(reply.data.contains("proxy") ? reply.data["proxy"] : reply.data);
-            if (reply.kind == "proxy-copy") {
-                auto subscription = proxy_.value("subscriptionUrl", "");
+            if (reply.kind == "proxy-copy" || reply.kind == "proxy-copy-claude") {
+                const bool claudeOnly = reply.kind == "proxy-copy-claude";
+                auto subscription = proxy_.value(claudeOnly ? "claudeSubscriptionUrl" : "subscriptionUrl", "");
                 if (subscription.empty()) Message(L"请先启用本地 Clash 节点。", true);
-                else { Clipboard(window_, Wide(subscription)); Report(L"完整配置订阅已复制 · 请在 Clash 导入并开启 TUN"); }
+                else {
+                    Clipboard(window_, Wide(subscription));
+                    if (claudeOnly) {
+                        const auto guard = proxy_.value("guard", Json::object());
+                        const bool warning = guard.is_object() && (guard.value("active", false) || guard.value("state", "") == "partial" || guard.value("state", "") == "unknown" || guard.value("verification", "") == "unknown");
+                        std::wstring message = L"Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN";
+                        if (warning) message += L"\r\n全局保护未确认关闭，可能阻断其他网站，请在原数据目录明确关闭（UAC）";
+                        Text(proxyMessage_, message); Report(message);
+                    } else Report(L"全量配置订阅已复制 · 请在 Clash 导入并开启 TUN");
+                }
             } else Report(Wide(proxy_.value("message", "代理设置已更新")));
             return;
         }
@@ -804,6 +818,7 @@ class Application {
             case PROXY_ENABLE: Action(L"/api/proxy", {{"enabled", !proxy_.value("enabled", false)}}, "proxy"); break;
             case PROXY_SHARING: Action(L"/api/proxy", {{"sharing", !proxy_.value("sharing", false)}}, "proxy"); break;
             case COPY_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy"); break;
+            case COPY_CLAUDE_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy-claude"); break;
             case PROXY_GUARD: Action(L"/api/proxy/guard", {{"enabled", true}}, "proxy"); break;
             case PROXY_GUARD_VERIFY: case SETTINGS_GUARD_VERIFY: Action(L"/api/proxy/guard/verify", Json::object(), "proxy"); break;
             case PROXY_GUARD_DISABLE: case SETTINGS_GUARD_DISABLE: Action(L"/api/proxy/guard", {{"enabled", false}}, "proxy"); break;

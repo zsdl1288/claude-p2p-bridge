@@ -93,7 +93,7 @@ export class BridgePeer extends EventEmitter {
     });
     if (this.closed) throw new Error('配对已关闭');
     if (this.networkAdapter) {
-      const resource = await this.networkAdapter.listen({ port: this.pairing.port, targetPort: server.address().port, maxConnections: 512 });
+      const resource = await this.networkAdapter.listen({ port: this.pairing.port, targetPort: server.address().port, maxConnections: 0 });
       if (this.closed) { await this.networkAdapter.release(resource).catch(() => {}); throw new Error('配对已关闭'); }
       this.listenResource = resource;
     }
@@ -116,7 +116,7 @@ export class BridgePeer extends EventEmitter {
   async connectOnce() {
     if (this.closed) return Promise.reject(new Error('配对已关闭'));
     const generation = this.networkGeneration;
-    const resource = this.networkAdapter ? await this.networkAdapter.dial({ ...this.pairing, maxConnections: 512 }) : null;
+    const resource = this.networkAdapter ? await this.networkAdapter.dial({ ...this.pairing, maxConnections: 0 }) : null;
     if (this.closed || generation !== this.networkGeneration) {
       if (resource) await this.networkAdapter.release(resource).catch(() => {});
       throw new Error(this.closed ? '配对已关闭' : '内置组网已重启，正在自动重连');

@@ -66,6 +66,20 @@ func TestProxyPreservesResponseAfterRequestHalfClose(t *testing.T) {
 }
 
 func TestProxyCountsSixteenClientsInsteadOfTheirSocketPairs(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		limits []int
+	}{
+		{"omitted", nil},
+		{"negative", []int{-1}},
+		{"invalid finite limit", []int{4097}},
+	} {
+		t.Run(test.name, func(t *testing.T) { testProxySixteenClientLimit(t, test.limits...) })
+	}
+}
+
+func testProxySixteenClientLimit(t *testing.T, limits ...int) {
+	t.Helper()
 	echo, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +100,7 @@ func TestProxyCountsSixteenClientsInsteadOfTheirSocketPairs(t *testing.T) {
 	}
 	p := newProxy(listener, func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp4", echo.Addr().String())
-	})
+	}, limits...)
 	t.Cleanup(p.Close)
 	var connections []net.Conn
 	t.Cleanup(func() {
@@ -152,18 +166,36 @@ func TestProxyCountsSixteenClientsInsteadOfTheirSocketPairs(t *testing.T) {
 }
 
 func TestProxyDataChannelCapacityDoesNotRetainTheModelClientLimit(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		limit int
+	}{
+		{"explicit finite limit", 4096},
+		{"explicit unlimited", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) { testProxyConcurrentDataChannels(t, test.limit) })
+	}
+}
+
+func testProxyConcurrentDataChannels(t *testing.T, limit int) {
+	t.Helper()
+	const clientCount = 600
 	echo, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { echo.Close() })
+	backendClosed := make(chan struct{}, clientCount)
 	go func() {
 		for {
 			connection, err := echo.Accept()
 			if err != nil {
 				return
 			}
-			go func() { defer connection.Close(); io.Copy(connection, connection) }()
+			go func() {
+				defer func() { connection.Close(); backendClosed <- struct{}{} }()
+				io.Copy(connection, connection)
+			}()
 		}
 	}()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -172,22 +204,79 @@ func TestProxyDataChannelCapacityDoesNotRetainTheModelClientLimit(t *testing.T) 
 	}
 	p := newProxy(listener, func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp4", echo.Addr().String())
-	}, 32)
+	}, limit)
 	t.Cleanup(p.Close)
-	for index := range 24 {
+	var connections []net.Conn
+	t.Cleanup(func() {
+		for _, connection := range connections {
+			connection.Close()
+		}
+	})
+	roundTrip := func(connection net.Conn, index int) {
+		t.Helper()
+		connection.SetDeadline(time.Now().Add(3 * time.Second))
+		payload := []byte{byte(index >> 8), byte(index)}
+		if _, err := connection.Write(payload); err != nil {
+			t.Fatalf("proxy data stream %d write failed: %v", index, err)
+		}
+		var reply [2]byte
+		if _, err := io.ReadFull(connection, reply[:]); err != nil || !bytes.Equal(reply[:], payload) {
+			t.Fatalf("proxy data stream %d failed: %v", index, err)
+		}
+	}
+	for index := range clientCount {
 		connection, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { connection.Close() })
-		connection.SetDeadline(time.Now().Add(3 * time.Second))
-		if _, err := connection.Write([]byte{byte(index)}); err != nil {
-			t.Fatal(err)
-		}
+		connections = append(connections, connection)
+		roundTrip(connection, index)
+	}
+	// Keep every connection alive together; neither an explicit finite limit
+	// nor unlimited admission may silently fall back to the default 16.
+	p.mu.Lock()
+	clients, sockets := p.clients, len(p.connections)
+	p.mu.Unlock()
+	if clients != clientCount || sockets != 2*clientCount {
+		t.Fatalf("expected %d live clients and their socket pairs, got %d / %d", clientCount, clients, sockets)
+	}
+	for index, connection := range connections {
+		roundTrip(connection, index)
+	}
+	p.Close()
+	for _, connection := range connections {
+		connection.SetReadDeadline(time.Now().Add(3 * time.Second))
 		var reply [1]byte
-		if _, err := io.ReadFull(connection, reply[:]); err != nil || reply[0] != byte(index) {
-			t.Fatalf("proxy data stream %d failed: %v", index, err)
+		if _, err := connection.Read(reply[:]); err == nil {
+			t.Fatal("revoked data proxy still carried a live connection")
+		} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+			t.Fatal("revoked data proxy left a connection open")
 		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.mu.Lock()
+		clients, sockets = p.clients, len(p.connections)
+		p.mu.Unlock()
+		if clients == 0 && sockets == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("revoked data proxy retained %d clients / %d sockets", clients, sockets)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	backendDeadline := time.After(5 * time.Second)
+	for range clientCount {
+		select {
+		case <-backendClosed:
+		case <-backendDeadline:
+			t.Fatal("revoked data proxy retained an echo backend connection")
+		}
+	}
+	if connection, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second); err == nil {
+		connection.Close()
+		t.Fatal("revoked data proxy retained its listener")
 	}
 }
 

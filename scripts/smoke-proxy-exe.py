@@ -172,6 +172,8 @@ def main():
             assert all(device["self"] or device["role"] == "host" for device in original["devices"]), original
             listed = request(b, "/api/proxy", token=token_b)
             assert len(listed["clients"]) == 1 and listed["clients"][0]["online"] and listed["clients"][0]["id"], listed
+            for state in (original, listed):
+                assert state["connectionLimit"] == 0 and state["sessionConnectionLimit"] == 0, "Packaged peers must not retain a fixed proxy connection limit"
             # A UDP association opens the real independent proxy channel but
             # does not contact any destination. Claude enable/disable must not
             # close it or change the subscription authorization.

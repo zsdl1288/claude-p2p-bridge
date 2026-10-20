@@ -79,12 +79,16 @@ func Run(input io.Reader, output io.Writer) error {
 				Host           string `json:"host"`
 				ID             string `json:"id"`
 				Data           string `json:"data"`
-				MaxConnections int    `json:"maxConnections"`
+				MaxConnections *int   `json:"maxConnections"`
 			}
 			if len(req.Params) > 0 {
 				err = json.Unmarshal(req.Params, &params)
 			}
 			if err == nil {
+				var limits []int
+				if params.MaxConnections != nil {
+					limits = []int{*params.MaxConnections}
+				}
 				switch req.Method {
 				case "status":
 					result, err = manager.Status(callCtx)
@@ -106,9 +110,9 @@ func Run(input io.Reader, output io.Writer) error {
 						clear(output)
 					}
 				case "listen":
-					result, err = manager.Listen(callCtx, params.Port, params.TargetPort, params.MaxConnections)
+					result, err = manager.Listen(callCtx, params.Port, params.TargetPort, limits...)
 				case "dial":
-					result, err = manager.Dial(callCtx, params.Host, params.Port, params.MaxConnections)
+					result, err = manager.Dial(callCtx, params.Host, params.Port, limits...)
 				case "release":
 					manager.Release(params.ID)
 					result = map[string]bool{"released": true}

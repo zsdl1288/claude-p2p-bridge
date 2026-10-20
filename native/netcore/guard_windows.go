@@ -108,6 +108,7 @@ var (
 const (
 	guardPersistent    = 1
 	guardDisabled      = 0x20
+	guardIndexed       = 0x40 // FWPM_FILTER_FLAG_INDEXED: classification lookup optimization.
 	guardBlock         = 0x1001
 	guardPermit        = 0x1002
 	guardByteBlob      = 12
@@ -322,7 +323,8 @@ func guardFilterMismatch(actual, expected *guardFilter) string {
 		return "layer does not match"
 	case actual.Provider != nil:
 		return "unexpected provider"
-	case actual.Flags != guardPersistent:
+	// BFE may index a filter after installation; this does not change its policy.
+	case actual.Flags&^guardIndexed != guardPersistent:
 		return fmt.Sprintf("flags 0x%08x; expected 0x%08x", actual.Flags, guardPersistent)
 	case actual.Action.Type != expected.Action.Type:
 		return fmt.Sprintf("action 0x%x; expected 0x%x", actual.Action.Type, expected.Action.Type)
@@ -838,11 +840,14 @@ func runNetworkGuard(action, profile string) (NetworkGuardStatus, error) {
 		return status, err
 	}
 	defer guardEngineClose.Call(uintptr(handle))
-	appID, err := guardReadAppID(helperPath)
-	if err != nil {
-		return status, err
+	var appID *guardBlob
+	if action != "disable" {
+		appID, err = guardReadAppID(helperPath)
+		if err != nil {
+			return status, err
+		}
+		defer guardFreePointer(unsafe.Pointer(appID))
 	}
-	defer guardFreePointer(unsafe.Pointer(appID))
 	if action == "enable" || action == "disable" {
 		if !windows.GetCurrentProcessToken().IsElevated() {
 			return status, errors.New("administrator authorization is required to change network protection")
