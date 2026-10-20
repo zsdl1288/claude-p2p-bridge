@@ -36,9 +36,12 @@ export async function probeClaude(command) {
       const child = spawn(executable.command, [...executable.prefix, '--version'], { windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], shell: false });
       let output = '';
       const timer = setTimeout(() => { terminateProcessTree(child); resolve({ available: false, message: '版本检测超时' }); }, 8000);
-      const collect = (data) => { output = (output + data.toString()).slice(0, 1000); };
-      child.stdout.on('data', collect);
-      child.stderr.on('data', collect);
+      const collect = (text) => { output = (output + text).slice(0, 1000); };
+      for (const stream of [child.stdout, child.stderr]) {
+        const decoder = new StringDecoder('utf8');
+        stream.on('data', (data) => collect(decoder.write(data)));
+        stream.on('end', () => collect(decoder.end()));
+      }
       child.on('error', (e) => { clearTimeout(timer); resolve({ available: false, message: e.message }); });
       child.on('close', (code) => { clearTimeout(timer); resolve({ available: code === 0, resolvedPath, message: `${output.trim() || `退出码 ${code}`}\n程序路径：${resolvedPath}` }); });
     });

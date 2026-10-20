@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.1.0
+# Claude Bridge · Windows 桌面托盘版 v1.1.1
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,9 +8,9 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.1.0-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.1.1-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.1.0.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
+桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.1.1.zip`，不含本机账号、配对或 API Token。
 
 ## 使用方法
 
@@ -67,9 +67,9 @@ A 应用 → Clash TUN → A 本机带密码的 SOCKS5 → Tailscale → B → �
 
 B 掉线、关闭共享、暂停连接或配对会话失效后，已有代理流立即撤销，新请求失败，A 按现有退避机制自动重连。重连仅恢复后续新连接，不重放中断的下载或请求。订阅地址、本地代理端口和凭据随本机数据目录稳定保存；更换配对需重新显式授权网络共享/代理。端口被占用时会报错，不会悄悄更换端口导致 Clash 使用旧配置。
 
-1.1.0 修复 TCP 本地接收端写入阻塞、暂停 WebSocket 读取时被心跳误判为失联的问题，慢读连接恢复后可继续接收数据。持续本地写入阻塞约 120 秒仍未恢复时回收该流；真正失联的连接仍按心跳超时回收。A、B 两端都需升级到 1.1.0，才能使用完整修复。跨城、跨国链路的实际吞吐和下载稳定性仍需升级后复测。
+TCP 本地接收端写入阻塞时会暂停 WebSocket 读取，避免继续堆积数据；背压期间保留连接，接收恢复后继续传输。持续本地写入阻塞约 120 秒仍未恢复时回收该流；真正失联的连接按心跳超时回收。跨城、跨国链路的实际吞吐和下载稳定性仍需两端升级后复测。
 
-UDP 通过独立 WebSocket 连接封装转发，支持真实 SOCKS5 UDP ASSOCIATE。弱网丢包时仍受 TCP 重传影响，不承诺游戏低延迟。从 1.0.9 起，A、B 的代理流及其内置传输通道默认不设固定连接数量上限，实际承载受系统资源和网络条件影响；资源不足时新连接仍可能失败。代理状态中的 `connectionLimit` 和 `sessionConnectionLimit` 为 `0` 表示不设数量上限，界面同时显示实际活跃连接数。TCP 关闭或断线后释放相应流，UDP 关联空闲 60 秒后回收，后续新流量可重新建立关联。每个已认证会话的 32 MiB/s 流量保护阈值、4 MiB 缓冲保护及握手超时等独立保护保留；超出相应保护限额时拒绝或关闭相关流。A、B 都需使用 1.0.9 或更新版本，才能移除两端旧版的连接数量限制；取消数量限制不改变链路带宽、延迟或中继路径。
+UDP 通过独立 WebSocket 连接封装转发，支持真实 SOCKS5 UDP ASSOCIATE。弱网丢包时仍受 TCP 重传影响，不承诺游戏低延迟。两端的代理流及内置传输通道默认不设固定连接数量上限，实际承载受系统资源和网络条件影响；资源不足时新连接仍可能失败。代理状态中的 `connectionLimit` 和 `sessionConnectionLimit` 为 `0` 表示不设数量上限，界面同时显示实际活跃连接数。TCP 关闭或断线后释放相应流，UDP 关联空闲 60 秒后回收，后续新流量可重新建立关联。每个已认证会话的 32 MiB/s 流量保护阈值、4 MiB 缓冲保护及握手超时仍保留；超出相应保护限额时拒绝或关闭相关流。升级时 A、B 应使用同一新版；取消数量限制不改变链路带宽、延迟或中继路径。
 
 ### 旧版系统保护的升级与恢复
 
@@ -83,7 +83,7 @@ A 应只开启 Clash TUN，关闭“系统代理”；Windows 手动代理和代
 
 Windows 组网传输选择非虚拟默认网卡，Tailscale 控制连接与普通组网 DNS 共用物理网卡解析器，避免控制域名落入 fake-IP。此修复不修改现有 Clash 配置、节点或系统路由，也不保证改善跨国链路带宽。
 
-新增接口均要求本机 API 鉴权，订阅使用独立 URL 令牌：
+代理管理接口要求本机 API 鉴权，订阅使用独立 URL 令牌：
 
 | 接口 | 用途 |
 | --- | --- |
@@ -100,7 +100,7 @@ Windows 初始化内置组网时，为当前用户拥有的状态目录设置私
 
 自启动默认关闭，启用后使用当前用户的 Windows 登录启动项，无需管理员权限。程序将 EXE 复制到数据目录下稳定的版本路径，移动下载文件不会影响启动。手动运行新版时，会刷新同一数据目录已启用的启动项。每个 Windows 用户只有一个 Claude Bridge 启动项；从另一数据目录手动启用会替换该项，关闭时只移除属于当前目录的启动项。演示模式禁用自启动。未登录 Windows 时客户端不会运行。
 
-升级时先从托盘退出旧版，再运行新版，A、B 统一使用 1.1.0 EXE，并沿用各自原数据目录。保存的组网登录、配对、身份和 Claude 配置会继续使用；若原本没有配对，或设备身份、授权已失效，则需重新授权或配对。A 的模型 API 每次启动默认关闭，需在模型页显式开启；模型 URL 默认为 `http://127.0.0.1:3210/v1`，管理端口默认为 `http://127.0.0.1:3211`。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享。
+升级时先从托盘退出旧版，再运行新版，A、B 统一使用同一新版 EXE，并沿用各自原数据目录。保存的组网登录、配对、身份和 Claude 配置会继续使用；若原本没有配对，或设备身份、授权已失效，则需重新授权或配对。A 的模型 API 每次启动默认关闭，需在模型页显式开启；模型 URL 默认为 `http://127.0.0.1:3210/v1`，管理端口默认为 `http://127.0.0.1:3211`。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享。
 
 **同一 Windows 用户只允许一个桌面实例运行**。再次启动会尝试唤回已有窗口；更换端口、数据目录或 EXE 位置不会启动第二份桌面。需要切换数据目录或版本时，先从托盘退出当前实例。窗口尚未就绪或锁权限受限时，新实例会等待或退出；崩溃后再次启动会先清退上一轮后台进程，再加载配置。A、B 实际部署在不同电脑；同机多端回归使用打包的 `bridge-engine` 组件和独立测试数据目录。
 
@@ -128,7 +128,7 @@ API Key 是桥接客户端自己生成的本机鉴权令牌，与 Claude 订阅�
 
 ### 模型请求示例
 
-先按“使用方法”完成两端身份选择、私网连接和 A/B 配对，再由 B 在模型页配置并启用 Claude。以下请求发送到 A 的本机 API；私网在线或创建配对码本身不会自动启用模型服务。
+先完成两端身份选择、私网连接和配对，由 B 在模型页配置并启用 Claude，再在 A 点击“开启模型 API”。以下请求发送到 A 的本机模型端口；私网在线或创建配对码本身不会自动启用模型服务。
 
 ```powershell
 $bridgeToken = (Get-Content "$env:LOCALAPPDATA\ClaudeBridge\api-token" -Raw).Trim()
@@ -211,13 +211,15 @@ HTTP 200 仍需检查 `success`。请求格式错误返回 400，Token 错误 40
 
 后续请求传入 `sessionId`，可续接当前 A 在**本次连接**中创建的会话。其他 A 无权续接；断线后清除授权，自动重连后需开启新会话。`POST /v1/requests/{requestId}/cancel` 或关闭 HTTP 请求可取消自己的排队或执行任务。
 
-Python 3 标准库示例支持流式输出、续接及错误退出：
+Python 3 标准库示例支持流式输出、续接及错误退出，直接访问本机接口，不使用环境变量中的 HTTP 代理：
 
 ```powershell
 $env:P2P_BRIDGE_TOKEN = (Get-Content "$env:LOCALAPPDATA\ClaudeBridge\api-token" -Raw).Trim()
 python examples/client.py '请概括当前项目结构'
 # 续接：python examples/client.py '继续分析' --session <上一次的 sessionId>
 ```
+
+下表的 `/v1/models` 和 `/v1/chat/completions` 使用模型端口；其他接口使用管理端口。取消接口也可通过已开启的模型端口调用。
 
 | 接口 | 用途 / 请求体 |
 | --- | --- |
@@ -303,8 +305,8 @@ python scripts/smoke-desktop.py
 python scripts/smoke-proxy-exe.py
 # Windows 权限重启验收：从普通 PowerShell 7 运行，一次 UAC 提示仅提升隔离测试阶段：
 python scripts/test-windows-state-restart.py
-# 在 native 目录运行 Go 测试，使用开发环境中已配置的 Go：
-go test ./cmd/bridge ./netcore
+# 使用与 Windows 构建相同的网络兼容配置，含显式 underlay 回归：
+python scripts/test-native.py
 ```
 
 可选的真实客户端协议验证：按 `scripts/smoke-harness-client.js` 顶部命令，将 Harness 使用的 pi-ai 1.1.0 安装到独立 `.bridge` 测试目录，再运行 `node scripts/smoke-harness-client.js`。该脚本用合成 CLI 验证实际 pi-ai 工具往返及官方 OpenAI SDK 错误处理，不访问外部模型；缺少可选依赖时明确跳过，不增加生产依赖。

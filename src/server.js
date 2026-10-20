@@ -242,7 +242,7 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
         if (stopping) throw new Error('客户端正在退出');
         ready = true;
       }
-      catch (error) { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); throw error; }
+      catch (error) { server.closeAllConnections(); await closeListener(server); throw error; }
       finally { finishInitializing(); }
       return server.address();
     },
@@ -261,7 +261,7 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
             try { await proxy?.close(); }
             finally {
               server.closeAllConnections();
-              await new Promise((resolve, reject) => server.close((error) => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()));
+              await closeListener(server);
             }
           }
         })();

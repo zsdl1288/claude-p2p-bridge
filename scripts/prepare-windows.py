@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import zipfile
-from build_support import ROOT as root, VERSION as version, checked_path, go_environment, runtime_files
+from build_support import ROOT as root, VERSION as version, checked_path, go_environment, module_license_files, runtime_files
 
 go = root / ".tools/go/bin/go.exe"
 node_path = shutil.which('node')
@@ -29,9 +29,8 @@ for module in modules.values():
     if not module.get("Dir") or module.get("Main"):
         continue
     directory = Path(module["Dir"])
-    for file in sorted(directory.iterdir()):
-        if file.is_file() and file.name.upper().startswith(("LICENSE", "COPYING", "NOTICE", "AUTHORS", "PATENTS")):
-            licenses.append((f"{module['Path']} {module.get('Version', '')} / {file.name}", file))
+    for file in module_license_files(directory):
+        licenses.append((f"{module['Path']} {module.get('Version', '')} / {file.name}", file))
 for label, file in licenses:
     if not file.is_file():
         raise FileNotFoundError(f"Missing license for {label}: {file}")

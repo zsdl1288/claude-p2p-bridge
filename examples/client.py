@@ -43,7 +43,10 @@ def run_bridge(prompt, *, base_url="http://127.0.0.1:3211", token, session_id=No
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=3660) as response:
+    # The bridge API is local; proxy environment variables must not forward its
+    # requests and local credentials to an unrelated network proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=3660) as response:
         yield from read_events(response)
 
 

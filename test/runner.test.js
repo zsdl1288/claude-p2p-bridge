@@ -51,6 +51,15 @@ test('CLI probing drains stderr and reports its diagnostic on failure', { timeou
   assert.notEqual(result.message, '版本检测超时');
 });
 
+test('CLI probing preserves fragmented UTF-8 on both output pipes', { timeout: 10000 }, async (t) => {
+  const config = await fixture(t, "(async () => { for (const [stream, text] of [[process.stdout, '版本🔒'], [process.stderr, '登录失败：中文']]) { for (const byte of Buffer.from(text)) { stream.write(Buffer.from([byte])); await new Promise(resolve => setTimeout(resolve, 5)); } } process.exitCode = 1; })();");
+  const result = await probeClaude(config.claudeCommand);
+  assert.equal(result.available, false);
+  assert.ok(result.message.includes('版本🔒'), result.message);
+  assert.ok(result.message.includes('登录失败：中文'), result.message);
+  assert.equal(result.message.includes('\ufffd'), false);
+});
+
 test('CLI discovery gives an absolute PATH installation priority over the user installation', async (t) => {
   const config = await discoveryFixture(t);
   const command = await config.create('path-bin', nativeClaude);

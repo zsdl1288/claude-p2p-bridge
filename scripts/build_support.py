@@ -35,6 +35,14 @@ def write_manifest(target):
     target.write_text(template.replace(marker, f'version="{VERSION}.0"'), encoding='utf-8')
 
 
+def module_license_files(directory):
+    """Keep license documents and named variants, excluding license test sources."""
+    return [file for file in sorted(directory.iterdir())
+            if file.is_file() and file.suffix.casefold() != '.go'
+            and re.match(r'^(?:LICENSE|COPYING|NOTICE|AUTHORS|PATENTS)(?:$|[.-])',
+                         file.name, re.IGNORECASE)]
+
+
 PRIVATE_PARTS = {'.bridge', '.cache', '.tools', '__pycache__', 'api-token', 'pairing.dat', 'pairing-demo.dat', 'desktop.ini', 'tailscale.state', 'proxy.json', 'proxy-demo.json', 'application.json', 'application-demo.json'}
 
 

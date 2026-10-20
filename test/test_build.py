@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
-from scripts.build_support import ROOT, VERSION, runtime_files, source_files, source_manifest, write_manifest
+from scripts.build_support import ROOT, VERSION, module_license_files, runtime_files, source_files, source_manifest, write_manifest
 from scripts.package import package_source
 
 
@@ -20,6 +20,17 @@ class ReleasePolicyTests(unittest.TestCase):
             write_manifest(target)
             identity = ET.parse(target).getroot().find('{urn:schemas-microsoft-com:asm.v1}assemblyIdentity')
             self.assertEqual(identity.attrib['version'], VERSION + '.0')
+
+    def test_module_licenses_keep_documents_without_go_test_sources(self):
+        with tempfile.TemporaryDirectory(prefix='module-license-') as directory:
+            root = Path(directory)
+            documents = {'LICENSE', 'LICENSE.BSD-2-Clause', 'LICENSE.md', 'LICENSE.txt',
+                         'LICENSE-MIT', 'COPYING', 'COPYING.LESSER', 'NOTICE', 'AUTHORS', 'PATENTS'}
+            for name in documents | {'license_test.go', 'licenses.go', 'license.go',
+                                     'LICENSE-MIT.go', 'NOTICE.GO', 'README.md'}:
+                (root / name).write_text('fixture')
+            (root / 'NOTICE.txt').mkdir()
+            self.assertEqual([file.name for file in module_license_files(root)], sorted(documents))
 
     def test_source_archive_excludes_private_state_binaries_and_old_launcher(self):
         names = {file.relative_to(ROOT).as_posix() for file in source_files()}
