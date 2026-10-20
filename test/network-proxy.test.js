@@ -183,6 +183,68 @@ test('a slow TCP reader receives all queued bytes before a normal half-close', {
   assert.deepEqual(await reader.read(payload.length), payload);
 });
 
+test('TCP backpressure across several heartbeats preserves the stream and every byte', { timeout: 10000 }, async (t) => {
+  const heartbeatMs = 150, payload = Buffer.alloc(16 * 1024 * 1024, 0x63);
+  const { a, b, socks } = await setup(t, { heartbeatMs });
+  a.heartbeatMs = heartbeatMs;
+  const port = await tcpEcho(t, (socket) => socket.on('end', () => socket.end(payload)));
+  const { socket, reader, reply } = await socks(1, { host: '127.0.0.1', port });
+  assert.equal(reply[1], 0);
+  const flow = [...a.flows][0];
+  const started = Date.now(); let closedAfterMs;
+  flow.ws.once('close', () => { closedAfterMs = Date.now() - started; });
+  socket.pause(); socket.end();
+  await until(() => flow.localSocket.writableNeedDrain || flow.dead);
+  assert.equal(flow.dead, false, 'The stream must reach real TCP backpressure before closing');
+  t.diagnostic(`TCP receive backpressure reached; WebSocket paused: ${flow.ws.isPaused}`);
+  await delay(heartbeatMs * 4);
+  if (flow.dead) t.diagnostic(`The backpressured WebSocket closed after ${closedAfterMs} ms with heartbeatMs=${heartbeatMs}`);
+  assert.equal(flow.dead, false, 'A healthy slow TCP reader must survive more than two heartbeat intervals');
+  assert.equal(a.flows.size, 1); assert.equal(b.flows.size, 1);
+  socket.resume();
+  assert.deepEqual(await reader.read(payload.length), payload);
+  await until(() => a.flows.size === 0 && b.flows.size === 0);
+});
+
+test('TCP backpressure that never drains releases its flow after the configured deadline', { timeout: 5000 }, async (t) => {
+  const heartbeatMs = 100, backpressureMs = 500, payload = Buffer.alloc(16 * 1024 * 1024, 0x64);
+  const { a, b, socks } = await setup(t, { heartbeatMs, backpressureMs });
+  a.heartbeatMs = heartbeatMs; a.backpressureMs = backpressureMs;
+  const port = await tcpEcho(t, (socket) => socket.on('end', () => socket.end(payload)));
+  const { socket, reply } = await socks(1, { host: '127.0.0.1', port });
+  assert.equal(reply[1], 0);
+  const flow = [...a.flows][0];
+  socket.pause(); socket.end();
+  await until(() => flow.localSocket.writableNeedDrain || flow.dead);
+  assert.equal(flow.dead, false);
+  await delay(heartbeatMs * 3);
+  assert.equal(flow.dead, false, 'Backpressure must receive its own deadline rather than the shorter heartbeat timeout');
+  assert.equal(flow.ws.isPaused, true, 'The real TCP receiver must remain backpressured');
+  await until(() => flow.dead);
+  assert.equal(flow.closeReason, 'backpressure-timeout');
+  await until(() => a.flows.size === 0 && b.flows.size === 0 && a.localSockets.size === 0);
+});
+
+test('proxy heartbeat still closes a real WebSocket peer that never answers ping', { timeout: 5000 }, async (t) => {
+  const heartbeatMs = 80;
+  const { b, bConnection, pairing } = await setup(t, { heartbeatMs });
+  const port = await tcpEcho(t);
+  const ws = new WebSocket(`ws://127.0.0.1:${pairing.port}/network/${pairing.room}`, {
+    autoPong: false,
+    headers: { Authorization: `Bearer ${digest(`p2pcc-network-v1:${pairing.room}:${pairing.secret}`)}` }
+  });
+  ws.on('error', () => {}); t.after(() => ws.terminate());
+  let pings = 0;
+  ws.on('ping', () => { pings++; });
+  await once(ws, 'open');
+  const reply = once(ws, 'message');
+  ws.send(JSON.stringify({ v: 1, session: bConnection.session, command: 'tcp', host: '127.0.0.1', port }));
+  assert.equal(JSON.parse((await reply)[0].toString()).ok, true);
+  await once(ws, 'close', { signal: AbortSignal.timeout(heartbeatMs * 10) });
+  assert.ok(pings > 0, 'The authenticated peer must receive an actual heartbeat ping');
+  assert.equal(b.flows.size, 0, 'A peer that withholds pong must release its proxy flow');
+});
+
 test('UDP ASSOCIATE relays real datagrams, resolves names on B and pins local source port', { timeout: 10000 }, async (t) => {
   let lookups = 0;
   const { socks } = await setup(t, { resolve: async (name) => { assert.equal(name, 'dns.example'); lookups++; return [{ address: '127.0.0.1', family: 4 }]; } });

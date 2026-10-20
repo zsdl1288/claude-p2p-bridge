@@ -92,13 +92,13 @@ function udpKey(host, port) { return `${net.isIP(host) === 6 ? ipv6Bytes(host).t
 export class NetworkProxy extends EventEmitter {
   constructor({ bridge, listenPort = 0, username = randomId(12), password = randomId(24), allowPrivateTargets = false,
     maxConnections = 0, maxPerSession = 0, maxUdpTargets = 128, bytesPerSecond = 32 * 1024 * 1024,
-    handshakeMs = 10000, heartbeatMs = 10000, udpIdleMs = 60000, resolve = lookup } = {}) {
+    handshakeMs = 10000, heartbeatMs = 10000, backpressureMs = 120000, udpIdleMs = 60000, resolve = lookup } = {}) {
     super();
     if (!bridge) throw new Error('缺少桥接实例');
     if (!Number.isInteger(listenPort) || listenPort < 0 || listenPort > 65535) throw new Error('代理端口无效');
     if (!username || !password || Buffer.byteLength(username) > 255 || Buffer.byteLength(password) > 255) throw new Error('代理凭据无效');
     if (![maxConnections, maxPerSession].every((limit) => Number.isSafeInteger(limit) && limit >= 0)) throw new Error('代理连接数限制无效');
-    Object.assign(this, { bridge, listenPort, username, password, allowPrivateTargets, maxConnections, maxPerSession, maxUdpTargets, bytesPerSecond, handshakeMs, heartbeatMs, udpIdleMs, resolve });
+    Object.assign(this, { bridge, listenPort, username, password, allowPrivateTargets, maxConnections, maxPerSession, maxUdpTargets, bytesPerSecond, handshakeMs, heartbeatMs, backpressureMs, udpIdleMs, resolve });
     this.enabled = false; this.sharing = false; this.flows = new Set(); this.localSockets = new Set();
     this.sessionBuckets = new WeakMap();
     this.uploadBytes = 0; this.downloadBytes = 0; this.error = null; this.lastError = null;
@@ -169,8 +169,9 @@ export class NetworkProxy extends EventEmitter {
   makeFlow(peer, connection, side, ws) {
     const flow = { peer, connection, session: connection?.session, pending: !connection, side, ws, resources: new Set(), timers: new Set(), dead: false,
       bucketAt: Date.now(), bucketBytes: 0 };
-    flow.close = (graceful = false) => {
+    flow.close = (graceful = false, reason) => {
       if (flow.dead) return; flow.dead = true;
+      flow.closeReason = reason;
       for (const timer of flow.timers) { clearTimeout(timer); clearInterval(timer); }
       for (const resource of flow.resources) {
         if (resource instanceof net.Socket) {
@@ -186,9 +187,46 @@ export class NetworkProxy extends EventEmitter {
       ws.terminate(); this.flows.delete(flow); this.emit('state');
     };
     ws.on('error', () => flow.close()); ws.on('close', (code) => flow.close(code === 1000));
-    let alive = true;
-    ws.on('pong', () => { alive = true; });
-    const heartbeat = setInterval(() => { if (!alive || !this.valid(flow)) return flow.close(); alive = false; if (ws.readyState === WebSocket.OPEN) ws.ping(); }, this.heartbeatMs);
+    let probe = null, controlWrite = null, pausedAt = null;
+    const activity = () => { probe = null; };
+    ws.on('message', activity); ws.on('ping', activity); ws.on('pong', activity);
+    const keepAlive = (ping) => {
+      if (flow.dead || controlWrite || ws.readyState !== WebSocket.OPEN) return;
+      const write = controlWrite = { at: performance.now() };
+      const pending = ping ? (probe = { sentAt: null }) : null;
+      const finish = (error) => {
+        if (error) return flow.close();
+        if (controlWrite === write) controlWrite = null;
+        if (pending && probe === pending) pending.sentAt = performance.now();
+      };
+      // An unsolicited pong also keeps the other end alive while our receive
+      // socket is paused and cannot read (or answer) its ping frames.
+      ws.pong(undefined, ping ? (error) => { if (error) flow.close(); } : finish);
+      if (ping) ws.ping(undefined, finish);
+    };
+    flow.pauseReceive = () => {
+      if (pausedAt === null) pausedAt = performance.now();
+      probe = null;
+      keepAlive(false);
+      ws.pause();
+    };
+    flow.resumeReceive = () => {
+      if (flow.dead) return;
+      pausedAt = null; probe = null;
+      ws.resume();
+      keepAlive(true);
+    };
+    const heartbeat = setInterval(() => {
+      if (!this.valid(flow)) return flow.close();
+      const now = performance.now();
+      if (controlWrite && now - controlWrite.at >= this.backpressureMs) return flow.close(false, 'heartbeat-write-timeout');
+      if (pausedAt !== null) {
+        if (now - pausedAt >= this.backpressureMs) return flow.close(false, 'backpressure-timeout');
+        keepAlive(false); return;
+      }
+      if (probe && probe.sentAt !== null && now - probe.sentAt >= this.heartbeatMs) return flow.close(false, 'heartbeat-timeout');
+      if (!probe) keepAlive(true);
+    }, this.heartbeatMs);
     heartbeat.unref(); flow.timers.add(heartbeat);
     this.flows.add(flow); this.emit('state');
     return flow;
@@ -281,12 +319,12 @@ export class NetworkProxy extends EventEmitter {
     socket.on('end', () => this.send(flow, Buffer.from([FIN]), flow.side === 'client'));
     socket.on('error', () => flow.close());
     socket.on('close', () => { if (flow.ws.readyState === WebSocket.OPEN) flow.ws.close(1000); });
-    socket.on('drain', () => flow.ws.resume());
+    socket.on('drain', () => flow.resumeReceive());
     let ended = false;
     const receive = (frame, binary) => {
       if (!binary || !frame.length || !this.account(flow, frame.length, flow.side === 'host')) return flow.close();
       if (frame[0] === FIN && frame.length === 1 && !ended) { ended = true; flow.remoteEnded = true; socket.end(); }
-      else if (frame[0] === DATA && !ended && frame.length > 1) { if (!socket.write(frame.subarray(1))) flow.ws.pause(); }
+      else if (frame[0] === DATA && !ended && frame.length > 1) { if (!socket.write(frame.subarray(1))) flow.pauseReceive(); }
       else flow.close();
     };
     this.receiveFrames(flow, receive);
