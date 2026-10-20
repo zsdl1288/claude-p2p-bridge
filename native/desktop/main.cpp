@@ -40,13 +40,15 @@ class Application {
     Json status_, proxy_ = Json::object(); HWND heading_ = nullptr, description_ = nullptr, state_ = nullptr;
     HWND identityMessage_ = nullptr, networkMessage_ = nullptr, connectionHint_ = nullptr, peerList_ = nullptr, proxyPeerList_ = nullptr, activity_ = nullptr;
     HWND startupHint_ = nullptr, modelStatus_ = nullptr, hostModelStatus_ = nullptr;
-    HWND proxyMessage_ = nullptr, proxyDetails_ = nullptr, proxyGuardMessage_ = nullptr, settingsGuardMessage_ = nullptr;
+    HWND proxyMessage_ = nullptr, proxyDetails_ = nullptr;
 
     Json Object(const Json& value, const char* key) const {
         return value.is_object() && value.contains(key) && value[key].is_object() ? value[key] : Json::object();
     }
     Json Identity() const { return Object(status_, "identity"); }
     Json Model() const { return Object(status_, "model"); }
+    Json ModelApi() const { return Object(status_, "modelApi"); }
+    int ControlPort() const { return options_.port == 65535 ? 65534 : options_.port + 1; }
     DesktopAccess::State Access() const { return DesktopAccess::FromStatus(status_, options_.demo); }
     bool Capability(const char* name) const { auto access = Access(); return std::string_view(name) == "model" ? access.model : std::string_view(name) == "proxy" && access.proxy; }
     bool RoleLocked() const { return Access().locked; }
@@ -146,7 +148,7 @@ class Application {
             if (visible) InvalidateRect(item.window, nullptr, TRUE);
         }
         const wchar_t* titles[] = {L"设备与配对", L"模型 API", L"运行记录", L"网络代理", L"设置"};
-        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用 B 的 Claude；工具、文件和命令由调用端执行。", L"查看私有网络、配对及两项业务的运行记录。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接 B，并提供持久系统断线保护。", L"管理后台运行、开机启动、系统保护恢复与开源许可。"};
+        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用 B 的 Claude；工具、文件和命令由调用端执行。", L"查看私有网络、配对及两项业务的运行记录。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接 B，提供网络共享节点。", L"管理后台运行、开机启动与开源许可。"};
         Text(heading_, titles[page_]); Text(description_, descriptions[page_]);
         InvalidateRect(window_, nullptr, TRUE);
     }
@@ -195,6 +197,7 @@ class Application {
         Button(L"暂停配对连接", PAIR_PAUSE, 810, 646, 186, 30, 0, 0, true);
 
         Label(L"A · Claude 模型调用", 228, 132, 540, 24, 1, 1, 1);
+        Button(L"开启模型 API", MODEL_API_TOGGLE, 784, 128, 208, 30, 1, 1, true);
         Label(L"Base URL · OpenAI 兼容接口", 228, 164, 540, 20, 1, 1, 3, true);
         Edit(DesktopModelApi::BaseUrl(options_.port).c_str(), API_ENDPOINT, 228, 188, 540, 30, 1, 1, false, true, true);
         Button(L"复制 Base URL", COPY_ENDPOINT, 784, 188, 208, 30, 1, 1, true);
@@ -212,7 +215,7 @@ class Application {
         Edit(L"请用一句话说明你能提供什么帮助", TEST_PROMPT, 228, 472, 620, 48, 1, 1, true, false, true);
         Button(L"发送测试", TEST_SEND, 864, 472, 128, 26, 1, 1, true);
         Button(L"取消调用", TEST_CANCEL, 864, 504, 128, 24, 1, 1, true);
-        Edit(L"测试使用上方模型 API；每次测试都是独立请求。", TEST_OUTPUT, 228, 542, 764, 124, 1, 1, true, true, true, true);
+        Edit(L"开启模型 API 并连接 B 后可测试；每次测试都是独立请求。", TEST_OUTPUT, 228, 542, 764, 124, 1, 1, true, true, true, true);
         Label(L"B · Claude 服务配置", 228, 132, 540, 24, 1, 2, 1);
         Label(L"Claude 程序路径或命令（claude 自动检测）", 228, 176, 540, 20, 1, 2, 3, true);
         Edit(L"claude", CLAUDE_COMMAND, 228, 204, 540, 30, 1, 2, false, false, true);
@@ -250,27 +253,17 @@ class Application {
         Label(L"Clash 全量配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
         Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 404, 556, 30, 3, 1, false, true, true);
         Button(L"复制全量订阅", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
-        Label(L"Claude 专用：Claude 固定走 B，其他网站直连；保持 Clash TUN 运行，关闭系统代理 / 代理脚本。\r\nB 断时 Claude 无直连回退；切换专用配置后请明确关闭全局系统保护，否则其他网站也会被阻止。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
+        Label(L"Claude 专用：Claude 固定走 B，其他网站直连；保持 Clash TUN 运行，关闭系统代理 / 代理脚本。\r\nB 断时 Claude 无直连回退；旧版系统保护仍会阻止其他网站，需用离线网络恢复工具清除。", 228, 444, 764, 42, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"设备在线表示配对连接可用；“使用中”表示该设备正连接网络共享。\r\n停止共享仅关闭代理连接，不会中断 Claude 模型服务。", 228, 634, 764, 42, 3, 2, 3, true); widgets_.back().stretch = true;
-        Label(L"全局系统保护", 228, 502, 700, 24, 3, 1, 1);
-        proxyGuardMessage_ = Label(L"正在读取保护状态…", 228, 536, 764, 40, 3, 1, 3); widgets_.back().stretch = true;
-        Button(L"启用 / 刷新保护（UAC）", PROXY_GUARD, 228, 584, 252, 32, 3, 1);
-        Button(L"检查保护（UAC）", PROXY_GUARD_VERIFY, 492, 584, 224, 32, 3, 1);
-        Button(L"关闭保护并恢复本机直连（UAC）", PROXY_GUARD_DISABLE, 228, 626, 488, 32, 3, 1);
-        Label(L"支持 ClaudeBridgeTun / Mihomo；网卡重建后请刷新保护。退出私网或切换身份不会撤除保护。", 228, 666, 764, 18, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"后台运行", 228, 132, 540, 24, 4, 0, 1);
         Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, 172, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
         Button(L"收起到托盘", MINIMIZE_TRAY, 228, 224, 220, 34, 4);
         Label(L"开机启动", 228, 294, 540, 24, 4, 0, 1);
         Add(L"BUTTON", L"Windows 登录后自动在后台运行", STARTUP_ENABLE, 228, 328, 540, 26, 4, 0, BS_AUTOCHECKBOX | WS_TABSTOP);
         startupHint_ = Label(L"", 228, 364, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
-        Label(L"系统保护恢复 · 所有身份均可使用", 228, 444, 700, 24, 4, 0, 1);
-        settingsGuardMessage_ = Label(L"正在读取保护状态…", 228, 478, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
-        Button(L"检查保护（UAC）", SETTINGS_GUARD_VERIFY, 228, 530, 224, 32, 4);
-        Button(L"关闭保护并恢复本机直连（UAC）", SETTINGS_GUARD_DISABLE, 466, 530, 350, 32, 4);
-        Label((L"Claude Bridge · v" + Wide(BRIDGE_VERSION)).c_str(), 228, 628, 540, 24, 4);
-        Button(L"开源许可", OPEN_LICENSES, 784, 620, 208, 34, 4, 0, true);
-        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 662, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label((L"Claude Bridge · v" + Wide(BRIDGE_VERSION)).c_str(), 228, 458, 540, 24, 4);
+        Button(L"开源许可", OPEN_LICENSES, 784, 450, 208, 34, 4, 0, true);
+        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 492, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
         LoadSettings(); LoadStartup(); Visibility(); Layout(); UpdateButtons();
     }
     DesktopStartup::Registration Startup() const { return {options_.directory, options_.port, options_.system}; }
@@ -323,8 +316,8 @@ class Application {
         if (page_ == 0) { card(208, 112, 808 + extraW, 184); card(208, 312, 370, 374); card(594, 312, 422 + extraW, 220); card(594, 540, 422 + extraW, 146); }
         if (page_ == 1) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 300); card(208, 420, 808 + extraW, 266 + extraH); } }
         if (page_ == 2) card(208, 112, 808 + extraW, 574 + extraH);
-        if (page_ == 3) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 362); card(208, 486, 808 + extraW, 200 + extraH); } }
-        if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 154); card(208, 600, 808 + extraW, 86); }
+        if (page_ == 3) card(208, 112, 808 + extraW, role_ == 2 ? 574 + extraH : 362);
+        if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 86); }
         SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); EndPaint(window_, &ps);
     }
     void DrawButton(DRAWITEMSTRUCT* draw) {
@@ -410,7 +403,7 @@ class Application {
         // A killed desktop releases its mutex before Windows finishes closing
         // every child. Let its local listener disappear before starting ours.
         for (int attempt = 0; attempt < 30 && !stopping_; ++attempt) {
-            occupied = LocalHttpListening(options_.port);
+            occupied = LocalHttpListening(ControlPort());
             if (!occupied) break;
             if (WaitForSingleObject(wake_.value, 100) == WAIT_OBJECT_0) return;
         }
@@ -444,10 +437,10 @@ class Application {
             bool started = false;
             for (int i = 0; i < 120 && !stopping_; ++i) {
                 try {
-                    auto health = Api(options_.port, "", L"/health");
+                    auto health = Api(ControlPort(), "", L"/health");
                     if (health.value("service", "") != "claude-p2p-bridge" || health.value("version", "") != BRIDGE_VERSION) throw std::runtime_error("本地端口返回了其他程序的数据");
                     if (health.value("parentPid", DWORD{0}) != GetProcessId(process_.value)) throw std::runtime_error("正在等待本次启动的引擎");
-                    auto boot = Api(options_.port, "", L"/api/bootstrap"); token_ = boot.at("token").get<std::string>();
+                    auto boot = Api(ControlPort(), "", L"/api/bootstrap"); token_ = boot.at("token").get<std::string>();
                     started = true; ready_ = true; Post({"ready", boot}); break;
                 } catch (...) {
                     DWORD exitCode = 1;
@@ -464,12 +457,12 @@ class Application {
             int count = 0;
             while (!stopping_) {
                 if (EngineExited()) { PostMessageW(window_, MSG_EXIT, 0, 0); return; }
-                try { Post({"status", Api(options_.port, token_, L"/api/status")}); }
+                try { Post({"status", Api(ControlPort(), token_, L"/api/status")}); }
                 catch (const std::exception& error) { Post({"poll-error", {}, error.what()}); }
                 if (count++ % 3 == 0) {
                     // Refresh network inventory, then render a versioned full
                     // snapshot so an old poll cannot undo an identity change.
-                    try { Api(options_.port, token_, L"/api/tailscale", nullptr, 5000); Post({"status", Api(options_.port, token_, L"/api/status")}); }
+                    try { Api(ControlPort(), token_, L"/api/tailscale", nullptr, 5000); Post({"status", Api(ControlPort(), token_, L"/api/status")}); }
                     catch (const std::exception& error) { Post({"network-error", {}, error.what()}); }
                 }
                 if (WaitForSingleObject(wake_.value, 1800) == WAIT_OBJECT_0) break;
@@ -493,7 +486,9 @@ class Application {
         EnableWindow(Item(PROBE_CLAUDE), enabled && role == "host" && Capability("model"));
         EnableWindow(Item(MODEL_ENABLE), enabled && role == "host" && Capability("model"));
         EnableWindow(Item(MODEL_DISABLE), enabled && role == "host" && Capability("model") && Model().value("enabled", false));
-        EnableWindow(Item(NAV_API), ready_ && Capability("model"));
+        EnableWindow(Item(MODEL_API_TOGGLE), ready_ && statusAvailable_ && !busy_ &&
+            (ModelApi().value("listening", false) || (enabled && Capability("model") && role == "client")));
+        EnableWindow(Item(NAV_API), ready_ && (Capability("model") || ModelApi().value("listening", false)));
         EnableWindow(Item(NAV_PROXY), ready_ && Capability("proxy"));
         EnableWindow(Item(COPY_INVITE), enabled && !invitation_.empty());
         EnableWindow(Item(COPY_TOKEN), ready_ && Capability("model"));
@@ -502,7 +497,7 @@ class Application {
         EnableWindow(Item(API_MODEL), enabled && Capability("model") && ModelsReady() && !testing_);
         EnableWindow(Item(MODELS_REFRESH), enabled && Capability("model") && role == "client" && status_.value("online", false) && Model().value("modelsState", "") != "loading");
         bool online = role == "client" && Model().value("online", false) && Model().value("available", false);
-        EnableWindow(Item(TEST_SEND), ready_ && !busy_ && Capability("model") && online && ModelsReady() && !testing_);
+        EnableWindow(Item(TEST_SEND), ready_ && !busy_ && ModelApi().value("listening", false) && Capability("model") && online && ModelsReady() && !testing_);
         EnableWindow(Item(TEST_CANCEL), testing_ && !requestId_.empty() && !busy_);
         auto pairing = status_.is_object() ? status_.value("pairing", Json::object()) : Json::object();
         bool saved = pairing.is_object() && pairing.value("saved", false);
@@ -510,17 +505,10 @@ class Application {
         EnableWindow(Item(PAIR_DISCONNECT), enabled && saved);
         EnableWindow(Item(PAIR_RESUME), enabled && saved && networkReady && (paused || !status_.value("online", false)));
         EnableWindow(Item(PAIR_PAUSE), enabled && saved && !paused);
-        const auto guard = proxy_.value("guard", Json::object());
         EnableWindow(Item(PROXY_ENABLE), enabled && proxyAvailable_ && Capability("proxy") && role == "client");
         EnableWindow(Item(PROXY_SHARING), enabled && proxyAvailable_ && Capability("proxy") && role == "host");
         EnableWindow(Item(COPY_SUBSCRIPTION), enabled && proxyAvailable_ && !proxy_.value("subscriptionUrl", "").empty());
         EnableWindow(Item(COPY_CLAUDE_SUBSCRIPTION), enabled && proxyAvailable_ && Capability("proxy") && role == "client" && !proxy_.value("claudeSubscriptionUrl", "").empty());
-        bool guardSupported = enabled && proxyAvailable_ && guard.is_object() && guard.value("supported", false);
-        EnableWindow(Item(PROXY_GUARD), guardSupported && role == "client" && Capability("proxy") && proxy_.value("enabled", false));
-        EnableWindow(Item(PROXY_GUARD_VERIFY), guardSupported);
-        EnableWindow(Item(PROXY_GUARD_DISABLE), guardSupported);
-        EnableWindow(Item(SETTINGS_GUARD_VERIFY), guardSupported);
-        EnableWindow(Item(SETTINGS_GUARD_DISABLE), guardSupported);
     }
     void RenderProxy(const Json& proxy) {
         if (!proxy.is_object()) return;
@@ -542,12 +530,6 @@ class Application {
         Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 A 使用本机网络");
         auto subscription = proxy.value("subscriptionUrl", "");
         Text(PROXY_SUBSCRIPTION, subscription.empty() ? L"启用本地节点后生成" : Wide(subscription));
-        const auto guard = proxy.value("guard", Json::object());
-        const bool active = guard.is_object() && guard.value("active", false);
-        const bool unknown = guard.is_object() && (guard.value("state", "") == "unknown" || guard.value("verification", "") == "unknown");
-        const bool partial = guard.is_object() && guard.value("state", "") == "partial";
-        auto guardMessage = std::wstring(unknown ? L"全局保护状态未验证，请检查或明确关闭" : partial ? L"全局保护规则未通过校验" : active ? L"全局系统保护已验证生效" : L"全局系统保护未启用") + L"\r\n" + Wide(guard.is_object() ? guard.value("message", "") : "");
-        Text(proxyGuardMessage_, guardMessage); Text(settingsGuardMessage_, guardMessage);
         RenderDevices(proxyPeerList_, proxy.value("devices", Json::array()), lastProxyDevices_, true);
         UpdateButtons();
     }
@@ -636,7 +618,12 @@ class Application {
         auto pairing = status.value("pairing", Json::object());
         auto model = Model();
         const auto modelsMessage = RenderModels(model);
-        Text(modelStatus_, Wide(model.value("message", "等待 B 的 Claude 模型服务。")) + L"\r\n" + modelsMessage);
+        const auto modelApi = ModelApi();
+        const bool listening = modelApi.value("listening", false);
+        std::wstring apiMessage = listening ? L"模型 API 正在监听 · " + Value(API_ENDPOINT) : L"模型 API 未监听 · 开启后才接受模型调用。";
+        if (!modelApi.value("error", "").empty()) apiMessage += L"\r\n" + Wide(modelApi.value("error", ""));
+        Text(modelStatus_, apiMessage + L"\r\n" + modelsMessage);
+        Text(MODEL_API_TOGGLE, listening || modelApi.value("enabled", false) ? L"关闭模型 API" : L"开启模型 API");
         Text(hostModelStatus_, Wide(model.value("message", "尚未开启 Claude 模型服务。")) + L"\r\n" + modelsMessage);
         Text(MODEL_ENABLE, model.value("enabled", false) ? L"保存配置并更新模型服务" : L"保存配置并开启模型服务");
         Text(identityMessage_, Wide(identity.value("message", RoleLocked() ? "身份已锁定；先退出私有网络才能切换。" : "请选择身份，再连接私有网络。")));
@@ -647,7 +634,7 @@ class Application {
             Text(TEST_OUTPUT, testing_ ? L"连接或授权已改变，本次测试已停止；连接就绪后可重新测试。" : L"每次测试都是独立请求。");
         }
         if (roleChanged) { role_ = role == "host" ? 2 : role == "client" ? 1 : 0; page_ = 0; lastProxyDevices_.clear(); }
-        if ((page_ == 1 && !Capability("model")) || (page_ == 3 && !Capability("proxy"))) page_ = 0;
+        if ((page_ == 1 && !Capability("model") && !listening) || (page_ == 3 && !Capability("proxy"))) page_ = 0;
         observedRole_ = role;
         if (pairing.is_object()) Text(PAIR_HOST, pairing.value("saved", false) && role == "host" ? L"重新创建服务身份与配对码" : L"创建服务身份与配对码");
         invitation_ = status.value("invitation", Json()).is_string() ? status["invitation"].get<std::string>() : "";
@@ -661,7 +648,7 @@ class Application {
             Text(MODEL_MAX_TURNS, std::to_wstring(config.value("maxTurns", 30)));
             lastConfig_ = config.dump();
         }
-        std::wstring hint = role.empty() ? L"先选择调用端或服务端，再连接私有网络。" : !RoleLocked() ? L"私有网络已退出；可以切换身份。\r\n未明确关闭的系统保护仍会保留。" : L"两端登录同一私有网络后进行桥接配对。\r\n临时掉线不会解除身份锁定。";
+        std::wstring hint = role.empty() ? L"先选择调用端或服务端，再连接私有网络。" : !RoleLocked() ? L"私有网络已退出；可以切换身份。" : L"两端登录同一私有网络后进行桥接配对。\r\n临时掉线不会解除身份锁定。";
         if (pairing.is_object() && (pairing.value("saved", false) || pairing.value("state", "none") == "error")) {
             hint = Wide(pairing.value("message", "")) + L"\r\n" + Wide(DesktopAccess::PairingRecoveryHint(pairing, identity.value("desiredOnline", false)));
         }
@@ -679,12 +666,12 @@ class Application {
         if (actionThread_.joinable()) actionThread_.join();
         busy_ = true; UpdateButtons(); Report(L"正在处理…");
         actionThread_ = std::thread([this, route = std::move(route), body = std::move(body), kind] {
-            try { Post({kind, Api(options_.port, token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && (kind == "proxy-copy" || kind == "proxy-copy-claude")) ? nullptr : &body, route == L"/api/proxy/guard" || route == L"/api/proxy/guard/verify" ? 330000 : 30000)}); }
+            try { Post({kind, Api(ControlPort(), token_, route, route == L"/api/tailscale" || (route == L"/api/proxy" && (kind == "proxy-copy" || kind == "proxy-copy-claude")) ? nullptr : &body, 30000)}); }
             catch (const std::exception& error) { Post({"action-error", {}, error.what()}); }
         });
     }
     void StartTest() {
-        if (testing_ || !statusAvailable_ || Role() != "client" || !Capability("model") || !Model().value("available", false) || !ModelsReady()) return;
+        if (testing_ || !statusAvailable_ || !ModelApi().value("listening", false) || Role() != "client" || !Capability("model") || !Model().value("available", false) || !ModelsReady()) return;
         auto prompt = Utf8(Value(TEST_PROMPT)); if (prompt.empty()) throw std::runtime_error("请先输入要发送给 Claude 的内容");
         auto model = Utf8(SelectedModel()); if (model.empty()) throw std::runtime_error("请先获取 B 端模型列表并选择模型");
         Json body = {{"model", model}, {"messages", Json::array({{{"role", "user"}, {"content", prompt}}})}, {"stream", true}};
@@ -726,8 +713,6 @@ class Application {
             Report(L"本机服务暂时不可用"); proxyAvailable_ = false; statusAvailable_ = false;
             Text(modelStatus_, L"本地桥接服务不可用，当前无法读取 B 的模型列表。\r\n等待服务恢复后自动更新。");
             Text(proxyMessage_, L"本地桥接服务不可用 · 请检查后台进程。\r\n代理连接状态无法确认，等待服务恢复。");
-            Text(proxyGuardMessage_, L"当前无法读取系统保护状态；请检查本地服务。\r\n此前已启用的系统保护需明确关闭才恢复直连。");
-            Text(settingsGuardMessage_, L"本地服务不可用，当前无法确认系统保护状态。\r\n此前已启用的保护仍须明确关闭才恢复直连。");
             UpdateButtons(); return;
         }
         if (reply.kind == "network-error") { Text(networkMessage_, Wide(reply.text)); return; }
@@ -757,10 +742,7 @@ class Application {
                 else {
                     Clipboard(window_, Wide(subscription));
                     if (claudeOnly) {
-                        const auto guard = proxy_.value("guard", Json::object());
-                        const bool warning = guard.is_object() && (guard.value("active", false) || guard.value("state", "") == "partial" || guard.value("state", "") == "unknown" || guard.value("verification", "") == "unknown");
                         std::wstring message = L"Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN";
-                        if (warning) message += L"\r\n全局保护未确认关闭，可能阻断其他网站，请在原数据目录明确关闭（UAC）";
                         Text(proxyMessage_, message); Report(message);
                     } else Report(L"全量配置订阅已复制 · 请在 Clash 导入并开启 TUN");
                 }
@@ -786,7 +768,7 @@ class Application {
         try {
             switch (id) {
             case NAV_CONNECTION: case NAV_API: case NAV_LOGS: case NAV_PROXY: case NAV_SETTINGS:
-                if ((id == NAV_API && !Capability("model")) || (id == NAV_PROXY && !Capability("proxy"))) break;
+                if ((id == NAV_API && !Capability("model") && !ModelApi().value("listening", false)) || (id == NAV_PROXY && !Capability("proxy"))) break;
                 page_ = id - NAV_CONNECTION; Visibility(); break;
             case ROLE_CLIENT: case ROLE_HOST:
                 if (statusAvailable_ && Identity().value("loaded", false) && !RoleLocked() && !testing_) Action(L"/api/identity", {{"role", id == ROLE_CLIENT ? "client" : "host"}}, "identity");
@@ -807,6 +789,9 @@ class Application {
                 SaveSettings(); Action(L"/api/model", {{"enabled", true}, {"workspace", Utf8(Value(WORKSPACE))}, {"claudeCommand", Utf8(Value(CLAUDE_COMMAND))}, {"timeoutMs", seconds * 1000}, {"maxTurns", turns}}, "model"); break;
             }
             case MODEL_DISABLE: Action(L"/api/model", {{"enabled", false}}, "model"); break;
+            case MODEL_API_TOGGLE:
+                if (IsWindowEnabled(Item(MODEL_API_TOGGLE))) Action(L"/api/model-api", {{"enabled", !ModelApi().value("listening", false) && !ModelApi().value("enabled", false)}}, "model-api");
+                break;
             case MODELS_REFRESH:
                 Text(modelStatus_, L"正在从 B 刷新 Claude 模型列表…");
                 Action(L"/api/models/refresh", Json::object(), "models"); break;
@@ -819,9 +804,6 @@ class Application {
             case PROXY_SHARING: Action(L"/api/proxy", {{"sharing", !proxy_.value("sharing", false)}}, "proxy"); break;
             case COPY_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy"); break;
             case COPY_CLAUDE_SUBSCRIPTION: Action(L"/api/proxy", Json::object(), "proxy-copy-claude"); break;
-            case PROXY_GUARD: Action(L"/api/proxy/guard", {{"enabled", true}}, "proxy"); break;
-            case PROXY_GUARD_VERIFY: case SETTINGS_GUARD_VERIFY: Action(L"/api/proxy/guard/verify", Json::object(), "proxy"); break;
-            case PROXY_GUARD_DISABLE: case SETTINGS_GUARD_DISABLE: Action(L"/api/proxy/guard", {{"enabled", false}}, "proxy"); break;
             case COPY_INVITE: Clipboard(window_, Wide(invitation_)); Report(L"配对码已复制"); break;
             case COPY_ENDPOINT: Clipboard(window_, Value(API_ENDPOINT)); Report(L"模型 Base URL 已复制"); break;
             case COPY_TOKEN: Clipboard(window_, Wide(token_)); Report(L"API 令牌已复制"); break;
@@ -832,7 +814,7 @@ class Application {
             case TEST_SEND: StartTest(); break;
             case TEST_CANCEL: if (!requestId_.empty()) Action(L"/v1/requests/" + Wide(requestId_) + L"/cancel", Json::object(), "cancel"); break;
             case OPEN_DATA: OpenLink(window_, options_.directory.wstring()); break;
-            case OPEN_LICENSES: OpenLink(window_, L"http://127.0.0.1:" + std::to_wstring(options_.port) + L"/licenses"); break;
+            case OPEN_LICENSES: OpenLink(window_, L"http://127.0.0.1:" + std::to_wstring(ControlPort()) + L"/licenses"); break;
             }
         } catch (const std::exception& error) { Message(Wide(error.what()), true); }
     }
@@ -842,7 +824,7 @@ class Application {
         {
             std::lock_guard lock(engineMutex_);
             if (process_.value && WaitForSingleObject(process_.value, 0) == WAIT_TIMEOUT) {
-                if (ready_) { try { Json body = Json::object(); Api(options_.port, token_, L"/api/shutdown", &body, 1000); } catch (...) {} }
+                if (ready_) { try { Json body = Json::object(); Api(ControlPort(), token_, L"/api/shutdown", &body, 1000); } catch (...) {} }
                 WaitForSingleObject(process_.value, 1500);
             }
             DrainOwnedJob(job_.value, process_.value);

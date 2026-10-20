@@ -3,7 +3,7 @@ export const pages = {
   api: { title: 'Claude 模型 API', description: '为 Claude 单独配置模型服务。模型服务和网络共享可分别启停。' },
   proxy: { title: '网络代理', description: '调用端使用 Clash TUN，服务端提供网络出口。网络共享独立于 Claude。' },
   activity: { title: '运行记录', description: '查看本机连接、配对和业务运行情况。' },
-  settings: { title: '设置', description: '管理后台运行、开源许可和本机系统保护。' }
+  settings: { title: '设置', description: '管理后台运行与开源许可。' }
 };
 
 export function uiState(status = {}, busy = false) {

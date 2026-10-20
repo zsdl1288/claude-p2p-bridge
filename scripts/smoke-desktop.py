@@ -6,6 +6,7 @@ instance behavior and never activating an existing real user desktop.
 """
 import ctypes
 from ctypes import wintypes
+import http.client
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ directory = temporary.path
 desktop = None
 processes = []
 clients = []
+model_urls = {}
 env = os.environ.copy()
 env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -42,16 +44,24 @@ def request(base, route, body=None, token=None):
         headers["Authorization"] = "Bearer " + token
     if route == "/api/bootstrap":
         headers["X-Bridge-UI"] = "1"
-    req = urllib.request.Request(base + route, data=None if body is None else json.dumps(body).encode(), headers=headers)
+    model_route = route in ("/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages") or route.startswith("/v1/requests/")
+    endpoint = model_urls[base] if model_route else base
+    req = urllib.request.Request(endpoint + route, data=None if body is None else json.dumps(body).encode(), headers=headers)
     with opener.open(req, timeout=5) as response:
         return json.load(response)
 
 
 def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, desktop_mode=False):
     if port is None:
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        while True:
+            with socket.socket() as model_probe, socket.socket() as management_probe:
+                model_probe.bind(("127.0.0.1", 0))
+                port = model_probe.getsockname()[1]
+                try:
+                    management_probe.bind(("127.0.0.1", management_port(port)))
+                except OSError:
+                    continue
+                break
     args = [str(desktop if desktop_mode else engine)]
     if not desktop_mode:
         args.append("--owned-engine")
@@ -62,23 +72,39 @@ def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, de
         args.append("--demo")
     process = subprocess.Popen(args, env=env)
     processes.append(process)
-    base = f"http://127.0.0.1:{port}"
+    base = f"http://127.0.0.1:{management_port(port)}"
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         try:
             health = request(base, "/health")
             if health["version"] == version:
-                token = request(base, "/api/bootstrap")["token"]
+                bootstrap = request(base, "/api/bootstrap")
+                token = bootstrap["token"]
+                model_urls[base] = bootstrap["api"]
                 clients.append((base, token))
                 if wait_identity:
-                    wait_status(base, token, lambda state: state["identity"]["loaded"], "Identity preferences did not load")
+                    initial = wait_status(base, token, lambda state: state["identity"]["loaded"], "Identity preferences did not load")
+                    assert not initial["modelApi"]["enabled"] and not initial["modelApi"]["listening"], initial
                 return base, token
-        except Exception:
+        except (OSError, ValueError, AssertionError, http.client.HTTPException):
             pass
         if process.poll() is not None:
             raise RuntimeError(f"{name} exited before startup")
         time.sleep(poll_interval)
     raise TimeoutError(f"{name} did not start")
+
+
+def management_port(port):
+    return 65534 if port == 65535 else port + 1
+
+
+def model_port(base):
+    return int(model_urls[base].rsplit(":", 1)[1])
+
+
+def enable_model_api(base, token):
+    enabled = request(base, "/api/model-api", {"enabled": True}, token)
+    assert enabled["modelApi"]["enabled"] and enabled["modelApi"]["listening"], enabled
 
 
 def stop(base, token, process):
@@ -188,7 +214,7 @@ try:
     status = request(base, "/api/tailscale", token=token)
     assert status["installed"] and status["embedded"] and not status["running"], status
     assert status["backendState"] == "NotStarted", status
-    assert request(base, "/v1/status", token=token)["mode"] == "tailscale"
+    assert request(base, "/api/status", token=token)["mode"] == "tailscale"
     with opener.open(base + "/licenses", timeout=5) as response:
         assert "Tailscale" in response.read().decode("utf-8")
     # A different port and directory must still reuse the same desktop.
@@ -205,7 +231,7 @@ try:
     # Reuse the extracted runtime and shut down as soon as its API appears,
     # before the native desktop necessarily finishes its own bootstrap poll.
     for _ in range(3):
-        quick_base, quick_token = start("embedded", port=int(base.rsplit(":", 1)[1]), poll_interval=0.005, wait_identity=False, desktop_mode=True)
+        quick_base, quick_token = start("embedded", port=model_port(base), poll_interval=0.005, wait_identity=False, desktop_mode=True)
         quick_process = processes[-1]
         request(quick_base, "/api/shutdown", {}, quick_token)
         assert quick_process.wait(timeout=5) == 0, "A graceful early shutdown returned a failure"
@@ -225,7 +251,7 @@ try:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 takeover_port = probe.getsockname()[1]
-            if takeover_port != int(crash_base.rsplit(":", 1)[1]):
+            if takeover_port != model_port(crash_base):
                 break
         takeover_base, takeover_token = start("job-takeover", port=takeover_port, desktop_mode=True)
         assert kernel32.WaitForSingleObject(old_engine, 0) == 0, "Different-port/profile takeover started before the previous engine signaled"
@@ -260,6 +286,8 @@ try:
     assert connected["online"] and connected["demo"]
     assert request(a2, "/api/join", {"invitation": host["invitation"]}, token_a2)["online"]
     wait_all_connected(a, token_a, a2, token_a2, b, token_b)
+    enable_model_api(a, token_a)
+    enable_model_api(a2, token_a2)
     listing = request(a, "/v1/models", token=token_a)
     advertised = request(b, "/api/status", token=token_b)["model"]["models"]
     assert listing["data"] and {item["id"] for item in listing["data"]} == {item["id"] for item in advertised}
@@ -321,7 +349,7 @@ try:
     finish_stream(first)
     wait_host(b, token_b, active=0)
     print("PASS: B serializes concurrent callers, queue cancellation stays isolated, and responses reach their owning A.", flush=True)
-    port_a, port_a2, port_b = int(a.rsplit(":", 1)[1]), int(a2.rsplit(":", 1)[1]), int(b.rsplit(":", 1)[1])
+    port_a, port_a2, port_b = model_port(a), model_port(a2), model_port(b)
     stop(a, token_a, process_a)
     stop(a2, token_a2, process_a2)
     stop(b, token_b, process_b)
@@ -333,6 +361,8 @@ try:
     b, token_b = start("host", demo=True, port=port_b)
     process_b = processes[-1]
     wait_all_connected(a, token_a, a2, token_a2, b, token_b)
+    enable_model_api(a, token_a)
+    enable_model_api(a2, token_a2)
     restored = request(b, "/api/status", token=token_b)
     assert restored["invitation"] == host["invitation"], "B changed its pairing code on restart"
     assert restored["model"]["config"]["workspace"] == configured_host["model"]["config"]["workspace"]
@@ -393,7 +423,7 @@ try:
     assert not down["identity"]["desiredOnline"] and down["identity"]["canSwitchRole"] and not down["identity"]["locked"], down
     assert down["pairing"]["saved"] and down["model"]["enabled"] and down["capabilities"]["model"] and down["capabilities"]["proxy"], down
     expect_error(transition, transition_token, "/api/reconnect", {})
-    transition_port = int(transition.rsplit(":", 1)[1])
+    transition_port = model_port(transition)
     stop(transition, transition_token, transition_process)
     transition, transition_token = start("identity-transition", demo=True, port=transition_port)
     transition_process = processes[-1]

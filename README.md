@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.0.9
+# Claude Bridge · Windows 桌面托盘版 v1.0.10
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,16 +8,16 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.0.9-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.0.10-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.9.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
+桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.10.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
 
 ## 使用方法
 
 1. 将同一个 EXE 复制到 B 和各台 A，分别运行。
 2. 在“设备与配对”先选择本机为 A 调用端或 B 服务端，再点击“连接私有网络”。在浏览器中用同一个 Tailscale 账号完成授权。若账号启用了设备审批，还需在管理台批准新设备。
 3. B 点击“创建服务与配对码”，无需先配置 Claude。每台 A 粘贴 B 的配对码，点击“配对并连接 B”。设备页只管理私网、身份、设备和配对，不配置模型。
-4. B 创建服务后、A 保存有效配对后，分别解锁“模型 API”和“网络代理”。B 在“模型 API”配置 Claude 程序和运行目录并启用服务；A 仅显示远端模型状态、本机 Base URL、API Key、模型 ID 和调用测试。只使用网络共享时可跳过模型配置。
+4. B 创建服务后、A 保存有效配对后，分别解锁“模型 API”和“网络代理”。B 在“模型 API”配置 Claude 程序和运行目录并启用服务；A 点击“开启模型 API”才开始监听本机模型端口，再使用 Base URL、API Key、模型 ID 和调用测试。停止后立即释放模型端口并取消在途模型请求，配对和网络代理继续运行。每次启动客户端，A 的模型 API 默认关闭。只使用网络共享时可跳过模型配置。
 5. 配对自动加密保存。下次运行客户端，B 恢复原服务，各 A 自动重连；A 先启动时会等待 B 上线。主动“退出私有网络”后不再自动上线，需再次点击连接。
 6. 需要随 Windows 登录启动时，在各端打开左下角“设置”，勾选“Windows 登录后自动在后台运行”。之后会直接驻留托盘并恢复配对。“收起到托盘”和“开源许可”也在设置中。
 
@@ -35,7 +35,7 @@ B 的“Claude 程序路径或命令”保留默认 `claude` 即可自动检测�
 
 从 A 切到 B 或从 B 切到 A 会停止原身份业务并撤销原配对，清除其网络共享授权；新身份需要重新创建服务或配对。不会同时保留双向服务，也不会因重启恢复旧角色。切换期间只显示设备页，未完成新授权前模型与代理入口重新置灰。撤销授权与保存新身份期间，新的登录、配对、业务配置和再次切换请求会被拒绝；保存失败后可以重试，但不会恢复已撤销的旧授权。普通对端离线则保留页面访问，便于查看状态和修复配置。
 
-模型和代理共用私网及设备配对身份，业务连接、状态及启停独立。关闭或重新配置 Claude、模型请求超时或取消，不关闭网络共享；停止共享不停止模型调用。退出私网、撤销配对或切换身份会中止两条业务的当前连接，这是共同授权失效的结果。**WFP 系统保护不会随上述操作自动撤除**，在“设置”始终保留检查及明确关闭保护的入口。
+模型和代理共用私网及设备配对身份，业务连接、状态及启停独立。关闭或重新配置 Claude、模型请求超时或取消，不关闭网络共享；停止共享不停止模型调用。退出私网、撤销配对或切换身份会中止两条业务的当前连接，这是共同授权失效的结果。
 
 ## 多电脑、托盘和自动恢复
 
@@ -61,56 +61,45 @@ A 应用 → Clash TUN → A 本机带密码的 SOCKS5 → Tailscale → B → �
 1. 将同一最新版 EXE 复制到两端，在原 Windows 用户下沿用配对。
 2. B 打开“网络代理”，点击“开启共享本机网络”。网络共享默认关闭，和 Claude 服务独立。该页列出已配对调用端，区分“已配对在线”和“正在使用共享”，显示各设备的活动连接和流量；私网在线节点不会自动成为代理使用者。
 3. A 打开“网络代理”，该页仅显示本机及已配对 B 的连接情况。点击“启用本地 Clash 节点”，复制“完整配置订阅”。订阅位于 A 的 `127.0.0.1`，需要 A 客户端持续运行；它不是 B 的公网地址。
-4. 在使用 Mihomo / Clash Meta 内核的客户端中导入该 URL 作为**完整配置**，切换到该配置并开启 TUN；不需要另开“系统代理”。不能只把节点合并进一份已有的直连分流配置。配置生成的虚拟网卡名是 `ClaudeBridgeTun`；Clash Verge 2.5.8 使用默认 `Mihomo` 网卡名时也可直接启用系统保护，无需手动改名。已验证 Mihomo v1.19.32 的订阅协议；Clash Verge 的实际 UAC/TUN 联动仍需在 A/B 测试机验收。
-5. 需要 Clash 退出后也保持禁止直连时，在 A 的本客户端点击“启用 / 刷新系统保护”，接受 Windows UAC。必须先开启上一步的 TUN，系统保护才会安装；没有对应 TUN 时会明确拒绝。
+4. 在使用 Mihomo / Clash Meta 内核的客户端中导入该 URL 作为**完整配置**，切换到该配置并开启 TUN；不需要另开“系统代理”。不能只把节点合并进一份已有的直连分流配置。配置生成的虚拟网卡名是 `ClaudeBridgeTun`，组网自举也识别 Clash Verge 默认的 `Mihomo` 网卡名。已验证 Mihomo v1.19.32 的订阅协议；Clash Verge 的实际 TUN 联动仍需在 A/B 测试机验收。
 
 完整配置将互联网流量固定到 B，不包含 `DIRECT` 回退；DNS 使用经 B 的 DoH，IPv4/IPv6 均纳入 TUN。仅回环流量和网络核心自身的组网连接绕过代理，避免回环。默认不设置国内网站直连或局域网直连规则。B 的代理拒绝本机、私网、链路本地和其他特殊目标地址；域名在 B 解析并检查实际拨号地址，避免无意暴露 B 的内网服务。
 
 B 掉线、关闭共享、暂停连接或配对会话失效后，已有代理流立即撤销，新请求失败，A 按现有退避机制自动重连。重连仅恢复后续新连接，不重放中断的下载或请求。订阅地址、本地代理端口和凭据随本机数据目录稳定保存；更换配对需重新显式授权网络共享/代理。端口被占用时会报错，不会悄悄更换端口导致 Clash 使用旧配置。
 
-UDP 通过独立 WebSocket 连接封装转发，支持真实 SOCKS5 UDP ASSOCIATE。弱网丢包时仍受 TCP 重传影响，不承诺游戏低延迟。从 1.0.9 起，A、B 的代理流及其内置传输通道默认不设固定连接数量上限，实际承载受系统资源和网络条件影响；资源不足时新连接仍可能失败。代理状态中的 `connectionLimit` 和 `sessionConnectionLimit` 为 `0` 表示不设数量上限，界面同时显示实际活跃连接数。TCP 关闭或断线后释放相应流，UDP 关联空闲 60 秒后回收，后续新流量可重新建立关联。每个已认证会话的 32 MiB/s 流量保护阈值、4 MiB 缓冲保护及握手超时等独立保护保留；超出相应保护限额时拒绝或关闭相关流。A、B 都需升级到 1.0.9，才能移除两端旧版的连接数量限制；取消数量限制不改变链路带宽、延迟或中继路径。
+UDP 通过独立 WebSocket 连接封装转发，支持真实 SOCKS5 UDP ASSOCIATE。弱网丢包时仍受 TCP 重传影响，不承诺游戏低延迟。从 1.0.9 起，A、B 的代理流及其内置传输通道默认不设固定连接数量上限，实际承载受系统资源和网络条件影响；资源不足时新连接仍可能失败。代理状态中的 `connectionLimit` 和 `sessionConnectionLimit` 为 `0` 表示不设数量上限，界面同时显示实际活跃连接数。TCP 关闭或断线后释放相应流，UDP 关联空闲 60 秒后回收，后续新流量可重新建立关联。每个已认证会话的 32 MiB/s 流量保护阈值、4 MiB 缓冲保护及握手超时等独立保护保留；超出相应保护限额时拒绝或关闭相关流。A、B 都需使用 1.0.9 或更新版本，才能移除两端旧版的连接数量限制；取消数量限制不改变链路带宽、延迟或中继路径。
 
 ### 只让 Claude 经 B，其他网站直连
 
-A 使用 1.0.9 后，点击“复制 Claude 专用配置”，在 Clash 中将其导入为完整配置并开启 TUN，保持规则模式。该订阅与原有全量订阅分开；原来的 `config.yaml` 不改变行为。
+A 使用 1.0.9 或更新版本后，点击“复制 Claude 专用配置”，在 Clash 中将其导入为完整配置并开启 TUN，保持规则模式。该订阅与原有全量订阅分开；原来的 `config.yaml` 不改变行为。
 
 专用配置将 `claude.ai`、`claude.com`、`claude.app`、`anthropic.com`、`claudeusercontent.com`、`claudemcpcontent.com` 及其子域固定交给 B，也覆盖官方列出的两个 Claude Code Datadog 遥测入口。这些域名优先于网络组件的直连例外。Claude 域名的 DNS 只经 B，只有这些域名使用 fake-IP；其他域名使用独立的直连 DNS 并返回真实地址，其他网站默认直连，避免给普通网站新增依赖 Clash 的 fake-IP 缓存。域名范围依据 [Claude Code 官方网络要求](https://code.claude.com/docs/en/network-config)及[桌面端官方清单](https://code.claude.com/docs/en/desktop#network-access-requirements)，不依赖远程规则集下载。B 掉线、停止共享或桥接退出后，匹配这些域名的请求失败，不回退到 DIRECT；B 恢复后只恢复新请求。
 
-**专用模式不要启用下方的全局 WFP 系统保护**，否则其他网站的直连也会被阻止。此前装过保护时，即使状态是“部分生效”也需用原数据目录明确关闭（UAC），确认关闭成功；程序不会自动撤除已有规则。
+这是 Clash TUN 内的域名分流，需要 Clash 和 TUN 持续运行。Clash 退出、TUN 停止、应用绕过 TUN 或目标域名无法识别时，不能依靠该配置保证阻止直连。新增 Claude 服务域名时需更新配置。
 
-这是 Clash TUN 内的域名分流保护，需要 Clash 和 TUN 持续运行。它不承诺在 Clash 退出、TUN 停止、应用绕过 TUN 或无法识别目标域名时仍阻止直连，也不能保证账号不会受到平台限制。新增 Claude 服务域名时需更新配置；需要覆盖这些故障时，可使用下面的全局系统保护，但会同时限制其他网站的公网直连。
+### 旧版系统保护的升级与恢复
 
-### 全局系统断线保护
+1.0.10 主程序移除系统断线保护的设置和 API，不再安装新的 WFP 保护规则。旧版已经安装的持久规则不会随退出或升级自动删除；升级前应使用旧版、原数据目录明确关闭保护，或使用本次发行版附带的离线恢复包。Claude 专用订阅需要其他网站能够直连，因此也应先清除旧的全局保护。
 
-系统保护使用 Windows WFP 持久过滤规则，不修改系统防火墙的全局默认策略。它放行指定 TUN、回环及必要局域网维护流量，允许内置网络核心重连，阻止绕过 TUN 的公网连接及业务 DNS。**关闭 Clash、退出本客户端、B 离线都不会自动移除保护。** 只有明确点击“关闭保护并恢复本机直连”，接受 UAC 后才移除本配置的保护。
-
-- 普通权限可能无法读取 WFP，界面将显示“状态未验证”，不会当作未启用。点击“检查系统保护（UAC）”可获取实际过滤规则状态；启动、轮询和订阅读取均不会自动请求管理员权限。
-- 启用或关闭操作返回“保护规则验证未通过”时，规则可能已经存在；界面会显示检测数量及校验诊断。这个状态不能表示保护已完整生效，也不能表示已关闭保护、恢复直连。
-- TUN 被重新创建后接口标识可能改变，即使网卡名称相同也需重新点击“启用 / 刷新系统保护”；更新客户端后网络核心路径改变也可能需要刷新。在刷新之前保持阻断，不会自动放开或移除持久保护。B 暂时离线且 TUN 接口未变时，B 恢复后仍自动重连，无需刷新保护。关闭保护按钮在尚未配对或切换角色后也可使用。
-- 保护范围是 Windows Base Filtering Engine（BFE）运行并加载持久规则之后，不保证 Windows 启动早期、BFE 被管理员停用或其他管理员改变策略时的阻断。
-- 系统保护仅支持 Windows 10/11 x64 内置组网模式。演示模式、其他系统或 `--system-tailscale` 模式不启用该系统保护。
-- 升级前建议显式关闭系统保护，升级并重新开启 Clash TUN 后再启用，避免旧路径/接口阻断新版本组网。
-- 同一电脑只应启用一份客户端的系统保护。保护按数据目录分别保存，并绑定启用时的 TUN 接口；多个目录同时启用可能互相阻断。迁移数据目录时，先用原目录明确关闭旧保护；新目录的关闭按钮不会删除其他目录的规则。
-
-旧版启用断线保护后整机断网、无法通过原界面关闭时，可在其他电脑取得 `release/ClaudeBridge-Network-Recovery-windows-x64.zip` 后离线拷入并解压。从托盘退出客户端，右键恢复 EXE 选择“以管理员身份运行”，输入 `RESTORE` 并回车。工具按显示名、确定性 GUID 和本软件规则标记查找全部旧配置，事务撤除后重新核对剩余数量；不需要原安装目录、AppID、TUN 或联网，不重置系统防火墙。确认剩余配置为 0 后，关闭 Clash TUN/系统代理并重新测试直连。报错时保留窗口诊断。恢复后先保持保护关闭，确认代理可用后再考虑启用。开发者可用 `python scripts/build_guard_recovery.py` 离线构建该工具。
+旧版启用断线保护后整机断网、无法通过原界面关闭时，可在其他电脑取得 `release/ClaudeBridge-Network-Recovery-windows-x64.zip` 后离线拷入并解压。从托盘退出客户端，右键恢复 EXE 选择“以管理员身份运行”，输入 `RESTORE` 并回车。工具按显示名、确定性 GUID 和本软件规则标记查找全部旧配置，事务撤除后重新核对剩余数量；不需要原安装目录、AppID、TUN 或联网，不重置系统防火墙。确认剩余配置为 0 后，关闭 Clash TUN/系统代理并重新测试直连。报错时保留窗口诊断。本版主程序不再提供重新启用系统保护的入口。开发者可用 `python scripts/build_guard_recovery.py` 离线构建该工具。
 
 独立订阅凭据不等同本机模型 API Token，但仍包含本地代理访问权限，应妥善保管。它不包含 Tailscale 登录凭据或 B 的配对密钥。
 
 A 应只开启 Clash TUN，关闭“系统代理”；Windows 手动代理和代理脚本不得指向本机 Clash，修改后重新启动本客户端。内置 Tailscale 在 Windows 仍可能参考 WinHTTP / PAC / WPAD 设置，指向本机 Clash 会导致组网自举循环；企业强制 PAC / WPAD 环境需要单独验证。本版组网启动 DNS 使用物理 IPv4 网卡，IPv6-only 接入暂不支持（不影响双栈网络中的 IPv6 代理流量）。
 
+1.0.10 修复 Windows 上其他 TUN 安装默认路由时内置组网误选虚拟网卡的问题。组网传输选择非虚拟默认网卡，Tailscale 控制连接与普通组网 DNS 共用物理网卡解析器，避免控制域名落入 fake-IP。此修复不修改现有 Clash 配置、节点或系统路由，也不保证改善跨国链路带宽。
+
 新增接口均要求本机 API 鉴权，订阅使用独立 URL 令牌：
 
 | 接口 | 用途 |
 | --- | --- |
-| `GET /api/proxy` | 共享、本地节点、流量和系统保护状态（只读） |
+| `GET /api/proxy` | 共享、本地节点和流量状态（只读） |
 | `POST /api/proxy` | B `{sharing:true/false}`；A `{enabled:true/false}` |
-| `POST /api/proxy/guard` | A 显式 `{enabled:true}` 启用；任一身份可 `{enabled:false}` 恢复直连，需要 UAC |
-| `POST /api/proxy/guard/verify` | 显式 `{}`，通过 UAC 检查实际保护状态 |
 | `GET /clash/<独立订阅令牌>/config.yaml` | 完整 Clash 配置，推荐导入 |
 | `GET /clash/<独立订阅令牌>/claude.yaml` | Claude 专用完整配置；Claude 固定经 B，其他网站直连 |
 | `GET /clash/<独立订阅令牌>/nodes.yaml` | 仅节点列表，不包含 TUN、DNS 和阻断规则 |
 
-开发验证可运行 `node scripts/smoke-clash.mjs --mihomo <Mihomo程序绝对路径>`，验证实际 Mihomo 的 TCP/UDP 和订阅协议；`python scripts/smoke-proxy-exe.py` 使用打包的 `bridge-engine` 组件与独立测试数据目录模拟多端，验证代理启停、断线恢复和配置持久化。两者都只使用本机测试，不创建 TUN、不修改系统代理或过滤规则，也不绕过桌面单实例限制。**WFP 规则/ABI、状态校验和模拟回归不能替代真实阻断验收**；实际 UAC 启停、Clash TUN 联动、物理断网、网络切换及重启后阻断仍需在专用 A/B 测试机验证。
+开发验证可运行 `node scripts/smoke-clash.mjs --mihomo <Mihomo程序绝对路径>`，验证实际 Mihomo 的 TCP/UDP 和订阅协议；`python scripts/smoke-proxy-exe.py` 使用打包的 `bridge-engine` 组件与独立测试数据目录模拟多端，验证代理启停、断线恢复和配置持久化。两者都只使用本机测试，不创建 TUN、不修改系统代理或过滤规则，也不绕过桌面单实例限制。实际 Clash TUN 联动、物理断网、网络切换及重启后的代理恢复仍需在专用 A/B 测试机验证。
 
 默认数据目录为 `%LOCALAPPDATA%\ClaudeBridge`，包含设备身份、本机 `api-token`、加密配对 `pairing.dat`、桌面设置和运行缓存。配对由 Windows DPAPI 绑定当前用户保护；演示配对使用独立的 `pairing-demo.dat`。不要分发这些私有文件。桌面配置读取完成前若窗口初始化失败，退出流程不会将默认值写回已有的 `desktop.ini`。
 
@@ -118,13 +107,13 @@ Windows 初始化内置组网时，为当前用户拥有的状态目录设置私
 
 自启动默认关闭，启用后使用当前用户的 Windows 登录启动项，无需管理员权限。程序将 EXE 复制到数据目录下稳定的版本路径，移动下载文件不会影响启动。手动运行新版时，会刷新同一数据目录已启用的启动项。每个 Windows 用户只有一个 Claude Bridge 启动项；从另一数据目录手动启用会替换该项，关闭时只移除属于当前目录的启动项。演示模式禁用自启动。未登录 Windows 时客户端不会运行。
 
-升级时先从托盘退出旧版，再运行新版。B 与所有 A 均需升级到 1.0.9，才能取消代理流及其底层传输的固定连接数量上限；Claude 专用订阅要求 A 使用 1.0.7 及以后版本；动态模型列表同步要求两端使用 1.0.4 及以后版本。旧版已保存的组网登录、配对、身份与 Claude 配置迁移保留，角色和网络是否自动恢复以保存状态为准。若旧版从未保存配对，需要首次配对。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享；设备身份失效或配对密钥被撤销时需重新授权。已启用持久 WFP 保护的升级及目录迁移仍遵循上文的显式关闭流程。
+升级时先从托盘退出旧版，再运行新版。A、B 都需使用 1.0.9 或更新版本才能取消旧版代理连接数量上限；从更早版本升级时请统一更新两端。1.0.10 起 A 的模型 API 每次启动均默认关闭，需在模型页显式开启；默认模型 URL 仍为 `http://127.0.0.1:3210/v1`，开发控制台改用独立管理端口，通常为 `http://127.0.0.1:3211`。动态模型列表要求 B 与所有 A 使用 1.0.4 及以上版本；旧版已保存的组网登录、配对、身份与 Claude 配置迁移保留，角色和网络是否自动恢复以保存状态为准。若旧版从未保存配对，需要首次配对。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享；设备身份失效或配对密钥被撤销时需重新授权。
 
 **同一 Windows 用户只允许一个新版桌面实例运行**。新版使用稳定的共享锁，不因端口、数据目录、EXE 位置或后续新版版本号变化而启动第二份桌面；再次启动会尝试唤回已有窗口。已有实例尚未显示窗口或锁权限受限时，新启动会等待其就绪或退出；无法安全取得锁就结束本次启动，不另开后台。新版也会检测当前用户已运行的旧版并唤回它，但无法让随后启动的 0.8 等历史程序遵守其尚未实现的新锁。因此升级时先从托盘退出旧版，升级后统一使用新版。需要更换数据目录或版本时，也先退出当前客户端。从 0.9.4 起，新版之间崩溃后再次启动，会先清退上一轮的后台进程，再读取配置和启动服务；改用其他端口或数据目录也遵守同一顺序。历史旧版没有这套交接记录，升级时应正常退出旧版。A、B 实际部署在不同电脑；同机多端回归由测试脚本使用打包的 `bridge-engine` 组件和独立测试数据目录完成。
 
 ## 将 A 配置为 Harness 主模型提供方
 
-在 **Settings → Models → Add model provider → Custom model API** 填写：
+先在 A 的“模型 API”页点击“开启模型 API”，每次重启客户端后都需要重新启动。然后在 **Settings → Models → Add model provider → Custom model API** 填写：
 
 | 字段 | 填写值 |
 | --- | --- |
@@ -185,17 +174,17 @@ $bridgeReply.choices[0].message
 
 ## 兼容的 B 端任务 API
 
-通过 `Authorization: Bearer <A 的 API_TOKEN>` 鉴权。各电脑 Token 独立，配对无需共享本机 Token。管理页面和 API 只监听 `127.0.0.1`；B 的远端服务位于 `tsnet` 虚拟网络，默认虚拟端口 3211。发现设备本身不会授予调用权限，需使用 B 的配对码。
+通过 `Authorization: Bearer <A 的 API_TOKEN>` 鉴权。各电脑 Token 独立，配对无需共享本机 Token。管理页面和 API 只监听 `127.0.0.1`。本机模型 API 默认端口为 3210，仅在 A 主动启动后监听；管理页面和 `/api/*` 使用独立端口，默认为 3211，不受模型 API 开关影响。指定 `--port` 时管理端口为该值加一，65535 时改用 65534。B 的远端服务位于 `tsnet` 虚拟网络，默认虚拟端口 3211，与本机管理端口属于不同网络。发现设备本身不会授予调用权限，需使用 B 的配对码。
 
 ### 普通 JSON 响应
 
-同样需要先完成 A/B 配对并由 B 单独启用 Claude 服务；兼容任务使用 B 模型页中保存的运行目录及工具权限。
+`/v1/run` 是独立兼容任务接口，使用管理端口（默认 3211），不受 A 的模型 API 监听开关控制。同样需要先完成 A/B 配对并由 B 单独启用 Claude 服务；兼容任务使用 B 模型页中保存的运行目录及工具权限。
 
 ```powershell
 $bridgeToken = (Get-Content "$env:LOCALAPPDATA\ClaudeBridge\api-token" -Raw).Trim()
 $bridgeHeaders = @{ Authorization = "Bearer $bridgeToken" }
 $bridgeBody = @{ prompt = '请概括当前项目结构'; stream = $false } | ConvertTo-Json
-Invoke-RestMethod -Uri http://127.0.0.1:3210/v1/run -Method Post -Headers $bridgeHeaders -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($bridgeBody))
+Invoke-RestMethod -Uri http://127.0.0.1:3211/v1/run -Method Post -Headers $bridgeHeaders -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($bridgeBody))
 ```
 
 ```json
@@ -240,6 +229,7 @@ python examples/client.py '请概括当前项目结构'
 | 接口 | 用途 / 请求体 |
 | --- | --- |
 | `GET /health` | 健康和版本，无需 Token |
+| `GET /api/status` | 管理状态，包含 `modelApi` 的 `enabled/listening/port/baseUrl/error` |
 | `GET /v1/status` | 角色、`connectedClients`、`queuedRequests` 和任务状态 |
 | `GET /api/tailscale` | 节点状态、授权链接、设备列表及连接路径 |
 | `POST /api/identity` | 退出私网后选择身份：`{"role":"client"}` 或 `{"role":"host"}`；改变身份撤销原授权 |
@@ -249,6 +239,8 @@ python examples/client.py '请概括当前项目结构'
 | `POST /api/join` | A 配对：`{invitation}` |
 | `GET /api/model` | 当前身份的模型配置、可用状态及提示（只读） |
 | `POST /api/model` | B 独立配置 Claude：`{enabled,workspace?,claudeCommand?,profile?,timeoutMs?,maxTurns?}`；停止时保留配置 |
+| `POST /api/model-api` | A 启停本机模型监听：`{enabled}`；返回完整状态，重启后默认关闭 |
+| `POST /api/model-test` | 管理端同源调用测试；请求体与 `/v1/chat/completions` 相同，模型 API 需已启动 |
 | `POST /api/pause` | 暂停连接，保留配对 |
 | `POST /api/reconnect` | 恢复保存的配对 |
 | `POST /api/disconnect` | 忘记配对并停止连接 |
@@ -264,7 +256,7 @@ python examples/client.py '请概括当前项目结构'
 
 管理接口遵循和页面相同的顺序：两端先 `POST /api/identity`，再 `POST /api/network/login`；B 使用不含 Claude 字段的 `POST /api/host` 创建服务，A 通过 `POST /api/join` 保存授权。需要模型时，B 随后单独调用 `POST /api/model` 配置并启用；只需代理时分别开启 B 共享与 A 本地节点。`workspace`、`claudeCommand`、`profile` 等字段不能再放进 `/api/host` 请求。切换身份前必须先成功完成 `POST /api/network/disconnect`。
 
-`/v1/run` 保留旧版“在 B 项目执行完整任务”的语义，工具权限在 B 的模型页高级配置中设置；该入口拒绝 `kind:model`，无任务结果时不会报告成功。网页模型测试使用标准 `/v1/chat/completions`。桌面和网页的模型测试绑定发起时的控制连接；角色、授权或连接更换后清除旧测试结果，不自动重发请求。Harness 主模型也应使用该入口，两个入口的工具执行位置不同。已支持且接收 JSON 参数的接口要求有效的 UTF-8 JSON 对象；取消接口不读取请求体。
+`/v1/run` 保留旧版“在 B 项目执行完整任务”的语义，工具权限在 B 的模型页高级配置中设置；该入口拒绝 `kind:model`，无任务结果时不会报告成功。网页和桌面模型测试经管理端 `/api/model-test` 使用标准 Chat Completions 请求格式；Harness 使用模型端口的 `/v1/chat/completions`。桌面和网页的模型测试绑定发起时的控制连接；角色、授权或连接更换后清除旧测试结果，不自动重发请求。两个模型入口的工具执行位置不同。已支持且接收 JSON 参数的接口要求有效的 UTF-8 JSON 对象；取消接口不读取请求体。
 
 ## 权限和开源组件
 
@@ -280,7 +272,7 @@ Tailscale 核心客户端、CLI 和 `tsnet` 使用 BSD-3-Clause；部分官方�
 
 | EXE 参数 | 用途 |
 | --- | --- |
-| `--port 3213` | 改变本机 API 端口；不允许同一 Windows 用户启动第二个桌面 |
+| `--port 3213` | 改变本机模型 API 端口，管理端口使用 3214；不允许同一 Windows 用户启动第二个桌面 |
 | `--data-dir E:\bridge-data` | 选择数据目录；更换前需退出已有桌面实例 |
 | `--minimized` | 启动后直接收起到托盘；兼容旧名 `--no-browser` |
 | `--demo` | 本机模拟网络及 Claude，不使用真实账号；配对单独保存 |
@@ -322,7 +314,7 @@ go test ./cmd/bridge ./netcore
 
 可选的真实客户端协议验证：按 `scripts/smoke-harness-client.js` 顶部命令，将 Harness 使用的 pi-ai 1.1.0 安装到独立 `.bridge` 测试目录，再运行 `node scripts/smoke-harness-client.js`。该脚本用合成 CLI 验证实际 pi-ai 工具往返及官方 OpenAI SDK 错误处理，不访问外部模型；缺少可选依赖时明确跳过，不增加生产依赖。
 
-测试使用合成 Claude CLI 与本机网络，覆盖加密 A/B 通道、A 端工具往返、多 A 排队及取消隔离、断线恢复、无效模型输出、DPAPI 保存、独立注册表自启动项、流式 UTF-8 分片、打包组件运行和快速退出。`test-single-instance.py` 检查新版在同一 Windows 用户下跨端口、目录、文件位置的互斥、锁权限受限时的等待与接管，以及已有窗口唤回；后续新版沿用同一锁标识，历史旧程序后启动的限制见上文。多端模拟使用打包的 `bridge-engine` 组件与各自独立的数据目录，生产桌面不提供绕过单实例限制的参数。源码/运行时白名单测试检查私有文件、缺失资源及链接路径；Windows 权限不允许创建符号链接时，相应链接回归会明确跳过。自启动测试仅写隔离 HKCU 测试键，代理测试不安装真实断网保护。
+测试使用合成 Claude CLI 与本机网络，覆盖加密 A/B 通道、A 端工具往返、多 A 排队及取消隔离、断线恢复、无效模型输出、DPAPI 保存、独立注册表自启动项、流式 UTF-8 分片、打包组件运行和快速退出。`test-single-instance.py` 检查新版在同一 Windows 用户下跨端口、目录、文件位置的互斥、锁权限受限时的等待与接管，以及已有窗口唤回；后续新版沿用同一锁标识，历史旧程序后启动的限制见上文。多端模拟使用打包的 `bridge-engine` 组件与各自独立的数据目录，生产桌面不提供绕过单实例限制的参数。源码/运行时白名单测试检查私有文件、缺失资源及链接路径；Windows 权限不允许创建符号链接时，相应链接回归会明确跳过。自启动测试仅写隔离 HKCU 测试键。
 
 `test-windows-state-restart.py` 使用同一账号的真实高权限、普通权限进程，验证管理员初始化后未启动 Tailscale 就退出，再以普通权限重新打开并读取保存状态。测试拒绝缺失或跳过的阶段，检查所有者、权限、父目录及状态内容；仅使用隔离合成数据，不连接真实私网，在 `.cache/validation` 保留回执供检查。
 

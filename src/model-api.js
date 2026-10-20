@@ -30,6 +30,7 @@ export async function serveModel(req, res, body, bridge, streams) {
   const onClose = () => { if (!completed) { controller.abort(); fail(new ModelError('调用端已断开', 499, 'request_cancelled')); } };
   res.once('close', onClose);
   if (res.destroyed) { res.off('close', onClose); return; }
+  streams.add(res);
   const frame = (data) => {
     if (res.destroyed) throw new ModelError('调用端已断开', 499, 'request_cancelled');
     const ok = res.write(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
@@ -37,6 +38,7 @@ export async function serveModel(req, res, body, bridge, streams) {
   };
   try {
     await bridge.getModels();
+    if (controller.signal.aborted || res.destroyed) throw new ModelError('调用端已断开', 499, 'request_cancelled');
     const requestId = bridge.run(request, (event) => {
       if (completed) return;
       if (event.type === 'error') fail(new ModelError(event.message || 'B 模型请求失败', event.code === 'PEER_DISCONNECTED' ? 503 : event.code === 'CANCEL_TIMEOUT' ? 499 : 502, event.code || 'model_process_error'));
@@ -47,7 +49,6 @@ export async function serveModel(req, res, body, bridge, streams) {
         else resolveRun();
       }
     }, controller.signal);
-    streams.add(res);
     if (streaming) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive', 'X-Accel-Buffering': 'no', 'X-Request-ID': requestId, 'X-Bridge-Output': 'buffered-structured-decision' });
       res.flushHeaders();

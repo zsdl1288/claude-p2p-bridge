@@ -5,7 +5,7 @@ import { version } from '../src/version.js';
 
 // Exercise the real browser controller with a small DOM surface. API responses
 // are explicit snapshots, so role locks, page gates and payload separation can
-// be checked without starting tsnet, Claude or Windows protection.
+// be checked without starting tsnet or Claude.
 class Element {
   constructor(id = '') {
     this.id = id; this.value = ''; this.textContent = ''; this.hidden = false; this.disabled = false; this.className = '';
@@ -33,7 +33,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
   const availableModels = [{ id: 'future-sonnet-id', name: 'Sonnet Next', description: 'B 账号可用模型' }, { id: 'custom-opus-id', name: 'Opus Next' }];
   const readyModel = { enabled: true, available: true, modelsState: 'ready', models: availableModels };
   const calls = [], intervals = [];
-  let snapshot = { instanceId: 'backend-first', revision: 1, identity: { loaded: true, role: null, locked: false, desiredOnline: false, canSwitchRole: true }, capabilities: { model: false, proxy: false }, model: {}, proxy: { guard: { supported: true } }, logs: [], network: { running: false, devices: [], addresses: [] } };
+  let snapshot = { instanceId: 'backend-first', revision: 1, identity: { loaded: true, role: null, locked: false, desiredOnline: false, canSwitchRole: true }, capabilities: { model: false, proxy: false }, model: {}, modelApi: { enabled: false, listening: false, port: 3210, baseUrl: 'http://127.0.0.1:3210/v1', error: null }, proxy: {}, logs: [], network: { running: false, devices: [], addresses: [] } };
   let holdDisconnect = false, releaseDisconnect;
   let holdRoute, deferredRequest;
   const original = Object.fromEntries(['document', 'window', 'location', 'history', 'fetch', 'setInterval', 'setTimeout', 'clearTimeout'].map((key) => [key, globalThis[key]]));
@@ -58,7 +58,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
       return new Promise((resolve) => { releaseDisconnect = () => resolve(Response.json(old)); });
     }
     if (route === '/api/identity') {
-      snapshot = { ...snapshot, revision: snapshot.revision + 1, role: body.role, identity: { ...snapshot.identity, role: body.role }, capabilities: { model: false, proxy: false }, pairing: { saved: false }, model: { enabled: false, config: snapshot.model.config } };
+      snapshot = { ...snapshot, revision: snapshot.revision + 1, role: body.role, identity: { ...snapshot.identity, role: body.role }, capabilities: { model: false, proxy: false }, pairing: { saved: false }, model: { enabled: false, config: snapshot.model.config }, modelApi: { ...snapshot.modelApi, enabled: false, listening: false } };
     } else if (route === '/api/network/login') {
       snapshot = { ...snapshot, revision: snapshot.revision + 1, identity: { ...snapshot.identity, locked: true, desiredOnline: true, canSwitchRole: false }, network: { running: true, addresses: ['100.101.102.103'], devices: [{ self: true, role: snapshot.role, name: '本机测试', address: '100.101.102.103', online: true }] } };
     } else if (route === '/api/network/disconnect') {
@@ -69,6 +69,8 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
       snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { enabled: body.enabled, available: body.enabled, config: body.enabled ? body : snapshot.model.config } };
     } else if (route === '/api/models/refresh') {
       snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, models: [...availableModels].reverse() } };
+    } else if (route === '/api/model-api') {
+      snapshot = { ...snapshot, revision: snapshot.revision + 1, modelApi: { ...snapshot.modelApi, enabled: body.enabled, listening: body.enabled } };
     }
     return Response.json(structuredClone(snapshot));
   };
@@ -76,7 +78,6 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     await import(`../public/app.js?console-test=${Date.now()}`); await tick();
     assert.equal(button('api').disabled, true); assert.equal(button('proxy').disabled, true);
     assert.equal(element('network-login').disabled, true);
-    assert.equal(element('settings-guard-disable').disabled, false, 'guard recovery stays usable before pairing');
     await element('tab-host').onclick();
     assert.equal(element('network-login').disabled, false);
     await element('network-login').onclick();
@@ -100,12 +101,20 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     element('client-form').onsubmit({ preventDefault() {} }); await tick(); button('api').onclick();
     assert.equal(element('model-host-panel').hidden, true); assert.equal(element('model-client-panel').hidden, false);
     snapshot = { ...snapshot, revision: snapshot.revision + 1, model: structuredClone(readyModel) }; await intervals[0]();
+    assert.equal(element('model-test-submit').disabled, true, 'B readiness does not start the local model listener');
+    await element('model-test-form').onsubmit({ preventDefault() {} });
+    assert.equal(calls.some((call) => call.route === '/api/model-test'), false, 'disabled local API cannot submit a model test');
+    element('model-api-toggle').onclick(); await tick();
+    assert.deepEqual(calls.find((call) => call.route === '/api/model-api').body, { enabled: true });
+    assert.equal(element('model-api-toggle').attributes['aria-pressed'], 'true');
+    assert.equal(element('model-test-submit').disabled, false);
     assert.deepEqual(element('model-id').children.map((item) => item.value), availableModels.map((item) => item.id), 'the model picker contains B model IDs without fixed aliases');
     assert.equal(element('model-id').value, 'future-sonnet-id');
     element('model-id').value = 'custom-opus-id'; element('model-id').onchange();
     assert.match(element('api-example').textContent, /"model":"custom-opus-id"/, 'the copied example uses the current raw B model ID');
     await element('model-test-form').onsubmit({ preventDefault() {} });
-    assert.equal(calls.find((call) => call.route === '/v1/chat/completions').body.model, 'custom-opus-id', 'test calls use the selected B model');
+    assert.equal(calls.find((call) => call.route === '/api/model-test').body.model, 'custom-opus-id', 'same-origin test calls use the selected B model');
+    assert.equal(calls.some((call) => call.route === '/v1/chat/completions'), false, 'browser model tests stay on the management origin');
     snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, models: [], modelsState: 'loading' } }; await intervals[0]();
     assert.equal(element('model-test-submit').disabled, true);
     snapshot = { ...snapshot, revision: snapshot.revision + 1, model: structuredClone(readyModel) }; await intervals[0]();
@@ -130,7 +139,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     holdDisconnect = true;
     const oldAction = element('network-disconnect').onclick(); await tick();
     assert.equal(typeof releaseDisconnect, 'function');
-    snapshot = { ...snapshot, instanceId: 'backend-restarted', revision: 0, role: 'host', identity: { loaded: true, role: 'host', locked: false, desiredOnline: false, canSwitchRole: true }, capabilities: { model: false, proxy: false }, pairing: { saved: false } };
+    snapshot = { ...snapshot, instanceId: 'backend-restarted', revision: 0, role: 'host', identity: { loaded: true, role: 'host', locked: false, desiredOnline: false, canSwitchRole: true }, capabilities: { model: false, proxy: false }, pairing: { saved: false }, modelApi: { ...snapshot.modelApi, enabled: false, listening: false } };
     await intervals[0]();
     assert.equal(element('sidebar-identity').textContent, 'B · 服务端', 'restart accepts revision 0 without reloading the page');
     assert.equal(button('api').disabled, true);
@@ -154,12 +163,12 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
 
     holdRoute = '/api/tailscale';
     const oldRefresh = element('refresh-network').onclick(); await tick();
-    snapshot = { ...snapshot, instanceId: 'backend-network-restarted', revision: 0, role: 'client', online: true, identity: { ...snapshot.identity, role: 'client' }, network: { ...snapshot.network, message: '新进程网络' } };
+    snapshot = { ...snapshot, instanceId: 'backend-network-restarted', revision: 0, role: 'client', online: true, identity: { ...snapshot.identity, role: 'client' }, network: { ...snapshot.network, message: '新进程网络' }, modelApi: { ...snapshot.modelApi, enabled: true, listening: true } };
     await intervals[0]();
     deferredRequest.resolve(Response.json({ running: false, devices: [], addresses: [], message: '过期网络' })); await oldRefresh;
     assert.equal(element('network-status').textContent, '新进程网络', 'a late manual refresh cannot overwrite the new identity network');
 
-    holdRoute = '/v1/chat/completions';
+    holdRoute = '/api/model-test';
     const oldModelResult = element('model-test-form').onsubmit({ preventDefault() {} }); await tick();
     const firstModelRequest = deferredRequest;
     snapshot = { ...snapshot, instanceId: 'backend-model-restarted', revision: 0 }; await intervals[0]();
@@ -187,6 +196,17 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     assert.equal(disabledRequest.signal.aborted, false, 'disabling only the model keeps its current-session error visible');
     disabledRequest.reject(new Error('B 已停用 Claude 服务')); await disabledModelResult;
     assert.equal(element('model-test-output').textContent, 'B 已停用 Claude 服务');
+    snapshot = { ...snapshot, revision: 5, model: structuredClone(readyModel) }; await intervals[0]();
+    const stoppedModelResult = element('model-test-form').onsubmit({ preventDefault() {} }); await tick();
+    const stoppedRequest = deferredRequest;
+    assert.equal(element('model-api-toggle').disabled, false, 'the local listener remains stoppable during a model test');
+    element('model-api-toggle').onclick(); await tick();
+    assert.equal(stoppedRequest.signal.aborted, true, 'stopping local API retires its active browser test');
+    assert.deepEqual(calls.filter((call) => call.route === '/api/model-api').at(-1).body, { enabled: false });
+    stoppedRequest.resolve(Response.json({ choices: [{ message: { content: '已停止 API 的过期回复' } }] })); await stoppedModelResult;
+    assert.equal(element('model-test-submit').disabled, true);
+    assert.doesNotMatch(element('model-test-output').textContent, /过期回复/);
+    assert.equal(calls.some((call) => call.route === '/api/proxy'), false, 'local model API toggles never mutate proxy state');
     holdRoute = null;
   } finally {
     for (const [key, value] of Object.entries(original)) { if (value === undefined) delete globalThis[key]; else globalThis[key] = value; }

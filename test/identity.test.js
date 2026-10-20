@@ -383,18 +383,14 @@ test('recreating a B pairing never embeds Claude configuration in its credential
   assert.equal(Object.hasOwn(store.record, 'config'), false);
 });
 
-test('model/proxy entry points are gated while protection recovery remains usable before pairing', async (t) => {
+test('model/proxy entry points are gated before identity selection', async (t) => {
   const { bridge } = make(t); await bridge.start();
-  const calls = [];
-  const guard = { async status() { return { supported: true, state: 'unknown', enabled: false }; }, async disable() { calls.push('disable'); return { supported: true, state: 'disabled', enabled: false }; } };
-  const app = createLocalServer({ port: 0, token: 'identity-api-token', bridge, proxyGuard: guard }); t.after(() => app.close());
+  const app = createLocalServer({ port: 0, token: 'identity-api-token', bridge }); t.after(() => app.close());
   const address = await app.listen();
   const post = (route, body) => fetch(`http://127.0.0.1:${address.port}${route}`, { method: 'POST', headers: { Authorization: 'Bearer identity-api-token', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   assert.equal((await post('/api/network/login', {})).status, 409);
   assert.equal((await post('/api/model', { enabled: true, workspace: process.cwd() })).status, 409);
   assert.equal((await post('/api/proxy', { enabled: true })).status, 409);
-  assert.equal((await post('/api/proxy/guard', { enabled: false })).status, 200);
-  assert.deepEqual(calls, ['disable']);
   const selection = await post('/api/identity', { role: 'host' }); assert.equal(selection.status, 200);
   assert.equal((await selection.json()).identity.role, 'host');
 });

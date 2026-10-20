@@ -13,14 +13,15 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 )
 
-// ConfigureBootstrapNetwork is called only inside bridge-net, never inside the
-// application/Claude process. Tailscale binds its sockets to the /0 underlay;
-// the generated Clash profile installs /1 routes, preserving that /0 route.
-// Resolve underlay names in this process, not through Windows Dnscache or TUN.
+// ConfigureBootstrapNetwork runs only in the network helper, before tsnet starts.
+// The reviewed Windows selector binds transport sockets to a non-virtual /0
+// underlay even when another TUN also installs /0 routes. Standard and Tailscale
+// control-plane DNS must both use that underlay, outside Windows Dnscache/TUN.
 func ConfigureBootstrapNetwork() {
 	netns.SetBindToInterfaceByRoute(func(string, ...any) {}, false)
 	var sequence atomic.Uint32
@@ -59,4 +60,8 @@ func ConfigureBootstrapNetwork() {
 		}
 		return dialer.DialContext(ctx, "tcp4", server)
 	}}
+	// Tailscale's singleton owns a separate net.Resolver. Its control HTTP
+	// dialer copies Forward, so changing net.DefaultResolver alone leaves
+	// control names exposed to Windows/TUN fake-IP DNS.
+	dnscache.Get().Forward = net.DefaultResolver
 }

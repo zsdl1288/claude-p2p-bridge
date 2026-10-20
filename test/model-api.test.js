@@ -111,15 +111,27 @@ async function setup(t, { join = true, clients = 1 } = {}) {
     const app = createLocalServer({ port: 0, token, bridge });
     apps.push(app);
     const address = await app.listen();
-    peers.push({ bridge, url: `http://127.0.0.1:${address.port}` });
+    peers.push({ bridge, app, controlUrl: `http://127.0.0.1:${address.port}` });
     if (join) await bridge.join({ invitation: state.invitation });
   }
   if (join) await until(() => host.status().connectedClients === clients && peers.every(({ bridge }) => bridge.status().online));
+  for (const peer of peers) {
+    if (!join) {
+      // A selected locally but not paired yet can listen and report its
+      // unavailable upstream without pretending that B models were found.
+      const status = peer.bridge.status.bind(peer.bridge);
+      peer.bridge.status = () => ({ ...status(), role: 'client' });
+    }
+    const enabled = await request(peer.controlUrl, '/api/model-api', { enabled: true });
+    assert.equal(enabled.status, 200);
+    assert.equal((await enabled.json()).modelApi.listening, true);
+    peer.url = `http://127.0.0.1:${peer.app.modelServer.address().port}`;
+  }
   const calls = async () => {
     try { return (await readFile(path.join(workspace, 'calls.ndjson'), 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)); }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   };
-  return { host, peers, client: peers[0].bridge, url: peers[0].url, harnessDirectory, calls, catalog };
+  return { host, peers, client: peers[0].bridge, url: peers[0].url, controlUrl: peers[0].controlUrl, harnessDirectory, calls, catalog };
 }
 
 function request(url, route, body, headers = {}) {
@@ -436,6 +448,7 @@ test('a dropped model connection fails once and accepts a fresh request after re
 test('an admission failure after an immediate error callback is handled once and cancels its request', { timeout: 10000 }, async (t) => {
   let aborted = false;
   const bridge = {
+    status() { return { role: 'client', online: true }; },
     async getModels() { return structuredClone(fixtureModels); },
     run(_request, emit, signal) {
       signal.addEventListener('abort', () => { aborted = true; }, { once: true });
@@ -447,7 +460,9 @@ test('an admission failure after an immediate error callback is handled once and
   const app = createLocalServer({ port: 0, token, bridge });
   t.after(() => app.close());
   const address = await app.listen();
-  const response = await request(`http://127.0.0.1:${address.port}`, '/v1/chat/completions', completion());
+  const enabled = await request(`http://127.0.0.1:${address.port}`, '/api/model-api', { enabled: true });
+  assert.equal(enabled.status, 200);
+  const response = await request(`http://127.0.0.1:${app.modelServer.address().port}`, '/v1/chat/completions', completion());
   assert.equal(response.status, 502);
   assert.match((await response.json()).error.message, /Admission threw/);
   assert.equal(aborted, true);

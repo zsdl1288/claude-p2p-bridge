@@ -45,6 +45,6 @@ download("https://raw.githubusercontent.com/nlohmann/json/v3.12.0/single_include
 download("https://raw.githubusercontent.com/nlohmann/json/v3.12.0/LICENSE.MIT", vendor / "json-LICENSE.MIT",
          "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603")
 
-env = go_environment(offline=False)
+env = go_environment(offline=False, underlay_policy=False)
 subprocess.run([str(TOOLS / "go/bin/go.exe"), "mod", "download"], cwd=ROOT / "native", env=env, check=True)
 print("Portable C++ and Go build tools ready. No system settings changed.", flush=True)

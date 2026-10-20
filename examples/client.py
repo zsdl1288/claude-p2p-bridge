@@ -33,7 +33,7 @@ def read_events(response):
     raise ConnectionError("Bridge stream ended before the done event")
 
 
-def run_bridge(prompt, *, base_url="http://127.0.0.1:3210", token, session_id=None):
+def run_bridge(prompt, *, base_url="http://127.0.0.1:3211", token, session_id=None):
     payload = {"prompt": prompt, "stream": True}
     if session_id:
         payload["sessionId"] = session_id
@@ -50,7 +50,7 @@ def run_bridge(prompt, *, base_url="http://127.0.0.1:3210", token, session_id=No
 def main():
     parser = argparse.ArgumentParser(description="Call Claude Code on your paired B computer")
     parser.add_argument("prompt")
-    parser.add_argument("--url", default="http://127.0.0.1:3210")
+    parser.add_argument("--url", default="http://127.0.0.1:3211")
     parser.add_argument("--session")
     args = parser.parse_args()
     token = os.environ.get("P2P_BRIDGE_TOKEN")

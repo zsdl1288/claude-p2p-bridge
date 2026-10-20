@@ -1,7 +1,6 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { digest, encodeInvitation, parseInvitation } from './crypto.js';
-import { NetworkGuard, networkGuardDiagnostics } from './network-guard.js';
 import { atomicWrite } from './storage.js';
 
 const NODE = 'B 网络出口';
@@ -9,7 +8,6 @@ const NODE = 'B 网络出口';
 // hosts. Shared registries, CDNs and source hosts remain outside this list.
 const claudeDomains = ['claude.ai', 'claude.com', 'claude.app', 'anthropic.com', 'claudeusercontent.com', 'claudemcpcontent.com'];
 const claudeTelemetry = ['http-intake.logs.us5.datadoghq.com', 'browser-intake-us5-datadoghq.com'];
-const safeGuard = { supported: false, active: false, message: '系统保护仅支持 Windows 内置组网模式；未启用时不能保证 Clash 退出后继续阻断。' };
 
 // JSON is a YAML 1.2 subset accepted by Mihomo. No executable scripts or
 // third-party subscription converters are involved in generating a profile.
@@ -61,15 +59,13 @@ export function clashProfile({ port, username, password, helperName = 'bridge-ne
 }
 
 export class ClashProxy {
-  constructor({ bridge, token, directory = null, guard = null }) {
+  constructor({ bridge, token, directory = null }) {
     this.bridge = bridge; this.proxy = bridge.networkProxy; this.directory = directory;
     this.file = directory ? path.join(directory, bridge.demo ? 'proxy-demo.json' : 'proxy.json') : null;
     this.subscriptionToken = digest(`clash-subscription-v1:${token}`);
     this.proxy.username = digest(`clash-user-v1:${token}`).slice(0, 24);
     this.proxy.password = digest(`clash-password-v1:${token}`);
     this.settings = { v: 1, enabled: false, sharing: false, port: 0, pairing: null };
-    this.guard = guard || (directory && !bridge.demo && bridge.networkAdapter ? new NetworkGuard({ directory, command: bridge.networkAdapter.command }) : null);
-    this.guardState = { ...safeGuard }; this.guardRevision = 0;
     this.operations = Promise.resolve(); this.error = '';
     this.onState = () => this.synchronize();
     bridge.proxyController = this;
@@ -107,8 +103,6 @@ export class ClashProxy {
       catch (error) { this.error = `本地代理监听失败：${error.message}，不会改用其他端口`; }
     }
     this.synchronize();
-    // Read-only: never install or remove protection while starting/restoring.
-    await this.refreshGuard();
   }
   synchronize() {
     if (this.closed) return;
@@ -136,7 +130,7 @@ export class ClashProxy {
       connectionLimit: state.connectionLimit, sessionConnectionLimit: state.sessionConnectionLimit, lastError: state.lastError || null,
       subscriptionUrl: subscription ? `${subscription}/config.yaml` : '',
       claudeSubscriptionUrl: subscription ? `${subscription}/claude.yaml` : '',
-      clients: state.clients || [], devices: this.devices(state.clients || []), guard: this.guardState };
+      clients: state.clients || [], devices: this.devices(state.clients || []) };
   }
   devices(clients) {
     const network = this.bridge.networkStatus?.();
@@ -189,78 +183,13 @@ export class ClashProxy {
       helperName: path.basename(this.bridge.networkAdapter?.command || 'bridge-net.exe'), system: !this.bridge.demo && !this.bridge.networkAdapter, scope });
     return JSON.stringify(nodesOnly ? { proxies: config.proxies } : config, null, 2) + '\n';
   }
-  refreshGuard() {
-    if (!this.guard || this.closed || this.guardChanging) return Promise.resolve(this.guardState);
-    if (!this.guardRead) {
-      const revision = this.guardRevision;
-      const reading = (async () => {
-        try {
-          const value = await this.guard.status();
-          if (!this.closed && revision === this.guardRevision) this.applyGuardState(value);
-        } catch (error) {
-          if (!this.closed && revision === this.guardRevision) this.guardState = { supported: process.platform === 'win32', state: 'unknown', active: false, message: `系统保护状态无法确认：${error.message}` };
-        }
-        return this.guardState;
-      })().finally(() => { if (this.guardRead === reading) this.guardRead = null; });
-      this.guardRead = reading;
-    }
-    return this.guardRead;
-  }
-  applyGuardState(value) {
-    const tun = typeof value.tunName === 'string' && value.tunName ? `（${value.tunName}）` : '';
-    const diagnostic = ['partial', 'unknown'].includes(value.state) ? networkGuardDiagnostics(value) : '';
-    this.guardState = { ...value, active: value.enabled === true,
-      message: (value.state === 'unknown' ? '当前权限无法核实系统保护；请点“检查系统保护（UAC）”，或明确关闭保护恢复直连。'
-        : value.enabled ? value.tunReady === false ? '系统保护仍在阻断；请开启 Clash TUN（ClaudeBridgeTun / Mihomo），再点“启用 / 刷新系统保护”更新接口。' : `系统保护已验证启用${tun}；退出 Clash 或桥接后仍阻断，需在此明确关闭。`
-        : value.state === 'partial' ? '保护规则未通过校验，请重新启用或明确关闭；当前不能保证完整阻断。'
-        : '系统保护未启用；请先在 Clash 开启完整配置的 TUN，再在此启用保护。') + (diagnostic ? ` ${diagnostic}。` : '') };
-  }
-  async changeGuard(operation) {
-    // Polls already in flight describe the state before this authorized action.
-    // Discard them, and keep later polls from replacing its verified result.
-    ++this.guardRevision; this.guardRead = null; this.guardChanging = true;
-    try {
-      const value = await operation();
-      this.applyGuardState(value || await this.guard.status());
-    } catch (error) {
-      // A committed operation can return verified partial rules. Keep that
-      // result instead of replacing it with an unprivileged read's unknown.
-      if (error.guardStatus) this.applyGuardState(error.guardStatus);
-      else {
-        try { this.applyGuardState(await this.guard.status()); }
-        catch (statusError) { this.guardState = { supported: process.platform === 'win32', state: 'unknown', active: false, message: `系统保护状态无法确认：${statusError.message}` }; }
-      }
-      throw error;
-    } finally { ++this.guardRevision; this.guardChanging = false; }
-  }
-  verifyGuard(input) {
-    return this.enqueue(async () => {
-      if (Object.keys(input).length) throw new Error('检查保护状态不接受额外参数');
-      if (!this.guard?.verify) throw new Error(safeGuard.message);
-      await this.changeGuard(() => this.guard.verify());
-      return this.status();
-    });
-  }
-  setGuard(input) {
-    return this.enqueue(async () => {
-      if (Object.keys(input).length !== 1 || typeof input.enabled !== 'boolean') throw new Error('需要 enabled 布尔开关');
-      if (!this.guard) throw new Error(safeGuard.message);
-      if (input.enabled) this.bridge.requireBusiness?.('proxy');
-      if (input.enabled && (this.role() !== 'client' || !this.proxy.enabled)) throw new Error('请先在 A 启用本地 Clash 节点');
-      await this.changeGuard(() => input.enabled ? this.guard.enable() : this.guard.disable());
-      if (input.enabled !== this.guardState.active) throw new Error(this.guardState.message);
-      return this.status();
-    });
-  }
   close() {
     if (!this.closing) this.closing = this.stop();
     return this.closing;
   }
   async stop() {
     this.closed = true; this.bridge.off('state', this.onState);
-    this.guard?.cancelStatus?.();
     try { await this.starting; await this.operations; }
-    // Persistent WFP protection intentionally survives all process exits.
     finally { await this.proxy.close(); }
   }
 }

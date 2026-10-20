@@ -13,11 +13,17 @@ if not re.fullmatch(r'\d+\.\d+\.\d+', VERSION):
     raise ValueError('Release version must contain three numeric components')
 
 
-def go_environment(*, offline=True):
+def go_environment(*, offline=True, underlay_policy=True):
     env = os.environ.copy()
     env.update(GOPATH=str(ROOT / '.cache/go'), GOMODCACHE=str(ROOT / '.cache/gomod'),
                GOCACHE=str(ROOT / '.cache/gobuild'), CGO_ENABLED='0',
                GOPROXY='off' if offline else 'https://proxy.golang.org,direct')
+    if underlay_policy and env.get('GOOS', 'windows' if os.name == 'nt' else '') == 'windows':
+        try:
+            from .windows_underlay import prepare_windows_underlay
+        except ImportError:
+            from windows_underlay import prepare_windows_underlay
+        env = prepare_windows_underlay(ROOT, env)
     return env
 
 

@@ -19,14 +19,14 @@ const appA = createLocalServer({ port: portA, token: await getApiToken(path.reso
 const appB = createLocalServer({ port: portB, token: await getApiToken(path.resolve('.bridge/demo-b')), bridge: host, onShutdown: shutdown });
 const cleanup = async () => { await Promise.allSettled([appA.close(), appB.close()]); };
 try {
-  await appB.listen();
-  await appA.listen();
+  const addressB = await appB.listen();
+  const addressA = await appA.listen();
   await host.selectIdentity({ role: 'host' }); await host.loginNetwork();
   await client.selectIdentity({ role: 'client' }); await client.loginNetwork();
   const status = await host.host({ tailscaleIp: '127.0.0.1', bridgePort: 0 });
   await host.configureModel({ enabled: true, workspace: process.cwd(), profile: 'read' });
   await client.join({ invitation: status.invitation });
-  console.log(`\nTailscale 组网版演示已启动：通过本机模拟两端，不调用真实 Claude。\nA / 本地 API：http://127.0.0.1:${portA}\nB / 控制台：http://127.0.0.1:${portB}\n两端已自动配对，无需公网中转。此演示不代表已接通真实 Tailscale 网络。\nAPI Token：.bridge/demo-a/api-token\nCtrl+C 停止全部服务。\n`);
+  console.log(`\nTailscale 组网版演示已启动：通过本机模拟两端，不调用真实 Claude。\nA / 控制台：http://127.0.0.1:${addressA.port}\nB / 控制台：http://127.0.0.1:${addressB.port}\nA / 模型 API：http://127.0.0.1:${portA}/v1（默认关闭，请在 A 控制台点击开启）\n两端已自动配对，无需公网中转。此演示不代表已接通真实 Tailscale 网络。\nAPI Token：.bridge/demo-a/api-token\nCtrl+C 停止全部服务。\n`);
 } catch (error) { console.error(error.message); await cleanup(); process.exit(1); }
 async function shutdown() { if (stopping) return; stopping = true; await cleanup(); process.exit(0); }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, shutdown);

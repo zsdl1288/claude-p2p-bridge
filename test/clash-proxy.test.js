@@ -8,7 +8,6 @@ import { once } from 'node:events';
 import { Bridge } from '../src/bridge.js';
 import { createLocalServer } from '../src/server.js';
 import { clashProfile } from '../src/clash-proxy.js';
-import { NetworkGuard } from '../src/network-guard.js';
 
 const token = 'clash-proxy-test-token';
 const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -16,14 +15,6 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check) {
   const deadline = Date.now() + 5000;
   while (!check()) { if (Date.now() > deadline) throw new Error('Clash integration condition timed out'); await delay(10); }
-}
-function guardMock(enabled = false) {
-  const calls = [];
-  return { calls,
-    async status() { calls.push('status'); return { supported: true, state: enabled ? 'enabled' : 'disabled', enabled, filterCount: enabled ? 4 : 0, expectedFilters: 4 }; },
-    async enable() { calls.push('enable'); enabled = true; },
-    async disable() { calls.push('disable'); enabled = false; }
-  };
 }
 async function localApp(t, bridge, options = {}) {
   const app = createLocalServer({ port: 0, token, bridge, ...options });
@@ -147,6 +138,17 @@ test('Claude subscription uses the existing local authorization and remains avai
   assert.deepEqual((await retained.json()).rules, config.rules);
 });
 
+test('proxy status has no system protection state and removed protection APIs are unavailable', async (t) => {
+  const { app, request } = await localApp(t, new Bridge({ demo: true }));
+  assert.equal(Object.hasOwn(app.proxy.status(), 'guard'), false);
+  const proxy = await (await request('/api/proxy')).json();
+  assert.equal(Object.hasOwn(proxy, 'guard'), false);
+  const status = await (await request('/api/status')).json();
+  assert.equal(Object.hasOwn(status.proxy, 'guard'), false);
+  assert.equal((await request('/api/proxy/guard', { enabled: true })).status, 404);
+  assert.equal((await request('/api/proxy/guard/verify', {})).status, 404);
+});
+
 test('B sharing control broadcasts truthfully to A and model access remains independent', { timeout: 15000 }, async (t) => {
   const fixture = await paired(t), { a, b, client } = fixture;
   assert.equal((await a.request('/api/proxy', { enabled: true })).status, 200);
@@ -257,45 +259,6 @@ test('proxy settings restore stable port and credentials only for the explicitly
   assert.equal((await other.request('/api/proxy')).status, 200);
 });
 
-test('network protection startup, settings recovery, status reads and close never mutate system rules', { timeout: 15000 }, async (t) => {
-  const directory = await temporaryDirectory(t), guard = guardMock(true);
-  const fixture = await paired(t, { directory, proxyGuard: guard }), { a } = fixture;
-  assert.deepEqual(guard.calls, ['status']); await enable(fixture);
-  let status = await (await a.request('/api/proxy')).json(); assert.equal(status.guard.active, true);
-  assert.equal(guard.calls.some((call) => call !== 'status'), false);
-  await a.app.close(); assert.equal(guard.calls.some((call) => call !== 'status'), false);
-  const restored = await localApp(t, new Bridge({ demo: true }), { directory, proxyGuard: guard });
-  status = await (await restored.request('/api/proxy')).json(); assert.equal(status.guard.active, true);
-  assert.equal(guard.calls.some((call) => call !== 'status'), false);
-});
-
-test('an unavailable protected TUN stays active and requests an explicit refresh without changing rules', async (t) => {
-  const calls = [];
-  const guard = {
-    async status() { calls.push('status'); return { supported: true, state: 'enabled', enabled: true, tunName: 'Mihomo', tunReady: false }; },
-    async enable() { calls.push('enable'); },
-    async disable() { calls.push('disable'); }
-  };
-  const { app, request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const status = await (await request('/api/proxy')).json();
-  assert.equal(status.guard.active, true); assert.equal(status.guard.tunReady, false);
-  assert.match(status.guard.message, /仍在阻断/); assert.match(status.guard.message, /Mihomo/);
-  assert.match(status.guard.message, /启用 \/ 刷新系统保护/);
-  await app.proxy.refreshGuard(); await app.close();
-  assert.equal(calls.every((call) => call === 'status'), true);
-});
-
-test('a ready Mihomo TUN reports its actual name without requiring ClaudeBridgeTun', async (t) => {
-  const guard = {
-    async status() { return { supported: true, state: 'enabled', enabled: true, verified: true, tunName: 'Mihomo', tunReady: true }; }
-  };
-  const { request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const status = await (await request('/api/proxy')).json();
-  assert.equal(status.guard.active, true); assert.equal(status.guard.tunReady, true);
-  assert.match(status.guard.message, /系统保护已验证启用（Mihomo）/);
-  assert.doesNotMatch(status.guard.message, /ClaudeBridgeTun|请开启|请启动/);
-});
-
 test('a restored occupied SOCKS port blocks visibly and never silently chooses another port', { timeout: 15000 }, async (t) => {
   const directory = await temporaryDirectory(t), fixture = await paired(t, { directory });
   await enable(fixture); const originalPort = fixture.a.app.proxy.status().port; await fixture.a.app.close();
@@ -313,161 +276,6 @@ test('a restored occupied SOCKS port blocks visibly and never silently chooses a
   assert.equal((await retry.json()).port, originalPort);
 });
 
-test('system protection mutations require explicit authenticated requests', { timeout: 15000 }, async (t) => {
-  const guard = guardMock(), fixture = await paired(t, { proxyGuard: guard }), { a } = fixture;
-  assert.equal((await a.request('/api/proxy/guard', { enabled: true })).status, 400);
-  await enable(fixture);
-  assert.equal((await fetch(`${a.base}/api/proxy/guard`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"enabled":true}' })).status, 401);
-  assert.equal(guard.calls.includes('enable'), false);
-  const enabled = await a.request('/api/proxy/guard', { enabled: true }); assert.equal(enabled.status, 200); assert.equal((await enabled.json()).guard.active, true);
-  const disabled = await a.request('/api/proxy/guard', { enabled: false }); assert.equal(disabled.status, 200); assert.equal((await disabled.json()).guard.active, false);
-  assert.equal(guard.calls.filter((call) => call === 'enable').length, 1); assert.equal(guard.calls.filter((call) => call === 'disable').length, 1);
-});
-
-test('explicit protection verification accepts no extra input and needs authentication but no pairing', { timeout: 15000 }, async (t) => {
-  const calls = [];
-  const guard = {
-    async status() { calls.push('status'); return { supported: true, enabled: false, state: 'unknown' }; },
-    async verify() { calls.push('verify'); return { supported: true, enabled: true, state: 'enabled', verified: true, tunReady: true, filterCount: 4, expectedFilters: 4 }; }
-  };
-  const fixture = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  assert.equal(fixture.app.proxy.status().guard.state, 'unknown');
-  assert.equal(fixture.app.proxy.status().guard.active, false);
-  assert.equal((await fetch(`${fixture.base}/api/proxy/guard/verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
-  assert.equal((await fixture.request('/api/proxy/guard/verify', { enabled: true })).status, 400);
-  assert.equal(calls.includes('verify'), false);
-  const checksBefore = calls.filter((call) => call === 'status').length;
-  const response = await fixture.request('/api/proxy/guard/verify', {}); assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.equal(result.guard.state, 'enabled'); assert.equal(result.guard.verified, true); assert.equal(result.guard.active, true);
-  assert.equal(calls.filter((call) => call === 'verify').length, 1);
-  assert.equal(calls.filter((call) => call === 'status').length, checksBefore);
-});
-
-test('explicit enable preserves verified native result even when ordinary status is unknown', { timeout: 15000 }, async (t) => {
-  const calls = [];
-  const guard = {
-    async status() { calls.push('status'); return { supported: true, enabled: false, state: 'unknown' }; },
-    async enable() { calls.push('enable'); return { supported: true, enabled: true, state: 'enabled', verified: true, tunReady: true, filterCount: 4, expectedFilters: 4 }; }
-  };
-  const fixture = await paired(t, { proxyGuard: guard }); await enable(fixture);
-  const before = calls.filter((call) => call === 'status').length;
-  const response = await fixture.a.request('/api/proxy/guard', { enabled: true }); assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.equal(result.guard.state, 'enabled'); assert.equal(result.guard.active, true); assert.equal(result.guard.verified, true);
-  assert.equal(calls.filter((call) => call === 'enable').length, 1);
-  assert.equal(calls.filter((call) => call === 'status').length, before);
-});
-
-test('partial enable keeps administrator diagnostics and ignores an older unknown poll', { timeout: 15000 }, async (t) => {
-  const stale = Promise.withResolvers();
-  const unknown = { supported: true, profileId: 'profile-a', state: 'unknown', enabled: false };
-  const partial = { supported: true, profileId: 'profile-a', state: 'partial', enabled: false,
-    filterCount: 46, expectedFilters: 46, issues: ['changed filter: out-v4-dns', 'verified 42 of 46 required filters'] };
-  let reads = 0;
-  const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async (_command, args) => {
-    if (args[1] === 'status') return ++reads === 2 ? stale.promise : { stdout: JSON.stringify(unknown) };
-    assert.equal(args[1], 'elevate-enable');
-    return { stdout: JSON.stringify(partial) };
-  } });
-  const fixture = await paired(t, { proxyGuard: guard }); await enable(fixture);
-  const poll = fixture.a.app.proxy.refreshGuard();
-  assert.equal(reads, 2);
-  const response = await fixture.a.request('/api/proxy/guard', { enabled: true });
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /verified 42 of 46 required filters/);
-  assert.equal(reads, 2);
-  const result = fixture.a.app.proxy.status().guard;
-  assert.equal(result.state, 'partial'); assert.equal(result.active, false);
-  assert.equal(result.filterCount, 46); assert.equal(result.expectedFilters, 46);
-  assert.deepEqual(result.issues, partial.issues);
-  assert.match(result.message, /不能保证完整阻断/);
-  assert.match(result.message, /verified 42 of 46 required filters/);
-  stale.resolve({ stdout: JSON.stringify(unknown) }); await poll;
-  assert.equal(fixture.a.app.proxy.status().guard.state, 'partial');
-  // A genuinely later failed read is still unknown, never a verified removal.
-  await fixture.a.app.proxy.refreshGuard();
-  assert.equal(fixture.a.app.proxy.status().guard.state, 'unknown');
-  assert.equal(fixture.a.app.proxy.status().guard.active, false);
-});
-
-test('partial disable keeps remaining rules visible without claiming restored access', async (t) => {
-  const calls = [];
-  const partial = { supported: true, profileId: 'profile-a', state: 'partial', enabled: false,
-    filterCount: 1, expectedFilters: 46, issues: ['verified 1 of 46 required filters'] };
-  const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async (_command, args) => {
-    calls.push(args[1]);
-    return { stdout: JSON.stringify(args[1] === 'status'
-      ? { supported: true, profileId: 'profile-a', state: 'unknown', enabled: false } : partial) };
-  } });
-  const { app, request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const response = await request('/api/proxy/guard', { enabled: false });
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /规则仍存在，尚未恢复直连/);
-  assert.equal(app.proxy.status().guard.state, 'partial');
-  assert.equal(app.proxy.status().guard.active, false);
-  assert.equal(app.proxy.status().guard.filterCount, 1);
-  assert.deepEqual(calls, ['status', 'elevate-disable']);
-});
-
-test('explicit protection verification reports partial rules without enabling protection', async (t) => {
-  const guard = {
-    async status() { return { supported: true, enabled: false, state: 'unknown' }; },
-    async verify() { return { supported: true, enabled: false, state: 'partial', filterCount: 46, expectedFilters: 46,
-      issues: ['verified 42 of 46 required filters'] }; }
-  };
-  const { request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const response = await request('/api/proxy/guard/verify', {});
-  assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.equal(result.guard.state, 'partial'); assert.equal(result.guard.active, false);
-  assert.match(result.guard.message, /verified 42 of 46 required filters/);
-});
-
-test('explicit protection disable remains available without any saved or active pairing', { timeout: 15000 }, async (t) => {
-  const calls = [];
-  const guard = {
-    async status() { calls.push('status'); return { supported: true, enabled: false, state: 'unknown' }; },
-    async disable() { calls.push('disable'); return { supported: true, enabled: false, state: 'disabled', verified: true, filterCount: 0, expectedFilters: 4 }; }
-  };
-  const bridge = new Bridge({ demo: true }), fixture = await localApp(t, bridge, { proxyGuard: guard });
-  assert.equal(bridge.peer, undefined);
-  const response = await fixture.request('/api/proxy/guard', { enabled: false }); assert.equal(response.status, 200);
-  const result = await response.json(); assert.equal(result.guard.active, false); assert.equal(result.guard.state, 'disabled'); assert.equal(result.guard.verified, true);
-  assert.deepEqual(calls, ['status', 'disable']);
-});
-
-test('concurrent guard polls share a read and cannot overwrite a newer authorized result', async (t) => {
-  const stale = Promise.withResolvers();
-  let reads = 0;
-  const disabled = { supported: true, enabled: false, state: 'disabled' };
-  const verified = { supported: true, enabled: true, state: 'enabled', verified: true };
-  const guard = { status() { return ++reads === 1 ? Promise.resolve(disabled) : stale.promise; }, async verify() { return verified; } };
-  const { app } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const polls = Array.from({ length: 8 }, () => app.proxy.refreshGuard());
-  assert.equal(reads, 2);
-  await app.proxy.verifyGuard({});
-  stale.resolve({ supported: true, enabled: false, state: 'unknown' });
-  await Promise.all(polls);
-  assert.equal(app.proxy.status().guard.active, true);
-  assert.equal(app.proxy.status().guard.verified, true);
-});
-
-test('polls during an authorized guard operation do not start competing status helpers', async (t) => {
-  const verifying = Promise.withResolvers();
-  let reads = 0, started = false;
-  const guard = {
-    async status() { reads++; return { supported: true, enabled: false, state: 'unknown' }; },
-    verify() { started = true; return verifying.promise; }
-  };
-  const { app } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
-  const operation = app.proxy.verifyGuard({}); await until(() => started);
-  await Promise.all(Array.from({ length: 8 }, () => app.proxy.refreshGuard()));
-  assert.equal(reads, 1);
-  verifying.resolve({ supported: true, enabled: true, state: 'enabled', verified: true });
-  assert.equal((await operation).guard.active, true);
-});
-
 test('an enabled saved node with no stable port is rejected without opening a random listener', async (t) => {
   const directory = await temporaryDirectory(t);
   await writeFile(path.join(directory, 'proxy-demo.json'), JSON.stringify({ v: 1, enabled: true, sharing: false, port: 0, pairing: 'a'.repeat(43) }));
@@ -480,31 +288,18 @@ test('an enabled saved node with no stable port is rejected without opening a ra
 test('local APIs wait for proxy restoration before accepting state changes', async (t) => {
   const loading = Promise.withResolvers(); let mutations = 0;
   const bridge = new Bridge({ demo: true }); bridge.host = async () => { mutations++; return {}; };
-  const app = createLocalServer({ port: 0, token, bridge, proxyGuard: { status: () => loading.promise } });
-  t.after(async () => { loading.resolve({ enabled: false, state: 'disabled' }); await app.close(); });
+  const app = createLocalServer({ port: 0, token, bridge });
+  const restore = app.proxy.restore.bind(app.proxy);
+  app.proxy.restore = async (address) => { await loading.promise; return restore(address); };
+  t.after(async () => { loading.resolve(); await app.close(); });
   const listening = app.listen(); await once(app.server, 'listening');
   const base = `http://127.0.0.1:${app.server.address().port}`;
   assert.equal((await fetch(`${base}/health`)).status, 503);
   const change = fetch(`${base}/api/host`, { method: 'POST', headers, body: '{}' });
   await delay(30); assert.equal(mutations, 0);
-  loading.resolve({ enabled: false, state: 'disabled' }); await listening;
+  loading.resolve(); await listening;
   assert.equal((await change).status, 200); assert.equal(mutations, 1);
   assert.equal((await fetch(`${base}/health`)).status, 200);
-});
-
-test('authenticated early shutdown cancels only guard reads and leaves no listener behind', async (t) => {
-  const loading = Promise.withResolvers(); let cancelled = 0, stopped;
-  const guard = { status: () => loading.promise, cancelStatus() { cancelled++; loading.resolve({ enabled: false, state: 'disabled' }); } };
-  const app = createLocalServer({ port: 0, token, bridge: new Bridge({ demo: true }), proxyGuard: guard, onShutdown: () => { stopped = app.close(); } });
-  t.after(() => app.close());
-  const listening = app.listen().then(() => null, (error) => error);
-  await once(app.server, 'listening');
-  const base = `http://127.0.0.1:${app.server.address().port}`;
-  assert.equal((await fetch(`${base}/api/shutdown`, { method: 'POST', headers, body: '{}' })).status, 200);
-  await until(() => Boolean(stopped)); await stopped;
-  assert.match((await listening).message, /退出/);
-  assert.equal(cancelled, 1); assert.equal(app.server.listening, false);
-  assert.equal(Boolean(app.proxy.proxy.server?.listening), false);
 });
 
 test('closing waits for a pending node start and then releases the newly opened port', async (t) => {

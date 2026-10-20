@@ -8,9 +8,10 @@ import { createLocalServer, getApiToken } from '../src/server.js';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const id = '00000000-0000-4000-8000-000000000001';
 const headers = { Authorization: 'Bearer server-fixture-token', 'Content-Type': 'application/json' };
-async function fixture(t, overrides = {}) {
+async function fixture(t, overrides = {}, { modelApi = false } = {}) {
   const dispatched = [];
   const bridge = {
+    status() { return { role: 'client', online: true }; },
     async getModels() { return [{ id: 'claude-code', name: 'Fixture account model' }]; },
     run(request, emit) {
       dispatched.push(request);
@@ -22,7 +23,14 @@ async function fixture(t, overrides = {}) {
   const app = createLocalServer({ port: 0, token: 'server-fixture-token', bridge });
   t.after(() => app.close().catch(() => {}));
   const address = await app.listen();
-  return { app, url: `http://127.0.0.1:${address.port}`, dispatched };
+  const url = `http://127.0.0.1:${address.port}`;
+  let modelUrl;
+  if (modelApi) {
+    const enabled = await fetch(`${url}/api/model-api`, { method: 'POST', headers, body: '{"enabled":true}' });
+    assert.equal(enabled.status, 200);
+    modelUrl = `http://127.0.0.1:${app.modelServer.address().port}`;
+  }
+  return { app, url, modelUrl, dispatched };
 }
 
 test('the browser entry point and its role-state module are served together', async (t) => {
@@ -67,21 +75,21 @@ test('task completion without a result is reported as failure', async (t) => {
 });
 
 test('a missing cancellation acknowledgement is a cancelled model request, not a provider failure', async (t) => {
-  const { url } = await fixture(t, { run(_request, emit) {
+  const { modelUrl } = await fixture(t, { run(_request, emit) {
     emit({ type: 'error', code: 'CANCEL_TIMEOUT', message: 'synthetic cancellation confirmation timeout' });
     emit({ type: 'done', exitCode: null, cancelled: true });
     return id;
-  } });
-  const response = await fetch(`${url}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'cancel test' }] }) });
+  } }, { modelApi: true });
+  const response = await fetch(`${modelUrl}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'cancel test' }] }) });
   assert.equal(response.status, 499);
   assert.equal((await response.json()).error.code, 'CANCEL_TIMEOUT');
 });
 
 test('invalid JSON, UTF-8 and non-object bodies fail before dispatch with the correct error shape', async (t) => {
-  const { url, dispatched } = await fixture(t);
-  for (const route of ['/v1/run', '/v1/chat/completions']) {
+  const { url, modelUrl, dispatched } = await fixture(t, {}, { modelApi: true });
+  for (const [base, route] of [[url, '/v1/run'], [modelUrl, '/v1/chat/completions']]) {
     for (const body of ['null', '[]', 'false', '42', '"text"', '{broken', Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d])]) {
-      const response = await fetch(`${url}${route}`, { method: 'POST', headers, body });
+      const response = await fetch(`${base}${route}`, { method: 'POST', headers, body });
       assert.equal(response.status, 400);
       const error = (await response.json()).error;
       assert.equal(typeof (route.endsWith('completions') ? error.message : error), 'string');
@@ -89,10 +97,10 @@ test('invalid JSON, UTF-8 and non-object bodies fail before dispatch with the co
   }
   assert.equal(dispatched.length, 0);
   for (const route of ['/v1/models', '/v1/chat/completions', '/v1/responses', '/v1/messages']) {
-    const unauthorized = await fetch(`${url}${route}`);
+    const unauthorized = await fetch(`${modelUrl}${route}`);
     assert.equal(unauthorized.status, 401);
     assert.equal((await unauthorized.json()).error.type, 'authentication_error');
-    const crossOrigin = await fetch(`${url}${route}`, { headers: { ...headers, Origin: 'https://example.invalid' } });
+    const crossOrigin = await fetch(`${modelUrl}${route}`, { headers: { ...headers, Origin: 'https://example.invalid' } });
     assert.equal(crossOrigin.status, 403);
     assert.equal(typeof (await crossOrigin.json()).error.message, 'string');
   }

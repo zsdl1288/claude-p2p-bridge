@@ -28,7 +28,7 @@ class ClientTests(unittest.TestCase):
         with patch.object(client.urllib.request, "urlopen", return_value=io.BytesIO(b'data: {"type":"done","exitCode":0}\n\n')) as opener:
             self.assertEqual(list(client.run_bridge("中文", token="local-test", session_id="own-session"))[0]["exitCode"], 0)
         request = opener.call_args.args[0]
-        self.assertEqual(request.full_url, "http://127.0.0.1:3210/v1/run")
+        self.assertEqual(request.full_url, "http://127.0.0.1:3211/v1/run")
         self.assertEqual(request.get_header("Authorization"), "Bearer local-test")
         self.assertEqual(json.loads(request.data)["sessionId"], "own-session")
         self.assertEqual(json.loads(request.data)["prompt"], "中文")

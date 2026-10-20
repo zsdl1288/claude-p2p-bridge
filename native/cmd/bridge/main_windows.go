@@ -158,9 +158,6 @@ func showError(message string) {
 }
 
 func main() {
-	if handled, exit := netcore.RunNetworkGuardCLI(os.Args[1:], os.Stdout); handled {
-		os.Exit(exit)
-	}
 	exitCode := 1
 	// Register this first so process and log handles are closed before a
 	// nonzero exit is returned to the native owner.
@@ -197,7 +194,11 @@ func main() {
 		showError("本机 API 端口必须为 1–65535")
 		return
 	}
-	url := fmt.Sprintf("http://127.0.0.1:%d", *port)
+	managementPort := *port + 1
+	if *port == 65535 {
+		managementPort = 65534
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d", managementPort)
 	if !*owned && clientRunning(url) {
 		if !*noBrowser {
 			openBrowser(url)

@@ -62,13 +62,10 @@ test('device labels only describe explicit role and self markers', () => {
   assert.equal(deviceConnection({ online: false, path: 'direct' }), '离线');
 });
 
-test('device page excludes Claude inputs and system recovery is outside gated business pages', async () => {
+test('device page excludes Claude inputs and business navigation starts gated', async () => {
   const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
   const devicePage = html.slice(html.indexOf('<section id="connection"'), html.indexOf('<section id="api"'));
   assert.doesNotMatch(devicePage, /id="(?:workspace|claude-command|profile|probe)"/);
-  const settingsPage = html.slice(html.indexOf('<section id="settings"'));
-  assert.match(settingsPage, /id="settings-guard-verify"/);
-  assert.match(settingsPage, /id="settings-guard-disable"/);
   assert.match(html, /data-page="api"[^>]+disabled/);
   assert.match(html, /data-page="proxy"[^>]+disabled/);
 });

@@ -1,10 +1,9 @@
 """Smoke-test the packaged Clash engine using isolated local demo instances.
 
-No public target, TUN, system proxy, route, firewall change, or UAC operation is
-used. The protection verification endpoint is checked without authentication
-only, so the expected response is 401 before any verification can run.
+No public target, TUN, system proxy, route, firewall change, or UAC operation is used.
 """
 from pathlib import Path
+import http.client
 import json
 import os
 import socket
@@ -34,9 +33,19 @@ def request(base, route, body=None, token=None):
 
 
 def available_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    while True:
+        with socket.socket() as model_probe, socket.socket() as management_probe:
+            model_probe.bind(("127.0.0.1", 0))
+            port = model_probe.getsockname()[1]
+            try:
+                management_probe.bind(("127.0.0.1", management_port(port)))
+            except OSError:
+                continue
+            return port
+
+
+def management_port(port):
+    return 65534 if port == 65535 else port + 1
 
 
 def wait_for(read, condition, description, timeout=25):
@@ -118,13 +127,14 @@ def check_private_target_denied(node):
 def main():
     if os.name != "nt" or not EXECUTABLE.is_file():
         raise SystemExit("Build the Windows embedded engine before running this smoke test on Windows.")
-    children, clients = [], []
+    children, clients, model_ports = [], [], {}
     env = os.environ.copy()
     env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
     with TemporaryTestDirectory("proxy-exe-smoke-") as directory:
         def start(name, port=None):
             port = port or available_port()
-            base = f"http://127.0.0.1:{port}"
+            base = f"http://127.0.0.1:{management_port(port)}"
+            model_ports[base] = port
             process = subprocess.Popen(
                 [str(EXECUTABLE), "--owned-engine", "--demo", "--no-browser", "--port", str(port),
                  "--data-dir", str(Path(directory) / name)],
@@ -138,10 +148,11 @@ def main():
                     assert request(base, "/health")["version"] == VERSION
                     token = request(base, "/api/bootstrap")["token"]
                     clients.append((base, token))
-                    wait_for(lambda: request(base, "/api/status", token=token),
-                             lambda state: state["identity"]["loaded"], "Identity preferences did not load")
+                    initial = wait_for(lambda: request(base, "/api/status", token=token),
+                                       lambda state: state["identity"]["loaded"], "Identity preferences did not load")
+                    assert not initial["modelApi"]["enabled"] and not initial["modelApi"]["listening"], initial
                     return base, token, process
-                except (OSError, ValueError, AssertionError):
+                except (OSError, ValueError, AssertionError, http.client.HTTPException):
                     time.sleep(0.1)
             raise TimeoutError(f"{name} did not start")
 
@@ -186,6 +197,10 @@ def main():
                 request(b, "/api/model", {"enabled": True, "workspace": str(directory)}, token_b)
                 wait_for(lambda: request(a, "/api/status", token=token_a),
                          lambda state: state["model"]["available"], "Claude model service did not become available")
+                enabled_api = request(a, "/api/model-api", {"enabled": True}, token_a)
+                assert enabled_api["modelApi"]["listening"], enabled_api
+                disabled_api = request(a, "/api/model-api", {"enabled": False}, token_a)
+                assert not disabled_api["modelApi"]["listening"], disabled_api
                 request(b, "/api/model", {"enabled": False}, token_b)
                 wait_for(lambda: request(a, "/api/status", token=token_a),
                          lambda state: not state["model"]["enabled"], "Claude disable did not reach A")
@@ -198,13 +213,7 @@ def main():
                     raise AssertionError(f"Claude configuration closed or wrote to the proxy association: {unexpected!r}")
                 independent = request(a, "/api/proxy", token=token_a)
                 assert independent["online"] and independent["subscriptionUrl"] == original["subscriptionUrl"], independent
-            try:
-                request(a, "/api/proxy/guard/verify", {})
-            except urllib.error.HTTPError as error:
-                assert error.code == 401, "Unauthenticated verification must be rejected before UAC"
-            else:
-                raise AssertionError("Unauthenticated verification was accepted")
-            print("PASS: identity-only pairing, packaged TUN/DNS subscription, private-target denial, device usage list, independent Claude/proxy channels and unauthenticated verify 401.", flush=True)
+            print("PASS: identity-only pairing, packaged TUN/DNS subscription, private-target denial, device usage list and independent Claude/model API/proxy channels.", flush=True)
 
             request(b, "/api/pause", {}, token_b)
             blocked = wait_for(lambda: request(a, "/api/proxy", token=token_a),
@@ -225,7 +234,7 @@ def main():
             assert restored["subscriptionUrl"] == original["subscriptionUrl"]
             print("PASS: B pause fails closed, subscription remains importable, B resume automatically restores the exit.", flush=True)
 
-            api_port = urllib.parse.urlparse(a).port
+            api_port = model_ports[a]
             request(a, "/api/shutdown", {}, token_a)
             assert process_a.wait(timeout=15) == 0
             a, token_a, process_a = start("caller", port=api_port)

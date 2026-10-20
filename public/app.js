@@ -26,7 +26,8 @@ function readInvitation(invitation) {
   return JSON.parse(atob(invitation.slice('p2pcc://pair/'.length).replace(/-/g, '+').replace(/_/g, '/')));
 }
 function navigate(next, updateHash = true) {
-  page = allowedPage(next, state());
+  const access = state();
+  page = allowedPage(next, { ...access, model: access.model || currentStatus?.modelApi?.listening === true });
   for (const [key, content] of Object.entries(pages)) {
     $(key).hidden = page !== key;
     for (const button of document.querySelectorAll(`[data-page="${key}"]`)) {
@@ -54,7 +55,7 @@ async function action(route, body, message) {
 $('tab-client').onclick = () => action('/api/identity', { role: 'client' }, '本机身份已设为 A 调用端');
 $('tab-host').onclick = () => action('/api/identity', { role: 'host' }, '本机身份已设为 B 服务端');
 $('network-login').onclick = () => action('/api/network/login', {}, '私网连接已启动；首次使用请在浏览器完成授权');
-$('network-disconnect').onclick = () => action('/api/network/disconnect', {}, '已退出私有网络，可切换身份；系统保护保持原状态');
+$('network-disconnect').onclick = () => action('/api/network/disconnect', {}, '已退出私有网络，可切换身份');
 $('host-form').onsubmit = (event) => {
   event.preventDefault();
   action('/api/host', { ...($('tailscale-ip').value ? { tailscaleIp: $('tailscale-ip').value } : {}), bridgePort: Number($('bridge-port').value) }, '服务身份已创建，请将配对码交给 A');
@@ -168,6 +169,10 @@ $('copy-token').onclick = () => copy(token);
 $('copy-url').onclick = () => copy(`${apiBase}/v1`);
 $('copy-example').onclick = () => copy($('api-example').textContent);
 $('refresh-models').onclick = () => action('/api/models/refresh', {});
+$('model-api-toggle').onclick = () => {
+  if ($('model-api-toggle').disabled) return;
+  action('/api/model-api', { enabled: !(currentStatus?.modelApi?.listening || currentStatus?.modelApi?.enabled) });
+};
 function updateExample() {
   if (!$('model-id').value) { $('api-example').textContent = '获取 B 端模型列表并选择模型后，生成调用示例。'; return; }
   $('api-example').textContent = [`curl ${apiBase}/v1/chat/completions`, '  -H "Authorization: Bearer <API_TOKEN>"', '  -H "Content-Type: application/json"', `  -d '${JSON.stringify({ model: $('model-id').value, messages: [{ role: 'user', content: '你好' }], stream: false })}'`].join(' \\\n');
@@ -207,17 +212,22 @@ function renderModels(status, ui) {
 }
 function renderModel(status, ui) {
   const model = status.model || {};
+  const modelApi = status.modelApi || {}, listening = modelApi.listening === true;
   const host = ui.role === 'host';
   $('model-heading').textContent = host ? 'B · Claude 服务配置' : 'A · 远端 Claude 调用';
   $('model-host-panel').hidden = !host; $('model-client-panel').hidden = ui.role !== 'client';
   const ready = model.available === true;
-  $('model-state').textContent = ready ? 'Claude 服务可用' : model.enabled ? '等待 Claude 服务' : 'Claude 服务未启用';
-  $('model-state').className = `proxy-badge${ready ? ' ready' : ''}`;
-  $('model-message').textContent = model.message || 'Claude 服务由 B 单独开启。';
+  $('model-state').textContent = host ? ready ? 'Claude 服务可用' : model.enabled ? '等待 Claude 服务' : 'Claude 服务未启用' : listening ? '模型 API 正在监听' : '模型 API 未监听';
+  $('model-state').className = `proxy-badge${(host ? ready : listening) ? ' ready' : ''}`;
+  const apiMessage = listening ? '本机模型 API 已开启，正在接受调用。' : '本机模型 API 已关闭，开启后才监听端口并接受调用。';
+  $('model-message').textContent = host ? model.message || 'Claude 服务由 B 单独开启。' : `${apiMessage}${modelApi.error ? ` ${modelApi.error}` : ''} ${model.message || 'Claude 服务由 B 单独开启。'}`;
+  $('model-api-toggle').textContent = listening || modelApi.enabled ? '关闭模型 API' : '开启模型 API';
+  $('model-api-toggle').setAttribute('aria-pressed', String(listening));
+  $('model-api-toggle').disabled = actionBusy || proxyBusy || !localAvailable || (!listening && (!ui.model || ui.role !== 'client'));
   for (const input of $('model-form').elements) input.disabled = actionBusy || proxyBusy || !localAvailable || !ui.model || !host;
   $('model-disable').disabled ||= !model.enabled;
   const modelsReady = renderModels(status, ui);
-  $('model-test-submit').disabled = actionBusy || proxyBusy || !localAvailable || !ui.model || ui.role !== 'client' || !ready || !modelsReady || Boolean(modelTest);
+  $('model-test-submit').disabled = actionBusy || proxyBusy || !localAvailable || !listening || !ui.model || ui.role !== 'client' || !ready || !modelsReady || Boolean(modelTest);
   $('model-test-cancel').hidden = !modelTest;
   const config = model.config || {};
   if (JSON.stringify(config) !== lastConfig) {
@@ -237,7 +247,7 @@ $('model-test-form').onsubmit = async (event) => {
   const controller = modelTest = new AbortController(); render(currentStatus);
   $('model-test-output').textContent = '等待 B 的 Claude 完成本轮回复…';
   try {
-    const response = await api('/v1/chat/completions', { model: $('model-id').value, messages: [{ role: 'user', content: $('model-test-prompt').value }], stream: false }, controller.signal);
+    const response = await api('/api/model-test', { model: $('model-id').value, messages: [{ role: 'user', content: $('model-test-prompt').value }], stream: false }, controller.signal);
     const result = await response.json();
     if (modelTest !== controller) return;
     $('model-test-output').textContent = result.choices?.[0]?.message?.content || JSON.stringify(result.choices?.[0]?.message || result, null, 2);
@@ -275,12 +285,6 @@ function renderProxy(proxy = {}, ui = state()) {
     const traffic = document.createElement('small'); traffic.textContent = `上传 ${formatBytes(client.uploadBytes)} · 下载 ${formatBytes(client.downloadBytes)}`;
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
-  const guard = proxy.guard || {}, unknown = guard.state === 'unknown' || guard.verification === 'unknown';
-  const guardMessage = `${unknown ? '全局保护状态未验证，请检查或明确关闭' : guard.state === 'partial' ? '全局保护规则未通过校验' : guard.active ? '全局系统保护已验证生效' : '全局系统保护未启用'}${guard.message ? ` · ${guard.message}` : ''}`;
-  $('proxy-guard-state').textContent = $('settings-guard-state').textContent = guardMessage;
-  const unavailable = actionBusy || proxyBusy || !localAvailable || !guard.supported;
-  $('proxy-guard').disabled = unavailable || ui.role !== 'client' || !ui.proxy || !proxy.enabled;
-  for (const id of ['proxy-guard-verify', 'proxy-guard-disable', 'settings-guard-verify', 'settings-guard-disable']) $(id).disabled = unavailable;
   const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : proxy.connectionLimit === 0 ? '（不设数量上限）' : ''}`;
   $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
 }
@@ -298,9 +302,6 @@ async function proxyAction(route, body) {
 }
 $('proxy-sharing').onclick = () => proxyAction('/api/proxy', { sharing: !proxyStatus.sharing });
 $('proxy-enable').onclick = () => proxyAction('/api/proxy', { enabled: !proxyStatus.enabled });
-$('proxy-guard').onclick = () => proxyAction('/api/proxy/guard', { enabled: true });
-for (const id of ['proxy-guard-verify', 'settings-guard-verify']) $(id).onclick = () => proxyAction('/api/proxy/guard/verify', {});
-for (const id of ['proxy-guard-disable', 'settings-guard-disable']) $(id).onclick = () => proxyAction('/api/proxy/guard', { enabled: false });
 $('copy-subscription').onclick = () => { if (proxyStatus.subscriptionUrl) copy(proxyStatus.subscriptionUrl); };
 $('copy-claude-subscription').onclick = async () => {
   const ui = state();
@@ -312,9 +313,7 @@ $('copy-claude-subscription').onclick = async () => {
     if (revision !== mutation) return;
     const proxy = result.proxy || result, subscription = proxy.claudeSubscriptionUrl;
     if (!subscription) { toast('请先启用本地 Clash 节点，并确认客户端支持 Claude 专用配置。', true); return; }
-    const guard = proxy.guard || {};
-    const warning = guard.active === true || guard.state === 'partial' || guard.state === 'unknown' || guard.verification === 'unknown';
-    await copy(subscription, `Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN${warning ? '。全局保护未确认关闭，可能阻断其他网站，请在原数据目录明确关闭（UAC）' : ''}`);
+    await copy(subscription, 'Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN');
   } catch (error) { if (revision === mutation) toast(error.message, true); }
   finally { proxyBusy = false; render(currentStatus); }
 };
@@ -332,11 +331,15 @@ function render(status) {
   }
   const previousRole = currentStatus?.identity?.role || currentStatus?.role;
   const previousConnection = currentStatus?.controlConnectionId;
+  const wasListening = currentStatus?.modelApi?.listening === true;
   currentStatus = status;
   const ui = state();
   if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); $('probe-result').textContent = ''; navigate('connection'); }
-  for (const key of ['api', 'proxy']) { const button = document.querySelector(`[data-page="${key}"]`); button.disabled = !ui[key === 'api' ? 'model' : 'proxy']; button.title = button.disabled ? '完成设备配对后可用' : ''; }
+  for (const key of ['api', 'proxy']) { const button = document.querySelector(`[data-page="${key}"]`); button.disabled = key === 'api' ? !ui.model && status.modelApi?.listening !== true : !ui.proxy; button.title = button.disabled ? '完成设备配对后可用' : ''; }
   if (!ui.model || ui.role !== 'client' || previousConnection !== status.controlConnectionId) retireModelTest();
+  if (wasListening && status.modelApi?.listening !== true && modelTest) {
+    retireModelTest(); $('model-test-output').textContent = '模型 API 已停止监听，本轮请求已停止；开启后可重新测试。';
+  }
   $('top-dot').classList.toggle('online', Boolean(status.online));
   $('top-status').textContent = !localAvailable ? '本地服务不可用' : status.online ? `${roleName(ui.role)} · ${ui.role === 'host' ? `${status.connectedClients || 0} 个 A 已连接` : 'B 已连接'}` : status.pairing?.message || status.identity?.message || '设备尚未配对';
   $('mode').textContent = status.demo ? 'DEMO / 本机模拟' : 'TAILSCALE MODE'; $('mode').classList.toggle('demo', status.demo);
@@ -356,7 +359,6 @@ async function poll() {
     localAvailable = false; modelTest?.abort(); render(currentStatus);
     $('top-status').textContent = `本地服务不可用：${error.message}`; $('top-dot').classList.remove('online');
     $('proxy-message').textContent = '无法读取本地代理状态，请检查后台客户端。';
-    $('proxy-guard-state').textContent = $('settings-guard-state').textContent = '无法读取保护状态；此前已启用的持久保护仍需明确关闭。';
   } finally { polling = false; }
 }
 async function pollNetwork() {
