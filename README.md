@@ -88,9 +88,12 @@ Windows 组网传输选择非虚拟默认网卡，Tailscale 控制连接与普�
 | 接口 | 用途 |
 | --- | --- |
 | `GET /api/proxy` | 共享、本地节点和流量状态（只读） |
+| `GET /api/network/diagnostics` | 内置组网的 TCP 重传、超时及各传输路径累计收发计数（只读） |
 | `POST /api/proxy` | B `{sharing:true/false}`；A `{enabled:true/false}` |
 | `GET /clash/<独立订阅令牌>/config.yaml` | 完整 Clash 配置，推荐导入 |
 | `GET /clash/<独立订阅令牌>/nodes.yaml` | 仅节点列表，不包含 TUN、DNS 和阻断规则 |
+
+诊断接口位于本机管理端口，沿用 API Token 鉴权。`scope: "node"` 表示整节点累计统计，包含控制连接、模型与所有调用端；比较同一次测速前后的差值，重传计数不能直接当作公网丢包率。`available: false` 表示当前没有可读取的快照，空集合不代表实测为零。读取不会启动未运行的网络组件，诊断超时也不会主动重置已有连接。
 
 开发验证可运行 `node scripts/smoke-clash.mjs --mihomo <Mihomo程序绝对路径>`，验证实际 Mihomo 的 TCP/UDP 和订阅协议；`python scripts/smoke-proxy-exe.py` 使用打包的 `bridge-engine` 组件与独立测试数据目录模拟多端，验证代理启停、断线恢复和配置持久化。两者都只使用本机测试，不创建 TUN、不修改系统代理或过滤规则，也不绕过桌面单实例限制。实际 Clash TUN 联动、物理断网、网络切换及重启后的代理恢复仍需在专用 A/B 测试机验证。
 
@@ -283,6 +286,8 @@ python scripts/package.py
 ```
 
 `package.json` 统一提供版本号，构建时生成 Windows manifest 并注入网络核心。共享构建配置、源码包及 EXE 内运行资源的白名单位于 `scripts/build_support.py`；两种打包都排除私有状态、`.env`、缓存和链接目录。
+
+本地网络诊断可使用 `python scripts/build_windows.py --diagnostics` 构建。带独立标签的 EXE 和构建记录位于 `release/diagnostics`，构建目录及引擎与正式产物分开保存。程序标题和设置页标明“本地诊断版”，该构建不会修改 Windows 自启动注册。此命令只生成本机文件，不发布 GitHub 版本。
 
 `release/claude-p2p-bridge-版本号.zip` 是源码快照，包含测试源码，不含测试数据、工具链和本机配置。构建生成 EXE 对应的 `.build.json`，记录二进制及每个源码文件的 SHA-256；源码打包核对这份记录，源码或 EXE 已变化时需重新构建。ZIP 使用原子替换，打包失败保留原文件。
 

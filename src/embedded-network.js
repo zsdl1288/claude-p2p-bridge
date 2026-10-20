@@ -76,13 +76,20 @@ export class EmbeddedNetwork extends EventEmitter {
       if (this.closed || child !== this.child || !child?.stdin.writable) { reject(new Error('组网进程未启动或已关闭')); return; }
       const id = ++this.sequence;
       const line = `${JSON.stringify({ id, method, params })}\n`;
+      const fail = (error) => {
+        if (method !== 'diagnostics') return this.invalidate(child, error);
+        // A failed snapshot must not revoke live transports owned by this helper.
+        if (!this.pending.delete(id)) return;
+        clearTimeout(timer); reject(error);
+      };
       const timer = setTimeout(() => {
         // A timed-out listen/dial may still allocate a proxy. Reset its owner
         // so those resources cannot survive without a corresponding JS handle.
-        this.invalidate(child, new Error('内置组网响应超时，将在下次连接时重试'));
+        fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : '内置组网响应超时，将在下次连接时重试'));
       }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer, child });
-      child.stdin.write(line, (error) => { if (error) this.invalidate(child, error); });
+      try { child.stdin.write(line, (error) => { if (error) fail(error); }); }
+      catch (error) { fail(error); }
     });
   }
   async call(method, params) { const child = await this.start(); return this.request(method, params, child); }
@@ -90,6 +97,13 @@ export class EmbeddedNetwork extends EventEmitter {
   async status() {
     try { return await this.networkState('status'); }
     catch (error) { return { installed: false, embedded: true, running: false, addresses: [], peers: [], hostname: this.hostname, source: 'embedded', backendState: 'Unavailable', message: `内置组网组件不可用：${error.message}。请使用完整发行版，或先运行原生组件构建脚本。` }; }
+  }
+  async diagnostics() {
+    const unavailable = (message) => ({ available: false, source: 'embedded', scope: 'node', capturedAt: new Date().toISOString(), netstack: {}, transport: [], message });
+    const child = this.child;
+    if (this.closed || !child || !this.initialized.has(child) || !child.stdin?.writable) return unavailable('内置组网进程尚未就绪，未启动诊断');
+    try { return await this.request('diagnostics', {}, child); }
+    catch { return unavailable('内置组网诊断暂不可用'); }
   }
   login() { this.wantRunning = true; return this.networkState('login'); }
   connect() { this.wantRunning = true; return this.networkState('connect'); }

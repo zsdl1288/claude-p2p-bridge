@@ -10,11 +10,22 @@
 #include "job-lifecycle.hpp"
 #include <uxtheme.h>
 
+#ifndef BRIDGE_DIAGNOSTICS_BUILD
+#define BRIDGE_DIAGNOSTICS_BUILD 0
+#endif
+#ifndef BRIDGE_BUILD_LABEL
+#define BRIDGE_BUILD_LABEL ""
+#endif
+
 namespace {
 constexpr COLORREF BACKGROUND = RGB(245, 246, 249), SIDEBAR = RGB(23, 30, 42);
 constexpr COLORREF INK = RGB(31, 42, 58), MUTED = RGB(104, 116, 134), ACCENT = RGB(178, 82, 57);
 constexpr COLORREF LINE = RGB(225, 229, 235), GREEN = RGB(28, 119, 93);
+#if BRIDGE_DIAGNOSTICS_BUILD
+constexpr wchar_t APP_TITLE[] = L"Claude Bridge · 本地诊断版";
+#else
 constexpr wchar_t APP_TITLE[] = L"Claude Bridge · C++ 桌面版";
+#endif
 using Options = DesktopCli::Options;
 struct Reply { std::string kind; Json data; std::string text, requestId; uint64_t viewEpoch = 0; };
 struct Widget {
@@ -260,14 +271,23 @@ class Application {
         Label(L"开机启动", 228, 294, 540, 24, 4, 0, 1);
         Add(L"BUTTON", L"Windows 登录后自动在后台运行", STARTUP_ENABLE, 228, 328, 540, 26, 4, 0, BS_AUTOCHECKBOX | WS_TABSTOP);
         startupHint_ = Label(L"", 228, 364, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
-        Label((L"Claude Bridge · v" + Wide(BRIDGE_VERSION)).c_str(), 228, 458, 540, 24, 4);
+        auto versionLabel = L"Claude Bridge · v" + Wide(BRIDGE_VERSION);
+        if constexpr (BRIDGE_DIAGNOSTICS_BUILD) versionLabel += L" · 本地诊断版";
+        Label(versionLabel.c_str(), 228, 458, 540, 24, 4);
         Button(L"开源许可", OPEN_LICENSES, 784, 450, 208, 34, 4, 0, true);
         Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 492, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
+        if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
+            Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, 530, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
+        }
         LoadSettings(); LoadStartup(); Visibility(); Layout(); UpdateButtons();
     }
     DesktopStartup::Registration Startup() const { return {options_.directory, options_.port, options_.system}; }
     void LoadStartup() {
-        EnableWindow(Item(STARTUP_ENABLE), !options_.demo);
+        EnableWindow(Item(STARTUP_ENABLE), !options_.demo && !BRIDGE_DIAGNOSTICS_BUILD);
+        if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
+            Text(startupHint_, L"本地诊断版不修改 Windows 自启动设置。\r\n已保存的正式版设置保持不变。");
+            return;
+        }
         if (options_.demo) { Text(startupHint_, L"演示模式不修改\r\nWindows 自启动设置。"); return; }
         try {
             auto startup = Startup();
@@ -279,7 +299,7 @@ class Application {
         } catch (const std::exception& error) { Text(startupHint_, L"自启动设置不可用：\r\n" + Wide(error.what())); }
     }
     void SetStartup() {
-        if (options_.demo) return;
+        if (options_.demo || BRIDGE_DIAGNOSTICS_BUILD) return;
         bool requested = SendMessageW(Item(STARTUP_ENABLE), BM_GETCHECK, 0, 0) == BST_CHECKED;
         try {
             auto startup = Startup();
@@ -925,7 +945,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         std::unique_ptr<wchar_t*, decltype(&LocalFree)> allocation(args, LocalFree);
         std::vector<std::wstring> arguments(args + 1, args + count);
         auto options = DesktopCli::Parse(arguments, defaultDirectory);
-        if (options.version) { const char text[] = "Claude Bridge " BRIDGE_VERSION " / C++ native desktop / embedded Tailscale\n"; DWORD written; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, sizeof(text) - 1, &written, nullptr); if (SUCCEEDED(com)) CoUninitialize(); return 0; }
+        if (options.version) {
+            std::string text = "Claude Bridge " BRIDGE_VERSION " / C++ native desktop / embedded Tailscale";
+            if constexpr (BRIDGE_DIAGNOSTICS_BUILD) text += " / local diagnostics (本地诊断版) / " BRIDGE_BUILD_LABEL;
+            text += '\n';
+            DWORD written; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+            if (SUCCEEDED(com)) CoUninitialize();
+            return 0;
+        }
         Application application(instance, std::move(options)); int result = application.Run();
         if (SUCCEEDED(com)) CoUninitialize();
         return result;

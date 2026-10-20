@@ -1,12 +1,33 @@
 """Build one portable EXE: native C++ UI + static runtime + embedded bridge engine."""
+import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
 import zlib
 from build_support import ROOT as root, VERSION as version, atomic_write, go_environment, source_manifest, verify_source_version, write_manifest
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--diagnostics', action='store_true', help='Build a clearly marked local diagnostics EXE in release/diagnostics')
+parser.add_argument('--diagnostic-label', help='Local build label, in the form local-diagnostics-YYYYMMDD.N')
+options = parser.parse_args()
+if options.diagnostic_label is not None and not options.diagnostics:
+    parser.error('--diagnostic-label requires --diagnostics')
+diagnostic_label = (options.diagnostic_label if options.diagnostic_label is not None else 'local-diagnostics-20261020.1') if options.diagnostics else None
+if diagnostic_label is not None and not re.fullmatch(r'local-diagnostics-[0-9]{8}\.[1-9][0-9]{0,5}', diagnostic_label, re.ASCII):
+    parser.error('--diagnostic-label must use local-diagnostics-YYYYMMDD.N with a positive build number of at most six digits')
+
+# Select every output before snapshotting sources. A local diagnostics build
+# must never replace a release executable, helper or desktop build directory.
+build = root / 'bin/desktop-build-diagnostics' / diagnostic_label if diagnostic_label else root / 'bin/desktop-build'
+release = root / 'release/diagnostics' if diagnostic_label else root / 'release'
+target_name = f'ClaudeBridge-{version}-{diagnostic_label}-windows-x64.exe' if diagnostic_label else f'ClaudeBridge-{version}-windows-x64.exe'
+target = release / target_name
+helper = build / 'bridge-net.exe' if diagnostic_label else root / 'bin/bridge-net.exe'
+engine = build / 'bridge-engine.exe' if diagnostic_label else root / 'bin/bridge-engine.exe'
 
 go = root / ".tools/go/bin/go.exe"
 compiler = root / ".tools/w64devkit/bin/g++.exe"
@@ -16,9 +37,8 @@ if not all(path.is_file() for path in [go, compiler, windres]):
 
 env = go_environment()
 env["PATH"] = str(compiler.parent) + os.pathsep + env.get("PATH", "")
-build = root / "bin/desktop-build"
 build.mkdir(parents=True, exist_ok=True)
-(root / "release").mkdir(exist_ok=True)
+release.mkdir(parents=True, exist_ok=True)
 manifest = build / 'app.manifest'
 write_manifest(manifest)
 
@@ -29,16 +49,18 @@ def run(args, cwd=root):
 
 verify_source_version(root, version)
 initial_sources = source_manifest()
-run([go, "build", "-trimpath", "-ldflags=-s -w", "-o", root / "bin/bridge-net.exe", "./cmd/bridge-net"], root / "native")
+run([go, "build", "-trimpath", "-ldflags=-s -w", "-o", helper, "./cmd/bridge-net"], root / "native")
 run([sys.executable, root / "scripts/prepare-windows.py"])
 build_sources = source_manifest()
 # Third-party notices are the only source asset generated during preparation.
 if {k: v for k, v in initial_sources.items() if k != 'public/licenses.txt'} != {k: v for k, v in build_sources.items() if k != 'public/licenses.txt'}:
     raise RuntimeError('Sources changed during preparation; finish editing and rebuild')
-engine = root / "bin/bridge-engine.exe"
 run([go, "build", "-trimpath", f"-ldflags=-s -w -H=windowsgui -X main.version={version}", "-o", engine, "./cmd/bridge"], root / "native")
 engine_hash = hashlib.sha256(engine.read_bytes()).hexdigest()
-(build / "build_config.hpp").write_text(f'#pragma once\n#define BRIDGE_VERSION "{version}"\n#define ENGINE_SHA256 "{engine_hash}"\n', encoding="utf-8")
+build_config = f'#pragma once\n#define BRIDGE_VERSION "{version}"\n#define ENGINE_SHA256 "{engine_hash}"\n'
+if diagnostic_label:
+    build_config += f'#define BRIDGE_DIAGNOSTICS_BUILD 1\n#define BRIDGE_BUILD_LABEL "{diagnostic_label}"\n'
+(build / "build_config.hpp").write_text(build_config, encoding="utf-8")
 
 # Original geometric icon. PNG-in-ICO is supported by Windows 10/11.
 def rounded(x, y, x0, y0, x1, y1, radius):
@@ -78,6 +100,8 @@ def rc_path(path):
 
 
 parts = version.split(".") + ["0"]
+description = 'Claude Bridge local diagnostics desktop' if diagnostic_label else 'Claude Bridge native C++ desktop'
+diagnostic_comment = f'   VALUE "Comments", "Local diagnostics build: {diagnostic_label}"\n' if diagnostic_label else ''
 rc = build / "desktop.rc"
 rc.write_text(f'''#include <windows.h>
 101 ICON "{rc_path(icon)}"
@@ -87,7 +111,7 @@ rc.write_text(f'''#include <windows.h>
  FILEVERSION {','.join(parts)}
  PRODUCTVERSION {','.join(parts)}
  FILEFLAGSMASK 0x3fL
- FILEFLAGS 0
+ FILEFLAGS {2 if diagnostic_label else 0}
  FILEOS 0x40004L
  FILETYPE 1
 BEGIN
@@ -95,11 +119,11 @@ BEGIN
  BEGIN
   BLOCK "040904b0"
   BEGIN
-   VALUE "FileDescription", "Claude Bridge native C++ desktop"
+   VALUE "FileDescription", "{description}"
    VALUE "FileVersion", "{version}"
    VALUE "ProductName", "Claude Bridge"
    VALUE "ProductVersion", "{version}"
-  END
+{diagnostic_comment}  END
  END
  BLOCK "VarFileInfo"
  BEGIN
@@ -108,7 +132,6 @@ BEGIN
 END
 ''', encoding="utf-8")
 run([windres, "-i", rc, "-o", build / "resources.o"])
-target = root / f"release/ClaudeBridge-{version}-windows-x64.exe"
 temporary = build / "ClaudeBridge-next.exe"
 try:
     run([compiler, "-std=c++20", "-O2", "-s", "-static", "-static-libgcc", "-static-libstdc++", "-municode", "-mwindows",
@@ -123,8 +146,11 @@ finally:
     temporary.unlink(missing_ok=True)
 digest = hashlib.sha256(target.read_bytes()).hexdigest()
 atomic_write(target.with_suffix('.sha256.txt'), f'{digest}  {target.name}\n'.encode('ascii'))
-atomic_write(target.with_suffix('.build.json'), json.dumps({
+build_record = {
     'v': 1, 'version': version, 'executable': target.name, 'sha256': digest,
     'sources': build_sources
-}, ensure_ascii=False, indent=2).encode('utf-8'))
+}
+if diagnostic_label:
+    build_record.update(diagnostics=True, buildLabel=diagnostic_label)
+atomic_write(target.with_suffix('.build.json'), json.dumps(build_record, ensure_ascii=False, indent=2).encode('utf-8'))
 print(f"{target} ({target.stat().st_size} bytes)\nSHA256: {digest}")

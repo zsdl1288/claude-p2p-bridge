@@ -29,6 +29,26 @@ async function setup(t, { join = true } = {}) {
 }
 function call(url, route, body, extra = {}) { return fetch(`${url}${route}`, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer test-local-token', 'Content-Type': 'application/json', ...extra }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }); }
 
+test('network diagnostics only forwards an embedded snapshot and never polls or changes network state', async () => {
+  const snapshot = { available: true, source: 'embedded', scope: 'node', capturedAt: '2026-10-20T12:34:56Z',
+    netstack: { counter_tcp_retransmits: 3 }, transport: [] };
+  let reads = 0, polls = 0;
+  const adapter = { embedded: true, async diagnostics() { reads++; return snapshot; } };
+  const bridge = new Bridge({ networkAdapter: adapter, networkProvider: async () => { polls++; throw new Error('Must not poll network status'); } });
+  const network = { running: false, backendState: 'Stopped', addresses: [] };
+  bridge.network = network; const generation = bridge.networkGeneration;
+  let events = 0; bridge.on('state', () => events++);
+  assert.equal(await bridge.networkDiagnostics(), snapshot);
+  assert.equal(bridge.network, network); assert.equal(bridge.networkGeneration, generation);
+  assert.equal(reads, 1); assert.equal(polls, 0); assert.equal(events, 0);
+  for (const options of [{}, { demo: true, networkAdapter: adapter }, { networkAdapter: { embedded: true } }, { networkAdapter: { diagnostics: adapter.diagnostics } }]) {
+    const unavailable = await new Bridge(options).networkDiagnostics();
+    assert.equal(unavailable.available, false); assert.equal(unavailable.scope, 'node');
+    assert.deepEqual(unavailable.netstack, {}); assert.deepEqual(unavailable.transport, []);
+  }
+  assert.equal(reads, 1);
+});
+
 test('request validation fixes the B-side workspace, tools and process arguments', () => {
   assert.throws(() => validateRequest({ prompt: '' }));
   assert.throws(() => validateRequest({ prompt: 'ok', model: '--dangerously-skip-permissions' }));

@@ -182,6 +182,7 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
       if (proxy && req.method === 'GET' && url.pathname === '/api/proxy') return json(res, 200, proxy.status());
       if (proxy && req.method === 'POST' && url.pathname === '/api/proxy') return json(res, 200, await proxy.configure(await readBody(req)));
       if (req.method === 'GET' && url.pathname === '/api/tailscale') return json(res, 200, await bridge.networkInfo(true));
+      if (!modelListener && req.method === 'GET' && url.pathname === '/api/network/diagnostics') return json(res, 200, await bridge.networkDiagnostics());
       if (req.method === 'POST' && url.pathname === '/api/network/login') { await readBody(req); return json(res, 200, actionStatus(await bridge.loginNetwork())); }
       if (req.method === 'POST' && url.pathname === '/api/network/disconnect') {
         await readBody(req);

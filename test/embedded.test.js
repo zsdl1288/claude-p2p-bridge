@@ -28,6 +28,11 @@ async function fakeCore(t, options = {}) {
       const { id, method, params } = JSON.parse(line);
       methods.push(method);
       if (method === 'hang') return;
+      if (method === 'diagnostics' && ${Boolean(options.diagnosticsHang)}) return;
+      if (method === 'diagnostics' && ${JSON.stringify(options.diagnosticsResult || null)}) {
+        process.stdout.write(JSON.stringify({ id, result: ${JSON.stringify(options.diagnosticsResult || null)} }) + '\\n');
+        return;
+      }
       if (method === 'oversized') { process.stdout.write('x'.repeat(2 * 1024 * 1024 + 1)); return; }
       if (method === 'invalid-utf8') { process.stdout.write(Buffer.from([123,34,120,34,58,34,255,34,125,10])); return; }
       if (method === 'init' && ${JSON.stringify(options.initError || null)}) {
@@ -61,6 +66,58 @@ test('status, login and reconnect retain the same local node name', async (t) =>
   assert.match(status.hostname, /^bridge-/);
   assert.equal((await core.login()).hostname, status.hostname);
   assert.equal((await core.connect()).hostname, status.hostname);
+});
+
+test('network diagnostics never starts an absent or uninitialized helper', async () => {
+  const core = new EmbeddedNetwork();
+  let starts = 0, requests = 0;
+  core.start = async () => { starts++; throw new Error('Snapshot must not start the helper'); };
+  core.request = async () => { requests++; throw new Error('Snapshot must not query an uninitialized helper'); };
+  for (const child of [undefined, { stdin: { writable: true } }]) {
+    core.child = child;
+    const result = await core.diagnostics();
+    assert.equal(result.available, false); assert.equal(result.source, 'embedded'); assert.equal(result.scope, 'node');
+    assert.ok(Number.isFinite(Date.parse(result.capturedAt)));
+    assert.deepEqual(result.netstack, {}); assert.deepEqual(result.transport, []);
+  }
+  core.child = undefined; await core.close();
+  assert.equal((await core.diagnostics()).available, false);
+  assert.equal(starts, 0); assert.equal(requests, 0); assert.equal(core.pending.size, 0);
+  assert.equal(core.wantRunning, undefined);
+});
+
+test('network diagnostics forwards the initialized helper snapshot without connecting or adding state', async (t) => {
+  const snapshot = { available: true, source: 'embedded', scope: 'node', capturedAt: '2026-10-20T12:34:56.123456789Z',
+    netstack: { counter_tcp_retransmits: 4, gauge_tcp_current_established: 1 },
+    transport: [{ direction: 'outbound', path: 'direct_ipv4', bytes: 1200, packets: 1 }] };
+  const core = await fakeCore(t, { diagnosticsResult: snapshot });
+  await core.start(); const child = core.child;
+  assert.deepEqual(await core.diagnostics(), snapshot);
+  assert.deepEqual((await core.status()).methods, ['init', 'diagnostics', 'status']);
+  assert.equal(core.child, child); assert.equal(core.wantRunning, undefined);
+});
+
+test('a diagnostics write failure clears its request without resetting the helper', async () => {
+  const core = new EmbeddedNetwork(); let kills = 0;
+  const child = { stdin: { writable: true, write() { throw new Error('synthetic write failure'); } }, kill() { kills++; } };
+  core.child = child; core.initialized.add(child);
+  const result = await core.diagnostics();
+  assert.equal(result.available, false); assert.equal(core.pending.size, 0);
+  assert.equal(core.child, child); assert.equal(kills, 0);
+  core.child = null; await core.close();
+});
+
+test('a diagnostics timeout leaves the live helper and its transport resources intact', async (t) => {
+  const core = await fakeCore(t, { diagnosticsHang: true });
+  const resource = await core.dial({ host: '100.64.0.2', port: 3211 });
+  const child = core.child; let resets = 0;
+  core.on('reset', () => resets++); core.requestTimeoutMs = 40;
+  const result = await core.diagnostics();
+  assert.equal(result.available, false); assert.deepEqual(result.netstack, {}); assert.deepEqual(result.transport, []);
+  assert.equal(core.child, child); assert.equal(child.killed, false);
+  assert.equal(core.resources.get(resource), child); assert.equal(core.pending.size, 0); assert.equal(resets, 0);
+  core.requestTimeoutMs = 1000;
+  assert.deepEqual((await core.status()).methods, ['init', 'dial', 'diagnostics', 'status']);
 });
 
 test('deliberate network disconnect retains the helper identity and never resumes after replacement', { timeout: 10000 }, async (t) => {

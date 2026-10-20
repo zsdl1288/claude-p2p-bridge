@@ -55,6 +55,10 @@ export class Bridge extends EventEmitter {
     return { role, serverAddress: role === 'client' ? this.peer.pairing.host : null };
   }
   networkStatus() { return this.network ? { ...this.network, devices: networkDevices(this.network, this.networkIdentity()) } : null; }
+  async networkDiagnostics() {
+    if (!this.demo && this.networkAdapter?.embedded === true && typeof this.networkAdapter.diagnostics === 'function') return this.networkAdapter.diagnostics();
+    return { available: false, source: 'embedded', scope: 'node', capturedAt: new Date().toISOString(), netstack: {}, transport: [], message: '当前模式不提供内置组网诊断' };
+  }
   invalidateNetworkInfo() { ++this.networkGeneration; this.networkPromise = null; }
   setNetwork(info) {
     // A completed up/down operation supersedes polls started before it. They

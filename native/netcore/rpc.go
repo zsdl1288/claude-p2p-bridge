@@ -92,6 +92,8 @@ func Run(input io.Reader, output io.Writer) error {
 				switch req.Method {
 				case "status":
 					result, err = manager.Status(callCtx)
+				case "diagnostics":
+					result, err = manager.Diagnostics(callCtx)
 				case "login":
 					result, err = manager.Login(callCtx)
 				case "connect":

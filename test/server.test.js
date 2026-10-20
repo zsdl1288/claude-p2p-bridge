@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { createLocalServer, getApiToken } from '../src/server.js';
 
@@ -42,6 +43,31 @@ test('the browser entry point and its role-state module are served together', as
   assert.equal(state.status, 200);
   assert.match(state.headers.get('content-type'), /javascript/);
   assert.match(await state.text(), /export function uiState/);
+});
+
+test('network diagnostics is an authenticated read-only management snapshot with host and origin checks', async (t) => {
+  const snapshot = { available: true, source: 'embedded', scope: 'node', capturedAt: '2026-10-20T12:34:56.123456789Z',
+    netstack: { counter_tcp_retransmits: 5 }, transport: [{ direction: 'inbound', path: 'direct_ipv4', bytes: 2400, packets: 2 }] };
+  let reads = 0;
+  const { url, modelUrl } = await fixture(t, { async networkDiagnostics() { reads++; return snapshot; } }, { modelApi: true });
+  const route = '/api/network/diagnostics';
+  assert.equal((await fetch(`${url}${route}`)).status, 401);
+  assert.equal((await fetch(`${url}${route}`, { headers: { Authorization: 'Bearer incorrect-token' } })).status, 401);
+  assert.equal((await fetch(`${url}${route}`, { headers: { ...headers, Origin: 'https://example.invalid' } })).status, 403);
+  const wrongHost = await new Promise((resolve, reject) => {
+    const request = http.request(`${url}${route}`, { headers: { ...headers, Host: 'example.invalid' } }, (response) => { response.resume(); resolve(response.statusCode); });
+    request.on('error', reject); request.end();
+  });
+  assert.equal(wrongHost, 403);
+  assert.equal((await fetch(`${modelUrl}${route}`, { headers })).status, 404);
+  assert.equal((await fetch(`${url}${route}`, { method: 'POST', headers, body: '{}' })).status, 404);
+  assert.equal(reads, 0, 'Rejected requests must not reach the helper');
+  const before = await (await fetch(`${url}/api/status`, { headers })).json();
+  const response = await fetch(`${url}${route}`, { headers });
+  assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await response.json(), snapshot);
+  assert.equal(reads, 1);
+  assert.deepEqual(await (await fetch(`${url}/api/status`, { headers })).json(), before);
 });
 
 test('task and model endpoints cannot silently exchange execution modes', async (t) => {
