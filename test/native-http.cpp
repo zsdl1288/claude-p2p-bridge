@@ -59,7 +59,7 @@ void CheckNativeState() {
     Require(DesktopAccess::PairingRecoveryHint({{"state", "network-disconnected"}}, false).find("当前不会自动联网") != std::string::npos,
             "Explicit private-network disconnect must not promise automatic reconnection");
     Require(DesktopAccess::PairingRecoveryHint({{"state", "paused"}}, true).find("已暂停") != std::string::npos &&
-            DesktopAccess::PairingRecoveryHint({{"state", "error"}}, true).find("重新设置") != std::string::npos &&
+            DesktopAccess::PairingRecoveryHint({{"state", "error"}}, true).find("新配对码重新配对") != std::string::npos &&
             DesktopAccess::PairingRecoveryHint({{"state", "reconnecting"}}, true).find("自动恢复") != std::string::npos,
             "Paused, failed and transiently disconnected pairings need distinct recovery guidance");
 
