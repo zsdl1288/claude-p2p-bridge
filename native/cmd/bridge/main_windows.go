@@ -299,6 +299,9 @@ func main() {
 	case waitError = <-processDone:
 		// A fast API shutdown must not wait for the readiness probe's timeout.
 	case running := <-ready:
+		if running && *owned {
+			cleanupGeneratedCaches(dataDir, runtimeDir)
+		}
 		if running && !*noBrowser {
 			openBrowser(url)
 		}
