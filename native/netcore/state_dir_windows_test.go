@@ -211,13 +211,38 @@ func TestPrepareStateDirAllowsEnabledAdministratorOwner(t *testing.T) {
 		t.Skip("Administrators-owned creation compatibility requires an enabled administrator token")
 	}
 	directory := t.TempDir()
-	if err := windows.SetNamedSecurityInfo(directory, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, admin, nil, nil, nil); err != nil {
+	user := stateDirTestUser(t)
+	modify, err := windows.SecurityDescriptorFromString("D:P(A;OICI;0x1301bf;;;" + user.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := modify.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(directory, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		admin, nil, dacl, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := prepareStateDir(directory); err != nil {
 		t.Fatal(err)
 	}
-	assertPrivateStateDirACL(t, directory, stateDirTestUser(t))
+	assertPrivateStateDirACL(t, directory, user)
+	owner, _, err := stateDirTestSecurity(t, directory).Owner()
+	if err != nil || owner == nil || !owner.Equals(user) {
+		t.Fatalf("Administrators-owned directory must become user-owned before tsnet starts: owner=%v, error=%v", owner, err)
+	}
+	first := stateDirTestSecurity(t, directory).String()
+	if err := prepareStateDir(directory); err != nil {
+		t.Fatal(err)
+	}
+	if got := stateDirTestSecurity(t, directory).String(); got != first {
+		t.Fatal("repeated preparation changed the normalized owner or private permissions")
+	}
+	if err := paths.MkStateDir(directory); err != nil {
+		t.Fatalf("Tailscale cannot secure an elevated-created state directory: %v", err)
+	}
 }
 
 func TestStateDirOwnerBoundary(t *testing.T) {

@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.0.5
+# Claude Bridge · Windows 桌面托盘版 v1.0.6
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,9 +8,9 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.0.5-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.0.6-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.5.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
+桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.6.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
 
 ## 使用方法
 
@@ -101,7 +101,7 @@ A 应只开启 Clash TUN，关闭“系统代理”；Windows 手动代理和代
 
 默认数据目录为 `%LOCALAPPDATA%\ClaudeBridge`，包含设备身份、本机 `api-token`、加密配对 `pairing.dat`、桌面设置和运行缓存。配对由 Windows DPAPI 绑定当前用户保护；演示配对使用独立的 `pairing-demo.dat`。不要分发这些私有文件。桌面配置读取完成前若窗口初始化失败，退出流程不会将默认值写回已有的 `desktop.ini`。
 
-1.0.5 在 Windows 初始化内置组网时，为当前用户拥有的状态目录设置私有访问权限，兼容只继承“修改”权限的自定义数据目录，正常连接无需以管理员身份运行；也兼容由当前已启用的管理员组拥有的目录。权限初始化仅作用于组网状态目录，保留已有登录和配对配置，不修改父目录权限；路径包含链接或状态目录属于其他账户时会明确报错，请选择当前用户拥有的独立目录。
+Windows 初始化内置组网时，为当前用户拥有的状态目录设置私有访问权限，兼容只继承“修改”权限的自定义数据目录，正常连接无需以管理员身份运行。1.0.6 进一步处理管理员首次创建目录后普通权限重启的兼容性：在管理员组已启用且拥有该目录时，将目录所有者规范为当前用户，再由普通权限继续使用。权限初始化仅作用于组网状态目录，保留已有登录和配对配置，不修改父目录权限；路径包含链接或状态目录属于其他账户时会明确报错，请选择当前用户拥有的独立目录。
 
 自启动默认关闭，启用后使用当前用户的 Windows 登录启动项，无需管理员权限。程序将 EXE 复制到数据目录下稳定的版本路径，移动下载文件不会影响启动。手动运行新版时，会刷新同一数据目录已启用的启动项。每个 Windows 用户只有一个 Claude Bridge 启动项；从另一数据目录手动启用会替换该项，关闭时只移除属于当前目录的启动项。演示模式禁用自启动。未登录 Windows 时客户端不会运行。
 
@@ -301,6 +301,8 @@ python scripts/test-single-instance.py
 python scripts/smoke-native-http.py
 python scripts/smoke-desktop.py
 python scripts/smoke-proxy-exe.py
+# Windows 权限重启验收：从普通 PowerShell 7 运行，一次 UAC 提示仅提升隔离测试阶段：
+python scripts/test-windows-state-restart.py
 # 在 native 目录运行 Go 测试，使用开发环境中已配置的 Go：
 go test ./cmd/bridge ./netcore
 ```
@@ -309,6 +311,8 @@ go test ./cmd/bridge ./netcore
 
 测试使用合成 Claude CLI 与本机网络，覆盖加密 A/B 通道、A 端工具往返、多 A 排队及取消隔离、断线恢复、无效模型输出、DPAPI 保存、独立注册表自启动项、流式 UTF-8 分片、打包组件运行和快速退出。`test-single-instance.py` 检查新版在同一 Windows 用户下跨端口、目录、文件位置的互斥、锁权限受限时的等待与接管，以及已有窗口唤回；后续新版沿用同一锁标识，历史旧程序后启动的限制见上文。多端模拟使用打包的 `bridge-engine` 组件与各自独立的数据目录，生产桌面不提供绕过单实例限制的参数。源码/运行时白名单测试检查私有文件、缺失资源及链接路径；Windows 权限不允许创建符号链接时，相应链接回归会明确跳过。自启动测试仅写隔离 HKCU 测试键，代理测试不安装真实断网保护。
 
-上述 Python 原生检查会在退出子进程后删除本次运行创建的测试 EXE、解包运行时和配置目录；清理只允许作用于项目内独立测试目录，遇到链接目录会拒绝删除。Mihomo 验证仅保留最新一次的 `.cache/mihomo-smoke.log`，不累积测试配置和缓存。可选的 `.bridge/harness-client-fixture` 是手动安装的测试依赖，不随每次运行自动删除；不再需要时可单独移除。普通开发控制台的 `.bridge` 可能含真实配对和配置，不能将整个目录当测试残留清空。
+`test-windows-state-restart.py` 使用同一账号的真实高权限、普通权限进程，验证管理员初始化后未启动 Tailscale 就退出，再以普通权限重新打开并读取保存状态。测试拒绝缺失或跳过的阶段，检查所有者、权限、父目录及状态内容；仅使用隔离合成数据，不连接真实私网，在 `.cache/validation` 保留回执供检查。
+
+除上述保留回执的权限测试外，Python 原生检查会在退出子进程后删除本次运行创建的测试 EXE、解包运行时和配置目录；清理只允许作用于项目内独立测试目录，遇到链接目录会拒绝删除。Mihomo 验证仅保留最新一次的 `.cache/mihomo-smoke.log`，不累积测试配置和缓存。可选的 `.bridge/harness-client-fixture` 是手动安装的测试依赖，不随每次运行自动删除；不再需要时可单独移除。普通开发控制台的 `.bridge` 可能含真实配对和配置，不能将整个目录当测试残留清空。
 
 **真实 Pro/Max 登录后的结构化模型质量、Harness 实际安装的多轮工具行为及跨城市直连/中转，仍需在实际电脑上验证。** 合成 CLI 和模拟 EXE 测试不能证明真实订阅调用已经通过；本开发环境没有代为授权账号或调用真实模型。

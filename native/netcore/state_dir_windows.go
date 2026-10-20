@@ -37,6 +37,7 @@ func prepareStateDir(stateDir string) error {
 		}
 	}
 	var directory windows.Handle
+	var directoryInfo windows.ByHandleFileInformation
 	for i := len(ancestors) - 1; i >= 0; i-- {
 		path := ancestors[i]
 		name, err := windows.UTF16PtrFromString(path)
@@ -74,6 +75,7 @@ func prepareStateDir(stateDir string) error {
 			return fmt.Errorf("private network state path is not a directory: %s", path)
 		}
 		directory = handle
+		directoryInfo = info
 	}
 	sd, err := windows.GetSecurityInfo(directory, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 	if err != nil {
@@ -105,6 +107,37 @@ func prepareStateDir(stateDir string) error {
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil); err != nil {
 		return fmt.Errorf("secure private network state directory %q: %w", stateDir, err)
+	}
+	if !owner.Equals(user.User.Sid) {
+		// Elevated creation commonly assigns Administrators as owner. Normalize
+		// it now, before tsnet starts, so a later normal UAC token can reopen it.
+		// Reopen only after granting Full Control: a user-owned Modify directory
+		// must not require WRITE_OWNER before its DACL has been repaired.
+		name, err := windows.UTF16PtrFromString(stateDir)
+		if err != nil {
+			return err
+		}
+		ownerHandle, err := windows.CreateFile(name, windows.WRITE_OWNER|windows.FILE_READ_ATTRIBUTES,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING,
+			windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if err != nil {
+			return fmt.Errorf("open private network state directory to normalize its owner: %w", err)
+		}
+		defer windows.CloseHandle(ownerHandle)
+		var reopened windows.ByHandleFileInformation
+		if err := windows.GetFileInformationByHandle(ownerHandle, &reopened); err != nil {
+			return fmt.Errorf("verify private network state directory before normalizing its owner: %w", err)
+		}
+		if reopened.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 ||
+			reopened.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+			reopened.VolumeSerialNumber != directoryInfo.VolumeSerialNumber ||
+			reopened.FileIndexHigh != directoryInfo.FileIndexHigh || reopened.FileIndexLow != directoryInfo.FileIndexLow {
+			return fmt.Errorf("private network state directory changed before normalizing its owner: %s", stateDir)
+		}
+		if err := windows.SetSecurityInfo(ownerHandle, windows.SE_FILE_OBJECT,
+			windows.OWNER_SECURITY_INFORMATION, user.User.Sid, nil, nil, nil); err != nil {
+			return fmt.Errorf("normalize private network state directory owner for normal Windows restarts: %w", err)
+		}
 	}
 	return nil
 }
