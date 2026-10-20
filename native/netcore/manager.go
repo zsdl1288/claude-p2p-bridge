@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -58,7 +57,7 @@ func New(config Config) (*Manager, error) {
 	if !filepath.IsAbs(config.StateDir) {
 		return nil, errors.New("stateDir must be absolute")
 	}
-	if err := os.MkdirAll(config.StateDir, 0700); err != nil {
+	if err := prepareStateDir(config.StateDir); err != nil {
 		return nil, err
 	}
 	hostname := regexp.MustCompile(`[^a-zA-Z0-9-]+`).ReplaceAllString(config.Hostname, "-")
