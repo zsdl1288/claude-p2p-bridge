@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.1.1
+# Claude Bridge · Windows 桌面托盘版 v1.1.2
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,9 +8,9 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.1.1-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.1.2-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.1.1.zip`，不含本机账号、配对或 API Token。
+桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.1.2.zip`，不含本机账号、配对或 API Token。
 
 ## 使用方法
 
@@ -61,7 +61,7 @@ A 应用 → Clash TUN → A 本机带密码的 SOCKS5 → Tailscale → B → �
 1. 将同一最新版 EXE 复制到两端，在原 Windows 用户下沿用配对。
 2. B 打开“网络代理”，点击“开启共享本机网络”。网络共享默认关闭，和 Claude 服务独立。该页列出已配对调用端，区分“已配对在线”和“正在使用共享”，显示各设备的活动连接和流量；私网在线节点不会自动成为代理使用者。
 3. A 打开“网络代理”，该页仅显示本机及已配对 B 的连接情况。点击“启用本地 Clash 节点”，复制“完整配置订阅”。订阅位于 A 的 `127.0.0.1`，需要 A 客户端持续运行；它不是 B 的公网地址。
-4. 在使用 Mihomo / Clash Meta 内核的客户端中导入该 URL 作为**完整配置**，切换到该配置并开启 TUN；不需要另开“系统代理”。不能只把节点合并进一份已有的直连分流配置。配置生成的虚拟网卡名是 `ClaudeBridgeTun`，组网自举也识别 Clash Verge 默认的 `Mihomo` 网卡名。已验证 Mihomo v1.19.32 的订阅协议；Clash Verge 的实际 TUN 联动仍需在 A/B 测试机验收。
+4. 在使用 Mihomo / Clash Meta 内核的客户端中导入该 URL 作为**完整配置**，切换到该配置，保持“规则”模式并开启 TUN；不需要另开“系统代理”。“代理”页显示“通过 B 上网”代理组，其中仅有“B 网络出口”节点；旧订阅更新并重新激活后即可显示。不能只把节点合并进一份已有的直连分流配置，也不要改用“全局”模式绕过组网进程的规则。配置生成的虚拟网卡名是 `ClaudeBridgeTun`，组网自举也识别 Clash Verge 默认的 `Mihomo` 网卡名。已验证 Mihomo v1.19.32 的订阅协议；Clash Verge 的实际 TUN 联动仍需在 A/B 测试机验收。
 
 完整配置将互联网流量固定到 B，不包含 `DIRECT` 回退；DNS 使用经 B 的 DoH，IPv4/IPv6 均纳入 TUN。仅回环流量和网络核心自身的组网连接绕过代理，避免回环。默认不设置国内网站直连或局域网直连规则。B 的代理拒绝本机、私网、链路本地和其他特殊目标地址；域名在 B 解析并检查实际拨号地址，避免无意暴露 B 的内网服务。
 

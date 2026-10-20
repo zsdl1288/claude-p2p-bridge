@@ -4,6 +4,7 @@ import { digest, encodeInvitation, parseInvitation } from './crypto.js';
 import { atomicWrite } from './storage.js';
 
 const NODE = 'B 网络出口';
+const GROUP = '通过 B 上网';
 
 // JSON is a YAML 1.2 subset accepted by Mihomo. No executable scripts or
 // third-party subscription converters are involved in generating a profile.
@@ -23,12 +24,15 @@ export function clashProfile({ port, username, password, helperName = 'bridge-ne
       nameserver: [`https://1.1.1.1/dns-query#${NODE}`, `https://1.0.0.1/dns-query#${NODE}`],
       'proxy-server-nameserver': [`https://1.1.1.1/dns-query#${NODE}`] },
     proxies: [node],
+    // Clash Verge's rule-mode page renders groups rather than bare nodes.
+    // A single fixed member keeps the UI usable without a direct fallback.
+    'proxy-groups': [{ name: GROUP, type: 'select', proxies: [NODE] }],
     // Loopback subscription/proxy access remains local. The ONLY Internet
     // exception is the embedded transport, which must not tunnel into itself.
     rules: [`PROCESS-NAME,${system ? 'tailscaled.exe' : helperName},DIRECT`,
       ...(system ? ['IP-CIDR,100.64.0.0/10,DIRECT,no-resolve'] : []),
       'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve', 'IP-CIDR6,::1/128,DIRECT,no-resolve',
-      `MATCH,${NODE}`]
+      `MATCH,${GROUP}`]
   };
 }
 

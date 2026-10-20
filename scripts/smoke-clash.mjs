@@ -86,12 +86,22 @@ try {
   await new Promise((resolve, reject) => { udpEcho.once('error', reject); udpEcho.bind(0, '127.0.0.1', resolve); });
   const port = await availablePort();
   const config = clashProfile({ port: a.networkProxy.port, username: a.networkProxy.username, password: a.networkProxy.password });
+  const controllerPort = await availablePort();
   // Runtime check uses only loopback, never Internet DNS or OS network changes.
   config.tun.enable = false; config.dns.enable = false; config['mixed-port'] = port;
-  config['find-process-mode'] = 'off'; config.rules = ['MATCH,B 网络出口'];
+  config['find-process-mode'] = 'off'; config.rules = [config.rules.at(-1)];
+  config['external-controller'] = `127.0.0.1:${controllerPort}`; config.secret = 'isolated-mihomo-smoke';
   const file = path.join(runtime, 'loopback.yaml'); await writeFile(file, JSON.stringify(config, null, 2));
   launch(['-f', file, '-d', runtime]);
-  await until(() => /mixed.*listening/i.test(log));
+  await until(() => /mixed.*listening/i.test(log) && /RESTful API listening/i.test(log));
+  const response = await fetch(`http://127.0.0.1:${controllerPort}/proxies`, {
+    headers: { Authorization: `Bearer ${config.secret}` }, signal
+  });
+  assert.equal(response.status, 200);
+  const { proxies } = await response.json(), group = proxies['通过 B 上网'];
+  assert.equal(group.type, 'Selector'); assert.deepEqual(group.all, ['B 网络出口']);
+  assert.equal(group.now, 'B 网络出口');
+  console.log('Rule-mode group visible to clients with only the B exit node: PASS');
   async function checkTcp() {
     const payload = Buffer.from('mihomo-tcp-through-B');
     const tcp = await socks(port, 1, { host: '127.0.0.1', port: echo.address().port });

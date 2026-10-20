@@ -47,8 +47,8 @@ test('generated complete Clash profile routes Internet and DNS through B without
   assert.equal(config.tun['auto-route'], true); assert.equal(config['allow-lan'], false);
   assert.equal(config.ipv6, true); assert.equal(config.dns.ipv6, true);
   assert.deepEqual(config.proxies, [{ name: 'B 网络出口', type: 'socks5', server: '127.0.0.1', port: 12345, username: 'user', password: 'secret', udp: true }]);
-  assert.equal(config.rules.at(-1), 'MATCH,B 网络出口');
-  assert.equal(config['proxy-groups'], undefined);
+  assert.deepEqual(config['proxy-groups'], [{ name: '通过 B 上网', type: 'select', proxies: ['B 网络出口'] }]);
+  assert.equal(config.rules.at(-1), 'MATCH,通过 B 上网');
   assert.equal(config.sniffer, undefined); assert.equal(config.dns['nameserver-policy'], undefined);
   for (const resolver of [...config.dns.nameserver, ...config.dns['proxy-server-nameserver']]) assert.match(resolver, /#B 网络出口$/);
   assert.ok(config.rules.includes('PROCESS-NAME,bridge-net.exe,DIRECT'));
@@ -68,7 +68,8 @@ test('subscription URLs authenticate independently, reject cross-origin access a
   assert.equal(status.state, 'ready'); assert.equal(status.online, true); assert.ok(status.subscriptionUrl);
   const response = await fetch(status.subscriptionUrl); assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type'), /application\/yaml/); assert.equal(response.headers.get('cache-control'), 'no-store');
-  const config = await response.json(); assert.equal(config.proxies[0].port, status.port); assert.equal(config.rules.at(-1), 'MATCH,B 网络出口');
+  const config = await response.json(); assert.equal(config.proxies[0].port, status.port); assert.equal(config.rules.at(-1), 'MATCH,通过 B 上网');
+  assert.deepEqual(config['proxy-groups'], [{ name: '通过 B 上网', type: 'select', proxies: [config.proxies[0].name] }]);
   const nodes = await (await fetch(status.subscriptionUrl.replace('config.yaml', 'nodes.yaml'))).json();
   assert.deepEqual(nodes, { proxies: config.proxies });
   const invalid = status.subscriptionUrl.replace(a.app.proxy.subscriptionToken, 'a'.repeat(43)); assert.equal((await fetch(invalid)).status, 401);
@@ -194,9 +195,11 @@ test('capacity rejections remain visible through both status APIs without blocki
 test('B outage retains importable subscription, blocks local node and reconnects with a fresh session', { timeout: 15000 }, async (t) => {
   const fixture = await paired(t), { host, client, a, hostInput } = fixture; await enable(fixture);
   const subscription = a.app.proxy.status().subscriptionUrl, pairing = { ...host.peer.pairing }, session = client.peer.session;
+  const profile = await (await fetch(subscription)).json();
   client.peer.retryMs = 30; await host.stopPeer(); await until(() => !client.peer.state.online);
   const state = await (await a.request('/api/proxy')).json(); assert.equal(state.state, 'blocked'); assert.equal(state.online, false);
-  assert.equal((await fetch(subscription)).status, 200);
+  const response = await fetch(subscription); assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), profile);
   const socket = net.createConnection({ host: '127.0.0.1', port: a.app.proxy.proxy.port }); socket.on('error', () => {}); t.after(() => socket.destroy());
   await once(socket, 'close');
   await host.host({ ...hostInput, bridgePort: pairing.port }, { pairing });

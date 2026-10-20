@@ -1,6 +1,6 @@
 {
   "name": "claude-p2p-bridge",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "type": "module",
   "description": "Native C++ Windows desktop and tray client with embedded Tailscale and a local Claude Code API.",
