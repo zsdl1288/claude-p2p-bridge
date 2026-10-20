@@ -11,6 +11,12 @@ const MAX_FRAME = 128 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
 const FAILURE = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
 const CAPACITY_CODE = 'PROXY_CAPACITY';
 const CAPACITY_MESSAGE = '代理连接数已达上限，请等待空闲连接释放后重试';
+const DIAGNOSTIC_ACTIVE_LIMIT = 128, DIAGNOSTIC_CLOSED_LIMIT = 32, DIAGNOSTIC_CLOSED_MS = 120000;
+const diagnosticReasons = new Set(['backpressure-timeout', 'heartbeat-write-timeout', 'heartbeat-timeout']);
+const diagnosticNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value)) : null;
+const diagnosticBoolean = (value) => typeof value === 'boolean' ? value : null;
+const diagnosticAge = (now, at) => typeof at === 'number' && Number.isFinite(at) ? diagnosticNumber(Math.max(0, now - at)) : null;
+const diagnosticAdd = (value, bytes) => Math.min(Number.MAX_SAFE_INTEGER, value + bytes);
 
 // Zero means no fixed connection count; combine only explicitly bounded limits.
 function connectionLimit(...limits) {
@@ -92,7 +98,7 @@ function udpKey(host, port) { return `${net.isIP(host) === 6 ? ipv6Bytes(host).t
 export class NetworkProxy extends EventEmitter {
   constructor({ bridge, listenPort = 0, username = randomId(12), password = randomId(24), allowPrivateTargets = false,
     maxConnections = 0, maxPerSession = 0, maxUdpTargets = 128, bytesPerSecond = 32 * 1024 * 1024,
-    handshakeMs = 10000, heartbeatMs = 10000, backpressureMs = 120000, udpIdleMs = 60000, resolve = lookup } = {}) {
+    handshakeMs = 10000, heartbeatMs = 10000, backpressureMs = 120000, udpIdleMs = 60000, resolve = lookup, diagnosticsEnabled = false } = {}) {
     super();
     if (!bridge) throw new Error('缺少桥接实例');
     if (!Number.isInteger(listenPort) || listenPort < 0 || listenPort > 65535) throw new Error('代理端口无效');
@@ -102,6 +108,8 @@ export class NetworkProxy extends EventEmitter {
     this.enabled = false; this.sharing = false; this.flows = new Set(); this.localSockets = new Set();
     this.sessionBuckets = new WeakMap();
     this.uploadBytes = 0; this.downloadBytes = 0; this.error = null; this.lastError = null;
+    this.diagnosticsEnabled = diagnosticsEnabled === true;
+    this.diagnosticSequence = 0; this.diagnosticClosed = [];
     this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME, perMessageDeflate: false });
     this.onPeerState = () => this.prune();
     this.bridge.on?.('state', this.onPeerState);
@@ -140,6 +148,56 @@ export class NetworkProxy extends EventEmitter {
       sessionConnectionLimit: this.maxPerSession, lastError: this.lastError,
       uploadBytes: this.uploadBytes, downloadBytes: this.downloadBytes, clients, error: this.error };
   }
+  // Only explicitly enabled TCP flows are observed. Never serialize status(),
+  // flow, socket, errors or payloads: all of those can contain private details.
+  // DATA callback completion means a local write, not receipt by A. On clients,
+  // early SOCKS bytes can be sent before sourceReadBytes begins counting.
+  // pendingDataAgeMs measures the current pending batch; closed ages freeze at close.
+  diagnosticFlow(flow, now) {
+    const data = flow.diagnostics, socket = data.socket, ws = flow.ws, control = flow.diagnosticControl();
+    const side = flow.side === 'host' ? 'host' : flow.side === 'client' ? 'client' : 'unknown';
+    return {
+      flowId: diagnosticNumber(data.id), side, sourceToWsDirection: side === 'host' ? 'download' : side === 'client' ? 'upload' : 'unknown',
+      ageMs: diagnosticAge(now, data.createdAt),
+      sourceReadBytes: diagnosticNumber(data.sourceReadBytes), lastReadAgoMs: diagnosticAge(now, data.lastReadAt),
+      wsWriteCompletedBytes: diagnosticNumber(data.wsWriteCompletedBytes), lastDoneAgoMs: diagnosticAge(now, data.lastDoneAt),
+      pendingDataFrames: diagnosticNumber(data.pendingDataFrames), pendingDataBytes: diagnosticNumber(data.pendingDataBytes),
+      pendingDataAgeMs: diagnosticAge(now, data.pendingDataAt),
+      receivedPayloadBytes: diagnosticNumber(data.receivedPayloadBytes), lastReceivedAgoMs: diagnosticAge(now, data.lastReceivedAt),
+      tcpPaused: diagnosticBoolean(socket.isPaused()), sourcePausedForMs: diagnosticAge(now, data.sourcePausedAt),
+      tcpReadableLength: diagnosticNumber(socket.readableLength), tcpWritableLength: diagnosticNumber(socket.writableLength),
+      tcpNeedDrain: diagnosticBoolean(socket.writableNeedDrain), tcpReadableEnded: diagnosticBoolean(socket.readableEnded),
+      tcpWritableEnded: diagnosticBoolean(socket.writableEnded), tcpWritableFinished: diagnosticBoolean(socket.writableFinished),
+      tcpDestroyed: diagnosticBoolean(socket.destroyed),
+      wsReadyState: Number.isInteger(ws.readyState) && ws.readyState >= 0 && ws.readyState <= 3 ? ws.readyState : null,
+      wsBufferedAmount: diagnosticNumber(ws.bufferedAmount), wsReceivePaused: diagnosticBoolean(ws.isPaused),
+      receivePausedForMs: diagnosticAge(now, control.pausedAt), controlWritePendingForMs: diagnosticAge(now, control.controlWriteAt),
+      wsSocketReadableLength: diagnosticNumber(ws._socket?.readableLength), wsSocketWritableLength: diagnosticNumber(ws._socket?.writableLength),
+      wsSocketNeedDrain: diagnosticBoolean(ws._socket?.writableNeedDrain),
+      wsSocketReadPaused: typeof ws._socket?.isPaused === 'function' ? diagnosticBoolean(ws._socket.isPaused()) : null
+    };
+  }
+  pruneDiagnosticClosed(now) {
+    while (this.diagnosticClosed.length && now - this.diagnosticClosed[0].at >= DIAGNOSTIC_CLOSED_MS) this.diagnosticClosed.shift();
+  }
+  diagnostics() {
+    if (!this.diagnosticsEnabled) return undefined;
+    const now = performance.now(), active = []; let activeCount = 0;
+    this.pruneDiagnosticClosed(now);
+    for (const flow of this.flows) if (flow.diagnostics && !flow.dead) {
+      activeCount++;
+      if (active.length < DIAGNOSTIC_ACTIVE_LIMIT) active.push(this.diagnosticFlow(flow, now));
+    }
+    return { scope: 'process', activeCount, truncated: Math.max(0, activeCount - active.length), active,
+      closed: this.diagnosticClosed.map(({ at, snapshot }) => ({ ...snapshot, closedAgoMs: diagnosticAge(now, at) })) };
+  }
+  closeDiagnosticFlow(flow, reason) {
+    if (!flow.diagnostics) return;
+    const now = performance.now();
+    this.pruneDiagnosticClosed(now);
+    this.diagnosticClosed.push({ at: now, snapshot: { ...this.diagnosticFlow(flow, now), closeReason: diagnosticReasons.has(reason) ? reason : 'closed' } });
+    if (this.diagnosticClosed.length > DIAGNOSTIC_CLOSED_LIMIT) this.diagnosticClosed.shift();
+  }
   capacityError() {
     const first = this.lastError?.code !== CAPACITY_CODE;
     this.lastError = { code: CAPACITY_CODE, message: CAPACITY_MESSAGE, at: new Date().toISOString() };
@@ -172,6 +230,7 @@ export class NetworkProxy extends EventEmitter {
     flow.close = (graceful = false, reason) => {
       if (flow.dead) return; flow.dead = true;
       flow.closeReason = reason;
+      this.closeDiagnosticFlow(flow, reason);
       for (const timer of flow.timers) { clearTimeout(timer); clearInterval(timer); }
       for (const resource of flow.resources) {
         if (resource instanceof net.Socket) {
@@ -188,6 +247,7 @@ export class NetworkProxy extends EventEmitter {
     };
     ws.on('error', () => flow.close()); ws.on('close', (code) => flow.close(code === 1000));
     let probe = null, controlWrite = null, pausedAt = null;
+    if (this.diagnosticsEnabled) flow.diagnosticControl = () => ({ pausedAt, controlWriteAt: controlWrite?.at ?? null });
     const activity = () => { probe = null; };
     ws.on('message', activity); ws.on('ping', activity); ws.on('pong', activity);
     const keepAlive = (ping) => {
@@ -249,7 +309,20 @@ export class NetworkProxy extends EventEmitter {
   }
   send(flow, frame, outgoing = true, callback) {
     if (!this.account(flow, frame.length, outgoing) || flow.ws.readyState !== WebSocket.OPEN) return false;
-    flow.ws.send(frame, (error) => { if (error) flow.close(); else callback?.(); }); return true;
+    const diagnostics = flow.diagnostics, bytes = diagnostics && frame[0] === DATA ? frame.length - 1 : null;
+    if (bytes !== null) {
+      if (!diagnostics.pendingDataFrames) diagnostics.pendingDataAt = performance.now();
+      diagnostics.pendingDataFrames++; diagnostics.pendingDataBytes = diagnosticAdd(diagnostics.pendingDataBytes, bytes);
+    }
+    flow.ws.send(frame, (error) => {
+      if (bytes !== null) {
+        diagnostics.pendingDataFrames = Math.max(0, diagnostics.pendingDataFrames - 1);
+        diagnostics.pendingDataBytes = Math.max(0, diagnostics.pendingDataBytes - bytes);
+        if (!diagnostics.pendingDataFrames) diagnostics.pendingDataAt = null;
+        if (!error) { diagnostics.wsWriteCompletedBytes = diagnosticAdd(diagnostics.wsWriteCompletedBytes, bytes); diagnostics.lastDoneAt = performance.now(); }
+      }
+      if (error) flow.close(); else callback?.();
+    }); return true;
   }
   async destination(host, port) {
     if (typeof host !== 'string' || host.length > 253 || host.includes('%') || /[\s/\\\0]/.test(host) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('目标地址无效');
@@ -308,13 +381,20 @@ export class NetworkProxy extends EventEmitter {
     this.pipeTcp(flow, socket);
   }
   pipeTcp(flow, socket) {
+    const diagnostics = this.diagnosticsEnabled ? (flow.diagnostics = { socket, id: ++this.diagnosticSequence, createdAt: performance.now(),
+      sourceReadBytes: 0, lastReadAt: null, wsWriteCompletedBytes: 0, lastDoneAt: null,
+      pendingDataFrames: 0, pendingDataBytes: 0, pendingDataAt: null, sourcePausedAt: null,
+      receivedPayloadBytes: 0, lastReceivedAt: null }) : null;
     socket.setNoDelay(true);
     socket.on('data', (data) => {
       socket.pause();
+      if (diagnostics) { diagnostics.sourceReadBytes = diagnosticAdd(diagnostics.sourceReadBytes, data.length); diagnostics.lastReadAt = diagnostics.sourcePausedAt = performance.now(); }
       const chunks = [];
       for (let offset = 0; offset < data.length; offset += 64 * 1024) chunks.push(Buffer.concat([Buffer.from([DATA]), data.subarray(offset, offset + 64 * 1024)]));
       let remaining = chunks.length;
-      for (const frame of chunks) if (!this.send(flow, frame, flow.side === 'client', () => { if (!--remaining && !flow.dead) socket.resume(); })) break;
+      for (const frame of chunks) if (!this.send(flow, frame, flow.side === 'client', () => {
+        if (!--remaining && !flow.dead) { if (diagnostics) diagnostics.sourcePausedAt = null; socket.resume(); }
+      })) break;
     });
     socket.on('end', () => this.send(flow, Buffer.from([FIN]), flow.side === 'client'));
     socket.on('error', () => flow.close());
@@ -324,7 +404,10 @@ export class NetworkProxy extends EventEmitter {
     const receive = (frame, binary) => {
       if (!binary || !frame.length || !this.account(flow, frame.length, flow.side === 'host')) return flow.close();
       if (frame[0] === FIN && frame.length === 1 && !ended) { ended = true; flow.remoteEnded = true; socket.end(); }
-      else if (frame[0] === DATA && !ended && frame.length > 1) { if (!socket.write(frame.subarray(1))) flow.pauseReceive(); }
+      else if (frame[0] === DATA && !ended && frame.length > 1) {
+        if (diagnostics) { diagnostics.receivedPayloadBytes = diagnosticAdd(diagnostics.receivedPayloadBytes, frame.length - 1); diagnostics.lastReceivedAt = performance.now(); }
+        if (!socket.write(frame.subarray(1))) flow.pauseReceive();
+      }
       else flow.close();
     };
     this.receiveFrames(flow, receive);

@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from scripts import build_support, windows_underlay
 
@@ -122,6 +122,56 @@ func defaultRoute() {}
         names = {file.relative_to(build_support.ROOT).as_posix() for file in build_support.source_files()}
         self.assertTrue({'scripts/windows_underlay.py', 'native/_windows_underlay/netmon/underlay_windows.go',
                          'native/_windows_underlay/netmon/underlay_windows_test.go', 'test/test_windows_underlay.py'} <= names)
+
+
+class PublishDirectoryTests(unittest.TestCase):
+    @staticmethod
+    def permission_error(code=None):
+        error = PermissionError('fixture access denied')
+        if code is not None:
+            error.winerror = code
+        return error
+
+    def test_temporary_windows_sharing_failure_is_retried_then_succeeds(self):
+        for code in (5, 32):
+            with self.subTest(winerror=code):
+                staging, destination = Mock(), object()
+                staging.rename.side_effect = [self.permission_error(code), None]
+                with patch.object(windows_underlay.sys, 'platform', 'win32'), \
+                        patch.object(windows_underlay.time, 'sleep') as sleep:
+                    windows_underlay.publish_directory(staging, destination)
+                self.assertEqual(staging.rename.call_args_list, [call(destination)] * 2)
+                sleep.assert_called_once_with(0.05)
+
+    def test_permanent_windows_denial_is_bounded_and_propagates(self):
+        staging, destination = Mock(), object()
+        error = self.permission_error(5)
+        staging.rename.side_effect = error
+        with patch.object(windows_underlay.sys, 'platform', 'win32'), \
+                patch.object(windows_underlay.time, 'sleep') as sleep:
+            with self.assertRaises(PermissionError) as raised:
+                windows_underlay.publish_directory(staging, destination)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(staging.rename.call_args_list, [call(destination)] * 6)
+        self.assertEqual(sleep.call_args_list, [call(0.05 * attempt) for attempt in range(1, 6)])
+        self.assertLessEqual(sum(args.args[0] for args in sleep.call_args_list), 0.75)
+        self.assertEqual(staging.mock_calls, [call.rename(destination)] * 6)
+
+    def test_other_errors_and_non_windows_fail_without_retry(self):
+        other = OSError('fixture I/O error')
+        other.winerror = 5
+        for platform, error in [('win32', self.permission_error()), ('win32', self.permission_error(13)),
+                                ('win32', other), ('linux', self.permission_error(5))]:
+            with self.subTest(platform=platform, error=type(error), winerror=getattr(error, 'winerror', None)):
+                staging, destination = Mock(), object()
+                staging.rename.side_effect = error
+                with patch.object(windows_underlay.sys, 'platform', platform), \
+                        patch.object(windows_underlay.time, 'sleep') as sleep:
+                    with self.assertRaises(type(error)) as raised:
+                        windows_underlay.publish_directory(staging, destination)
+                self.assertIs(raised.exception, error)
+                staging.rename.assert_called_once_with(destination)
+                sleep.assert_not_called()
 
 
 if __name__ == '__main__':

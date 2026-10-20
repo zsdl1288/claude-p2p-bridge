@@ -49,6 +49,26 @@ test('network diagnostics only forwards an embedded snapshot and never polls or 
   assert.equal(reads, 1);
 });
 
+test('opt-in flow diagnostics adds only a read-only projection without mutating the native snapshot or API authorization', async (t) => {
+  const native = Object.freeze({ available: true, source: 'embedded', scope: 'node', capturedAt: '2026-10-20T12:34:56Z', netstack: {}, transport: [] });
+  let reads = 0;
+  const bridge = new Bridge({ networkAdapter: { embedded: true, async diagnostics() { reads++; return native; } },
+    networkProvider: () => { throw new Error('Must not poll or connect'); }, proxyOptions: { diagnosticsEnabled: true } });
+  const app = createLocalServer({ port: 0, token: 'private-flow-fixture-token', bridge });
+  t.after(() => app.close());
+  const address = await app.listen(), url = `http://127.0.0.1:${address.port}/api/network/diagnostics`;
+  assert.equal((await fetch(url)).status, 401);
+  assert.equal((await fetch(url, { headers: { Authorization: 'Bearer wrong-token' } })).status, 401);
+  assert.equal(reads, 0);
+  const before = bridge.status(); let events = 0; bridge.on('state', () => events++);
+  const response = await fetch(url, { headers: { Authorization: 'Bearer private-flow-fixture-token' } });
+  assert.equal(response.status, 200);
+  const combined = await response.json();
+  assert.deepEqual(combined, { ...native, proxyFlows: { scope: 'process', activeCount: 0, truncated: 0, active: [], closed: [] } });
+  assert.equal(Object.hasOwn(native, 'proxyFlows'), false); assert.equal(reads, 1); assert.equal(events, 0);
+  assert.deepEqual(bridge.status(), before);
+});
+
 test('request validation fixes the B-side workspace, tools and process arguments', () => {
   assert.throws(() => validateRequest({ prompt: '' }));
   assert.throws(() => validateRequest({ prompt: 'ok', model: '--dangerously-skip-permissions' }));

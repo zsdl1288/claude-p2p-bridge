@@ -51,6 +51,18 @@ func TestDiagnosticsReadsRealNetstackExpVarWithoutStartingNetwork(t *testing.T) 
 			t.Fatalf("unstarted in-memory stack has nonzero %s: %d", name, value)
 		}
 	}
+	var ids tcpFlowIDs
+	tcp, err := ids.snapshot(context.Background(), ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, extended := any(ns).(interface{ BridgeTCPEndpoints(int) []any }); extended {
+		if tcp == nil || !tcp.Available || len(tcp.Flows) != 0 {
+			t.Fatal("diagnostic shadow must expose an empty passive TCP snapshot", tcp)
+		}
+	} else if tcp != nil {
+		t.Fatal("normal dependency must not expose a TCP snapshot", tcp)
+	}
 }
 
 func diagnosticExpVarFixture() *metrics.Set {

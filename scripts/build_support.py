@@ -14,12 +14,23 @@ if not re.fullmatch(r'\d+\.\d+\.\d+', VERSION):
     raise ValueError('Release version must contain three numeric components')
 
 
-def go_environment(*, offline=True, underlay_policy=True):
+def go_environment(*, offline=True, underlay_policy=True, tcp_diagnostics=None):
     env = os.environ.copy()
     env.update(GOPATH=str(ROOT / '.cache/go'), GOMODCACHE=str(ROOT / '.cache/gomod'),
                GOCACHE=str(ROOT / '.cache/gobuild'), CGO_ENABLED='0',
                GOPROXY='off' if offline else 'https://proxy.golang.org,direct')
+    # Only --diagnostics opts in. The marker propagates that explicit choice
+    # to nested prepare-windows.py calls; normal builds explicitly opt out.
+    diagnostics = env.get('BRIDGE_TCP_DIAGNOSTICS_BUILD') == '1' if tcp_diagnostics is None else tcp_diagnostics
+    if tcp_diagnostics is False:
+        env.pop('BRIDGE_TCP_DIAGNOSTICS_BUILD', None)
     if underlay_policy and env.get('GOOS', 'windows' if os.name == 'nt' else '') == 'windows':
+        if diagnostics:
+            try:
+                from .tcp_diagnostics import prepare_tcp_diagnostics
+            except ImportError:
+                from tcp_diagnostics import prepare_tcp_diagnostics
+            return prepare_tcp_diagnostics(ROOT, env)
         try:
             from .windows_underlay import prepare_windows_underlay
         except ImportError:

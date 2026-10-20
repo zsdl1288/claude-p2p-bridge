@@ -16,7 +16,8 @@ const token = process.env.BRIDGE_API_TOKEN || await getApiToken(directory);
 const core = new EmbeddedNetwork({ directory });
 const network = !demo && !options.systemTailscale ? core : null;
 const store = new PairingStore({ directory, protector: core, demo });
-const bridge = new ApplicationBridge({ store, directory, demo, ...(network ? { networkProvider: () => network.status(), networkAdapter: network } : {}) });
+const bridge = new ApplicationBridge({ store, directory, demo, proxyOptions: { diagnosticsEnabled: process.env.BRIDGE_FLOW_DIAGNOSTICS === '1' },
+  ...(network ? { networkProvider: () => network.status(), networkAdapter: network } : {}) });
 let stopping = false;
 const shutdown = async () => {
   if (stopping) return;

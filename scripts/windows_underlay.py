@@ -9,7 +9,9 @@ import json
 from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
+import time
 
 
 TAILSCALE_VERSION = 'v1.104.1'
@@ -26,6 +28,23 @@ def sha256(data):
 def file_manifest(directory):
     return {path.relative_to(directory).as_posix(): sha256(path.read_bytes())
             for path in sorted(directory.rglob('*')) if path.is_file()}
+
+
+def publish_directory(staging, destination):
+    """Atomically rename a verified copy, bounding Windows sharing retries.
+
+    Only retry the original rename; never delete a destination or bypass a
+    failed publish. Permanent errors propagate after six attempts; delays
+    total at most 0.75 seconds.
+    """
+    for attempt in range(6):
+        try:
+            staging.rename(destination)
+            return
+        except PermissionError as error:
+            if sys.platform != 'win32' or getattr(error, 'winerror', None) not in {5, 32} or attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def patch_selector(source):
@@ -127,7 +146,7 @@ def prepare_windows_underlay(root, env):
             if file_manifest(staging / 'tailscale.com') != shadow_manifest:
                 raise ValueError('Tailscale source changed while preparing the Windows underlay copy')
             (staging / 'receipt.json').write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n', encoding='utf-8')
-            staging.rename(cache)
+            publish_directory(staging, cache)
 
     result = env.copy()
     result['GOFLAGS'] = (flags + ' ' + own_flag).strip()

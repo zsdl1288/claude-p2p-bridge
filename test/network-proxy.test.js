@@ -185,7 +185,7 @@ test('a slow TCP reader receives all queued bytes before a normal half-close', {
 
 test('TCP backpressure across several heartbeats preserves the stream and every byte', { timeout: 10000 }, async (t) => {
   const heartbeatMs = 150, payload = Buffer.alloc(16 * 1024 * 1024, 0x63);
-  const { a, b, socks } = await setup(t, { heartbeatMs });
+  const { a, b, socks, pairing } = await setup(t, { heartbeatMs, diagnosticsEnabled: true }, { diagnosticsEnabled: true });
   a.heartbeatMs = heartbeatMs;
   const port = await tcpEcho(t, (socket) => socket.on('end', () => socket.end(payload)));
   const { socket, reader, reply } = await socks(1, { host: '127.0.0.1', port });
@@ -196,6 +196,17 @@ test('TCP backpressure across several heartbeats preserves the stream and every 
   socket.pause(); socket.end();
   await until(() => flow.localSocket.writableNeedDrain || flow.dead);
   assert.equal(flow.dead, false, 'The stream must reach real TCP backpressure before closing');
+  await until(() => b.diagnostics().active[0]?.pendingDataFrames > 0);
+  const receiving = a.diagnostics().active[0], sending = b.diagnostics().active[0];
+  assert.equal(receiving.side, 'client'); assert.equal(receiving.sourceToWsDirection, 'upload');
+  assert.equal(receiving.wsReceivePaused, true); assert.equal(receiving.tcpNeedDrain, true);
+  assert.ok(receiving.receivePausedForMs >= 0);
+  assert.equal(sending.side, 'host'); assert.equal(sending.sourceToWsDirection, 'download');
+  assert.equal(sending.tcpPaused, true); assert.ok(sending.sourceReadBytes > 0);
+  assert.ok(sending.pendingDataBytes > 0); assert.ok(sending.pendingDataAgeMs >= 0);
+  assert.ok(sending.wsBufferedAmount > 0);
+  const projected = JSON.stringify([a.diagnostics(), b.diagnostics()]);
+  for (const secret of [a.username, a.password, b.username, b.password, pairing.room, pairing.secret, '127.0.0.1']) assert.equal(projected.includes(secret), false);
   t.diagnostic(`TCP receive backpressure reached; WebSocket paused: ${flow.ws.isPaused}`);
   await delay(heartbeatMs * 4);
   if (flow.dead) t.diagnostic(`The backpressured WebSocket closed after ${closedAfterMs} ms with heartbeatMs=${heartbeatMs}`);
@@ -204,11 +215,16 @@ test('TCP backpressure across several heartbeats preserves the stream and every 
   socket.resume();
   assert.deepEqual(await reader.read(payload.length), payload);
   await until(() => a.flows.size === 0 && b.flows.size === 0);
+  const completed = b.diagnostics().closed.at(-1);
+  assert.equal(completed.flowId, sending.flowId);
+  assert.equal(completed.sourceReadBytes, payload.length); assert.equal(completed.wsWriteCompletedBytes, payload.length);
+  assert.equal(completed.pendingDataFrames, 0); assert.equal(completed.pendingDataBytes, 0); assert.equal(completed.pendingDataAgeMs, null);
+  assert.ok(completed.lastDoneAgoMs >= 0); assert.ok(completed.closedAgoMs >= 0);
 });
 
 test('TCP backpressure that never drains releases its flow after the configured deadline', { timeout: 5000 }, async (t) => {
   const heartbeatMs = 100, backpressureMs = 500, payload = Buffer.alloc(16 * 1024 * 1024, 0x64);
-  const { a, b, socks } = await setup(t, { heartbeatMs, backpressureMs });
+  const { a, b, socks } = await setup(t, { heartbeatMs, backpressureMs, diagnosticsEnabled: true }, { diagnosticsEnabled: true });
   a.heartbeatMs = heartbeatMs; a.backpressureMs = backpressureMs;
   const port = await tcpEcho(t, (socket) => socket.on('end', () => socket.end(payload)));
   const { socket, reply } = await socks(1, { host: '127.0.0.1', port });
@@ -223,6 +239,10 @@ test('TCP backpressure that never drains releases its flow after the configured 
   await until(() => flow.dead);
   assert.equal(flow.closeReason, 'backpressure-timeout');
   await until(() => a.flows.size === 0 && b.flows.size === 0 && a.localSockets.size === 0);
+  const closed = a.diagnostics().closed.at(-1);
+  assert.equal(closed.closeReason, 'backpressure-timeout'); assert.equal(closed.wsReceivePaused, true);
+  assert.ok(closed.receivePausedForMs >= backpressureMs);
+  assert.equal(closed.tcpDestroyed, false, 'The closed summary must capture queues before destroying its socket');
 });
 
 test('proxy heartbeat still closes a real WebSocket peer that never answers ping', { timeout: 5000 }, async (t) => {
@@ -247,9 +267,11 @@ test('proxy heartbeat still closes a real WebSocket peer that never answers ping
 
 test('UDP ASSOCIATE relays real datagrams, resolves names on B and pins local source port', { timeout: 10000 }, async (t) => {
   let lookups = 0;
-  const { socks } = await setup(t, { resolve: async (name) => { assert.equal(name, 'dns.example'); lookups++; return [{ address: '127.0.0.1', family: 4 }]; } });
+  const { a, b, socks } = await setup(t, { diagnosticsEnabled: true, resolve: async (name) => { assert.equal(name, 'dns.example'); lookups++; return [{ address: '127.0.0.1', family: 4 }]; } }, { diagnosticsEnabled: true });
   const port = await udpEcho(t), udp = await udpClient(t), rogue = await udpClient(t);
   const association = await socks(3, { host: '0.0.0.0', port: 0 }); assert.equal(association.reply[1], 0);
+  assert.equal(a.flows.size, 1); assert.equal(b.flows.size, 1);
+  assert.deepEqual(a.diagnostics().active, []); assert.deepEqual(b.diagnostics().active, []);
   const send = (socket, text) => socket.send(Buffer.concat([Buffer.from([0, 0, 0]), encodeSocksAddress('dns.example', port), Buffer.from(text)]), association.address.port, '127.0.0.1');
   let result = once(udp, 'message'); send(udp, 'dns-query');
   let [reply] = await result, target = decodeSocksAddress(reply, 3);

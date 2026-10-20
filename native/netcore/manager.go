@@ -43,14 +43,15 @@ type Resource struct {
 	Port int    `json:"port"`
 }
 type Manager struct {
-	mu        sync.Mutex
-	startMu   sync.Mutex
-	config    Config
-	server    *tsnet.Server
-	started   bool
-	closed    bool
-	authURL   string
-	resources map[string]*proxy
+	mu         sync.Mutex
+	startMu    sync.Mutex
+	config     Config
+	server     *tsnet.Server
+	started    bool
+	closed     bool
+	authURL    string
+	resources  map[string]*proxy
+	tcpFlowIDs tcpFlowIDs // guarded by startMu; diagnostics-only anonymous identities
 }
 
 func New(config Config) (*Manager, error) {
@@ -351,6 +352,7 @@ func (m *Manager) Release(id string) {
 func (m *Manager) Close() {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
+	m.tcpFlowIDs.ids = nil
 	m.mu.Lock()
 	m.closed = true
 	started := m.started

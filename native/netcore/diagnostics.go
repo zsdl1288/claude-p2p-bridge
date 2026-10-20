@@ -21,6 +21,7 @@ type Diagnostics struct {
 	Netstack   map[string]uint64      `json:"netstack"`
 	Transport  []TransportDiagnostics `json:"transport"`
 	Message    string                 `json:"message,omitempty"`
+	TCP        *TCPDiagnostics        `json:"tcp,omitempty"`
 }
 
 type TransportDiagnostics struct {
@@ -154,10 +155,15 @@ func (m *Manager) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
+	tcp, err := m.tcpFlowIDs.snapshot(ctx, ns)
+	if err != nil {
+		return result, err
+	}
 	result.Available = true
 	result.CapturedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	result.Netstack = netstack
 	result.Transport = transport
+	result.TCP = tcp
 	return result, nil
 }
 

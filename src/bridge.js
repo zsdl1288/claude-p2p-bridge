@@ -56,8 +56,10 @@ export class Bridge extends EventEmitter {
   }
   networkStatus() { return this.network ? { ...this.network, devices: networkDevices(this.network, this.networkIdentity()) } : null; }
   async networkDiagnostics() {
-    if (!this.demo && this.networkAdapter?.embedded === true && typeof this.networkAdapter.diagnostics === 'function') return this.networkAdapter.diagnostics();
-    return { available: false, source: 'embedded', scope: 'node', capturedAt: new Date().toISOString(), netstack: {}, transport: [], message: '当前模式不提供内置组网诊断' };
+    const snapshot = !this.demo && this.networkAdapter?.embedded === true && typeof this.networkAdapter.diagnostics === 'function'
+      ? await this.networkAdapter.diagnostics()
+      : { available: false, source: 'embedded', scope: 'node', capturedAt: new Date().toISOString(), netstack: {}, transport: [], message: '当前模式不提供内置组网诊断' };
+    return this.networkProxy.diagnosticsEnabled ? { ...snapshot, proxyFlows: this.networkProxy.diagnostics() } : snapshot;
   }
   invalidateNetworkInfo() { ++this.networkGeneration; this.networkPromise = null; }
   setNetwork(info) {

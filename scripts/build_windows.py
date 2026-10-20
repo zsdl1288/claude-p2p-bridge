@@ -35,7 +35,7 @@ windres = compiler.with_name("windres.exe")
 if not all(path.is_file() for path in [go, compiler, windres]):
     raise SystemExit("Run python scripts/bootstrap-tools.py to prepare portable C++/Go tools.")
 
-env = go_environment()
+env = go_environment(tcp_diagnostics=options.diagnostics)
 env["PATH"] = str(compiler.parent) + os.pathsep + env.get("PATH", "")
 build.mkdir(parents=True, exist_ok=True)
 release.mkdir(parents=True, exist_ok=True)
