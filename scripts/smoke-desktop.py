@@ -261,7 +261,7 @@ try:
     assert request(a2, "/api/join", {"invitation": host["invitation"]}, token_a2)["online"]
     wait_all_connected(a, token_a, a2, token_a2, b, token_b)
     listing = request(a, "/v1/models", token=token_a)
-    assert {item["id"] for item in listing["data"]} == {"claude-code", "claude-code-sonnet", "claude-code-opus"}
+    assert {item["id"] for item in listing["data"]} == {"default", "sonnet", "opus"}, listing
     messages = [{"role": "user", "content": "[tool] Read the A-only fixture."}]
     tools = [{"type": "function", "function": {"name": "read_local_fixture", "description": "Read a file on A.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}]
     model_first = request(a, "/v1/chat/completions", {"model": "claude-code", "messages": messages, "tools": tools, "tool_choice": "required", "stream": False}, token_a)

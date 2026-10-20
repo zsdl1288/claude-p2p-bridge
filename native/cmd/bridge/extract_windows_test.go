@@ -38,7 +38,7 @@ func runtimeJunction(t *testing.T, link, target string) {
 	defer cancel()
 	// Junctions do not require Developer Mode or symlink privileges. Paths are
 	// t.TempDir descendants, passed as environment values rather than code.
-	command := exec.CommandContext(ctx, filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+	command := exec.CommandContext(ctx, "pwsh",
 		"-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:BRIDGE_TEST_JUNCTION_LINK -Target $env:BRIDGE_TEST_JUNCTION_TARGET | Out-Null")
 	command.Env = append(os.Environ(), "BRIDGE_TEST_JUNCTION_LINK="+link, "BRIDGE_TEST_JUNCTION_TARGET="+target)
 	hide(command)
