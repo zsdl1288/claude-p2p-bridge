@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.0.2
+# Claude Bridge · Windows 桌面托盘版 v1.0.4
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,9 +8,9 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.0.2-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.0.4-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.2.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
+桌面窗口、系统托盘和进程管理继续使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.0.4.zip`，不含本机账号、配对或 API Token。既有组网、DPAPI 配对和自启动架构保留。
 
 ## 使用方法
 
@@ -22,6 +22,8 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
 6. 需要随 Windows 登录启动时，在各端打开左下角“设置”，勾选“Windows 登录后自动在后台运行”。之后会直接驻留托盘并恢复配对。“收起到托盘”和“开源许可”也在设置中。
 
 各端保存独立设备身份，**只复制 EXE，不要把数据目录复制到另一台电脑**。首次授权或账号授权过期时仍需浏览器操作。[tsnet 说明](https://tailscale.com/docs/features/tsnet)
+
+B 的“Claude 程序路径或命令”保留默认 `claude` 即可自动检测：优先使用当前 PATH，随后读取最新的 Windows 用户/系统 PATH，并检查用户原生安装、npm、WinGet、旧版本地安装及 Claude 桌面版（含 Microsoft Store）的 CLI 目录。桌面版有多个缓存版本时选用最新版本；检测成功会显示版本和实际程序路径。自定义安装位置仍可填写 `claude.exe` 或官方 `cli.js` 的绝对路径。找不到程序时只提示未能定位，不据此判断未安装或未登录。
 
 网络中的设备列表将本机固定在首位，标注“本机”及已配置的“B 服务端 / A 调用端”，同时显示名称、虚拟 IP、在线状态和已知连接路径。A 已配对的 B 也标注服务端；其余节点角色未知时不作推断。本机不能选作远端 B。优先尝试 P2P，无法直连时可通过 Tailscale 的加密中转连接；同一账号不保证所有网络都能物理直连。本软件依赖 Tailscale 托管的协调及中转基础设施。[连接类型](https://tailscale.com/docs/reference/connection-types)
 
@@ -101,7 +103,7 @@ A 应只开启 Clash TUN，关闭“系统代理”；Windows 手动代理和代
 
 自启动默认关闭，启用后使用当前用户的 Windows 登录启动项，无需管理员权限。程序将 EXE 复制到数据目录下稳定的版本路径，移动下载文件不会影响启动。手动运行新版时，会刷新同一数据目录已启用的启动项。每个 Windows 用户只有一个 Claude Bridge 启动项；从另一数据目录手动启用会替换该项，关闭时只移除属于当前目录的启动项。演示模式禁用自启动。未登录 Windows 时客户端不会运行。
 
-升级时先从托盘退出旧版，再运行新版。建议 B 与所有 A 一起升级到 1.0.2；旧版已保存的组网登录、配对、身份与 Claude 配置迁移保留，角色和网络是否自动恢复以保存状态为准。若旧版从未保存配对，需要首次配对。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享；设备身份失效或配对密钥被撤销时需重新授权。已启用持久 WFP 保护的升级及目录迁移仍遵循上文的显式关闭流程。
+升级时先从托盘退出旧版，再运行新版。B 与所有 A 均需升级到 1.0.4，才能同步动态模型列表；旧版已保存的组网登录、配对、身份与 Claude 配置迁移保留，角色和网络是否自动恢复以保存状态为准。若旧版从未保存配对，需要首次配对。Claude 工作目录失效只影响模型配置，不应阻止独立网络共享；设备身份失效或配对密钥被撤销时需重新授权。已启用持久 WFP 保护的升级及目录迁移仍遵循上文的显式关闭流程。
 
 **同一 Windows 用户只允许一个新版桌面实例运行**。新版使用稳定的共享锁，不因端口、数据目录、EXE 位置或后续新版版本号变化而启动第二份桌面；再次启动会尝试唤回已有窗口。已有实例尚未显示窗口或锁权限受限时，新启动会等待其就绪或退出；无法安全取得锁就结束本次启动，不另开后台。新版也会检测当前用户已运行的旧版并唤回它，但无法让随后启动的 0.8 等历史程序遵守其尚未实现的新锁。因此升级时先从托盘退出旧版，升级后统一使用新版。需要更换数据目录或版本时，也先退出当前客户端。从 0.9.4 起，新版之间崩溃后再次启动，会先清退上一轮的后台进程，再读取配置和启动服务；改用其他端口或数据目录也遵守同一顺序。历史旧版没有这套交接记录，升级时应正常退出旧版。A、B 实际部署在不同电脑；同机多端回归由测试脚本使用打包的 `bridge-engine` 组件和独立测试数据目录完成。
 
@@ -116,10 +118,12 @@ A 应只开启 Clash TUN，关闭“系统代理”；Windows 手动代理和代
 | Base URL | `http://127.0.0.1:3210/v1`，以 A 窗口实际端口为准 |
 | API protocol | **OpenAI Chat Completions** |
 | API Key | A 客户端“模型 API”页复制的本机 Key |
-| Model ID | `claude-code` |
+| Model ID | 从 A 的“模型 API”下拉列表复制，或使用 Fetch available models 获取 |
 | Input types | **Text** |
 
-保存后选择这个模型。也可使用 `claude-code-sonnet` 或 `claude-code-opus`，分别传递官方 CLI 的 `sonnet` / `opus` 别名；`claude-code` 沿用 B 官方 CLI 的默认模型与认证。可点 Fetch available models，也可手动添加。Harness 实际服务进程须在 A 本机运行；仅从 A 浏览器打开另一台机器上的 Harness，不能访问 A 的 `127.0.0.1`。官方字段见 [Harness 模型配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md)。
+保存提供商后点击 Fetch available models，选择 B 返回的模型；也可从 A 客户端复制所选模型 ID 手动添加。列表来自 B 当前 Claude Code 的官方初始化接口，包含名称、说明和原始 ID，并过滤 CLI 标记不可选的条目；不再维护固定的模型家族或版本列表。A 的调用测试、复制示例及 API 请求均使用所选 ID，包括上下文后缀。启用模型或重连时自动同步，列表缓存五分钟，A 的“刷新模型列表”会请求 B 重新读取。读取失败会明确报错，不返回静态或空的成功列表；切换 B 配置、撤销配对或停用服务会清除原目录。列表反映 CLI 当前可选项，后端额度、登录或权限变化仍可能在实际调用时返回错误。[官方模型配置](https://code.claude.com/docs/en/model-config)
+
+旧客户端的 `claude-code` 仅作为默认入口兼容，不再列在动态目录；新版调用应直接使用列表中的 ID。Harness 实际服务进程须在 A 本机运行；仅从 A 浏览器打开另一台机器上的 Harness，不能访问 A 的 `127.0.0.1`。官方字段见 [Harness 模型配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md)。
 
 API Key 是桥接客户端自己生成的本机鉴权令牌，与 Claude 订阅登录凭据不同。程序不读取、复制或中转 Claude OAuth Token，不修改官方 Claude Code 二进制；Claude 认证仍由 B 的官方 CLI 完成。
 
@@ -131,7 +135,9 @@ API Key 是桥接客户端自己生成的本机鉴权令牌，与 Claude 订阅�
 
 ```powershell
 $bridgeToken = (Get-Content "$env:LOCALAPPDATA\ClaudeBridge\api-token" -Raw).Trim()
-$bridgeBody = @{ model = 'claude-code'; messages = @(@{ role = 'user'; content = '你好，请介绍你的能力' }); stream = $false } | ConvertTo-Json -Depth 8
+$bridgeModels = Invoke-RestMethod -Uri http://127.0.0.1:3210/v1/models -Headers @{ Authorization = "Bearer $bridgeToken" }
+$bridgeModelId = $bridgeModels.data[0].id # 可改为动态列表中的其他 ID
+$bridgeBody = @{ model = $bridgeModelId; messages = @(@{ role = 'user'; content = '你好，请介绍你的能力' }); stream = $false } | ConvertTo-Json -Depth 8
 $bridgeReply = Invoke-RestMethod -Uri http://127.0.0.1:3210/v1/chat/completions -Method Post -Headers @{ Authorization = "Bearer $bridgeToken" } -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($bridgeBody)) -TimeoutSec 3660
 $bridgeReply.choices[0].message
 ```
@@ -233,7 +239,8 @@ python examples/client.py '请概括当前项目结构'
 | `POST /api/disconnect` | 忘记配对并停止连接 |
 | `POST /api/shutdown` | 停止客户端，保留配对 |
 | `POST /api/probe` | 检查本机 Claude：`{claudeCommand?}` |
-| `GET /v1/models` | 模型列表，需本机 API Key |
+| `GET /v1/models` | B 的动态可选模型列表，需本机 API Key 和有效服务连接 |
+| `POST /api/models/refresh` | `{}`；B 重新读取 CLI 目录，A 请求已配对的 B 刷新并同步 |
 | `POST /v1/chat/completions` | Harness 文本和函数工具决策 |
 | `POST /v1/run` | `{prompt,stream?,sessionId?,model?}` |
 | `POST /v1/requests/{id}/cancel` | 取消自己的任务 |

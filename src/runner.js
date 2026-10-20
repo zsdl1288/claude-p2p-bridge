@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
-import { access, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import { consumeLines } from './line-stream.js';
-import { normalizeChatRequest, decisionSchema, modelSystemPrompt, buildModelPrompt, modelCatalog } from './model-protocol.js';
+import { normalizeChatRequest, decisionSchema, modelSystemPrompt, buildModelPrompt } from './model-protocol.js';
+import { resolveClaude } from './claude-discovery.js';
+export { resolveClaude } from './claude-discovery.js';
 
 const profiles = { read: ['Read', 'Glob', 'Grep'], edit: ['Read', 'Glob', 'Grep', 'Edit', 'Write'], develop: ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'] };
 const outputLimit = 16 * 1024 * 1024;
@@ -27,38 +28,10 @@ export function validateRequest(input) {
   return { prompt: input.prompt, ...(input.sessionId ? { sessionId: input.sessionId } : {}), ...(input.model ? { model: input.model } : {}) };
 }
 
-async function exists(file) { try { await access(file); return true; } catch { return false; } }
-export async function resolveClaude(command = 'claude') {
-  let target = command;
-  if (!path.isAbsolute(command)) {
-    if (command !== 'claude') throw new Error('请填写 claude 或 Claude 可执行文件的绝对路径');
-    const extensions = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-    target = null;
-    for (const directory of (process.env.PATH || '').split(path.delimiter)) {
-      const absoluteDirectory = directory.replace(/^"|"$/g, '');
-      // Empty/relative PATH components point into the opened project. A project
-      // named "claude" must not become the executable used for a remote run.
-      if (!path.isAbsolute(absoluteDirectory)) continue;
-      for (const ext of extensions) {
-        const candidate = path.join(absoluteDirectory, `claude${ext}`);
-        if (await exists(candidate)) { target = candidate; break; }
-      }
-      if (target) break;
-    }
-    if (!target) throw new Error('未找到 Claude Code。请在 B 端安装、登录 claude，并重启桥接程序；也可指定可执行文件绝对路径。');
-  }
-  if (!(await stat(target)).isFile()) throw new Error('Claude 路径不是文件');
-  if (/\.(cmd|bat)$/i.test(target)) {
-    const cli = path.join(path.dirname(target), 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
-    if (await exists(cli)) return { command: process.execPath, prefix: [cli] };
-    throw new Error('该 .cmd/.bat 不是受支持的 npm Claude 启动器，请指定 claude.exe 或官方 cli.js 的绝对路径');
-  }
-  return /\.[cm]?js$/i.test(target) ? { command: process.execPath, prefix: [target] } : { command: target, prefix: [] };
-}
-
 export async function probeClaude(command) {
   try {
     const executable = await resolveClaude(command);
+    const resolvedPath = executable.prefix[0] || executable.command;
     return await new Promise((resolve) => {
       const child = spawn(executable.command, [...executable.prefix, '--version'], { windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], shell: false });
       let output = '';
@@ -67,7 +40,7 @@ export async function probeClaude(command) {
       child.stdout.on('data', collect);
       child.stderr.on('data', collect);
       child.on('error', (e) => { clearTimeout(timer); resolve({ available: false, message: e.message }); });
-      child.on('close', (code) => { clearTimeout(timer); resolve({ available: code === 0, message: output.trim() || `退出码 ${code}` }); });
+      child.on('close', (code) => { clearTimeout(timer); resolve({ available: code === 0, resolvedPath, message: `${output.trim() || `退出码 ${code}`}\n程序路径：${resolvedPath}` }); });
     });
   } catch (error) { return { available: false, message: error.message }; }
 }
@@ -85,8 +58,7 @@ export async function runClaude(config, request, emit, signal) {
     // --bare skips subscription OAuth. Safe mode disables customizations while
     // retaining the official CLI's normal authentication flow.
     args.push('--safe-mode', '--disable-slash-commands', '--disallowedTools', 'mcp__*', '--no-session-persistence', '--system-prompt', modelSystemPrompt, '--json-schema', JSON.stringify(decisionSchema));
-    const alias = modelCatalog.find((item) => item.id === request.model).alias;
-    if (alias) args.push('--model', alias);
+    if (request.model !== 'claude-code') args.push('--model', request.model);
     if (['low', 'medium', 'high', 'xhigh', 'max'].includes(request.reasoning_effort)) args.push('--effort', request.reasoning_effort);
   } else {
     args.push('--allowedTools', tools);

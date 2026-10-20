@@ -34,7 +34,9 @@ class Application {
     std::atomic<bool> stopping_{false}, ready_{false};
     std::mutex engineMutex_; KernelHandle process_, job_, wake_;
     std::thread pollThread_, actionThread_, testThread_;
-    std::string token_, authUrl_, requestId_, invitation_, lastDevices_, lastProxyDevices_, lastConfig_, observedRole_, testScope_;
+    std::string token_, authUrl_, requestId_, invitation_, lastDevices_, lastProxyDevices_, lastConfig_, lastModels_, observedRole_, testScope_;
+    std::vector<std::wstring> modelIds_;
+    std::wstring selectedModel_;
     Json status_, proxy_ = Json::object(); HWND heading_ = nullptr, description_ = nullptr, state_ = nullptr;
     HWND identityMessage_ = nullptr, networkMessage_ = nullptr, connectionHint_ = nullptr, peerList_ = nullptr, proxyPeerList_ = nullptr, activity_ = nullptr;
     HWND startupHint_ = nullptr, modelStatus_ = nullptr, hostModelStatus_ = nullptr;
@@ -63,6 +65,14 @@ class Application {
         Text(Item(id), lines);
     }
     std::wstring Value(int id) const { return ControlText(Item(id)); }
+    std::wstring SelectedModel() const {
+        const auto selected = SendMessageW(Item(API_MODEL), CB_GETCURSEL, 0, 0);
+        return selected >= 0 && static_cast<size_t>(selected) < modelIds_.size() ? modelIds_[selected] : L"";
+    }
+    bool ModelsReady() const {
+        return statusAvailable_ && Role() == "client" && status_.value("online", false) &&
+            Model().value("modelsState", "unavailable") == "ready" && !SelectedModel().empty();
+    }
     int ConfigNumber(int id, int minimum, int maximum, const char* error) const {
         auto value = Value(id); int number = 0;
         if (value.empty()) throw std::runtime_error(error);
@@ -192,10 +202,11 @@ class Application {
         auto apiToken = Edit(L"", API_TOKEN, 228, 254, 540, 30, 1, 1, false, true, true);
         SendMessageW(apiToken, EM_SETPASSWORDCHAR, L'\x25CF', 0);
         Button(L"复制 API Key", COPY_TOKEN, 784, 254, 208, 30, 1, 1, true);
-        Label(L"Model ID · claude-code / claude-code-sonnet / claude-code-opus", 228, 296, 540, 20, 1, 1, 3, true);
-        Edit(DesktopModelApi::DefaultModel, API_MODEL, 228, 320, 540, 30, 1, 1, false, false, true);
+        Label(L"B 端可用模型 · Model ID", 228, 296, 540, 20, 1, 1, 3, true);
+        Add(L"COMBOBOX", L"", API_MODEL, 228, 320, 540, 250, 1, 1, WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, false, true);
+        Button(L"刷新模型列表", MODELS_REFRESH, 784, 290, 208, 26, 1, 1, true);
         Button(L"复制 Model ID", COPY_MODEL, 784, 320, 208, 30, 1, 1, true);
-        modelStatus_ = Label(L"正在读取 Claude 模型服务状态…", 228, 364, 540, 40, 1, 1, 3, true); widgets_.back().stretch = true;
+        modelStatus_ = Label(L"正在读取 Claude 模型服务状态…", 228, 358, 540, 50, 1, 1, 3, true); widgets_.back().stretch = true;
         Button(L"复制模型 API 示例", COPY_EXAMPLE, 784, 364, 208, 30, 1, 1, true);
         Label(L"Claude 调用测试", 228, 436, 500, 24, 1, 1, 1);
         Edit(L"请用一句话说明你能提供什么帮助", TEST_PROMPT, 228, 472, 620, 48, 1, 1, true, false, true);
@@ -203,10 +214,10 @@ class Application {
         Button(L"取消调用", TEST_CANCEL, 864, 504, 128, 24, 1, 1, true);
         Edit(L"测试使用上方模型 API；每次测试都是独立请求。", TEST_OUTPUT, 228, 542, 764, 124, 1, 1, true, true, true, true);
         Label(L"B · Claude 服务配置", 228, 132, 540, 24, 1, 2, 1);
-        Label(L"Claude 程序路径或命令", 228, 176, 540, 20, 1, 2, 3, true);
+        Label(L"Claude 程序路径或命令（claude 自动检测）", 228, 176, 540, 20, 1, 2, 3, true);
         Edit(L"claude", CLAUDE_COMMAND, 228, 204, 540, 30, 1, 2, false, false, true);
         Button(L"检测 Claude", PROBE_CLAUDE, 784, 204, 208, 30, 1, 2, true);
-        Label(L"Claude 运行目录", 228, 254, 540, 20, 1, 2, 3, true);
+        Label(L"Claude 工作目录", 228, 254, 540, 20, 1, 2, 3, true);
         Edit(L"", WORKSPACE, 228, 282, 540, 30, 1, 2, false, false, true);
         Button(L"选择目录", BROWSE_WORKSPACE, 784, 282, 208, 30, 1, 2, true);
         Label(L"单次最长时间（秒）", 228, 336, 250, 20, 1, 2, 3, true);
@@ -484,9 +495,13 @@ class Application {
         EnableWindow(Item(NAV_API), ready_ && Capability("model"));
         EnableWindow(Item(NAV_PROXY), ready_ && Capability("proxy"));
         EnableWindow(Item(COPY_INVITE), enabled && !invitation_.empty());
-        EnableWindow(Item(COPY_TOKEN), ready_ && Capability("model")); EnableWindow(Item(COPY_EXAMPLE), ready_ && Capability("model"));
+        EnableWindow(Item(COPY_TOKEN), ready_ && Capability("model"));
+        EnableWindow(Item(COPY_EXAMPLE), ready_ && Capability("model") && ModelsReady());
+        EnableWindow(Item(COPY_MODEL), ready_ && Capability("model") && ModelsReady());
+        EnableWindow(Item(API_MODEL), enabled && Capability("model") && ModelsReady() && !testing_);
+        EnableWindow(Item(MODELS_REFRESH), enabled && Capability("model") && role == "client" && status_.value("online", false) && Model().value("modelsState", "") != "loading");
         bool online = role == "client" && Model().value("online", false) && Model().value("available", false);
-        EnableWindow(Item(TEST_SEND), ready_ && !busy_ && Capability("model") && online && !testing_);
+        EnableWindow(Item(TEST_SEND), ready_ && !busy_ && Capability("model") && online && ModelsReady() && !testing_);
         EnableWindow(Item(TEST_CANCEL), testing_ && !requestId_.empty() && !busy_);
         auto pairing = status_.is_object() ? status_.value("pairing", Json::object()) : Json::object();
         bool saved = pairing.is_object() && pairing.value("saved", false);
@@ -570,6 +585,36 @@ class Application {
         RenderDevices(peerList_, devices, lastDevices_);
         UpdateButtons();
     }
+    std::wstring RenderModels(const Json& model) {
+        const auto models = model.contains("models") && model["models"].is_array() ? model["models"] : Json::array();
+        const auto serialized = models.dump();
+        if (serialized != lastModels_) {
+            const auto previous = SelectedModel();
+            if (!previous.empty()) selectedModel_ = previous;
+            SendMessageW(Item(API_MODEL), CB_RESETCONTENT, 0, 0); modelIds_.clear();
+            int selected = 0;
+            for (const auto& item : models) {
+                if (!item.is_object() || !item.contains("id") || !item["id"].is_string()) continue;
+                const auto id = Wide(item["id"].get<std::string>());
+                if (id.empty()) continue;
+                const auto name = Wide(item.value("name", ""));
+                const auto label = !name.empty() && name != id ? name + L" · " + id : id;
+                SendMessageW(Item(API_MODEL), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                if (id == selectedModel_) selected = static_cast<int>(modelIds_.size());
+                modelIds_.push_back(id);
+            }
+            if (modelIds_.empty()) SendMessageW(Item(API_MODEL), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"等待 B 端模型列表"));
+            else selectedModel_ = modelIds_[selected];
+            SendMessageW(Item(API_MODEL), CB_SETCURSEL, selected, 0); lastModels_ = serialized;
+        }
+        const auto phase = model.value("modelsState", "unavailable");
+        if (Role() == "client" && !status_.value("online", false)) return L"B 未连接，模型列表暂不可用；连接后自动更新。";
+        if (phase == "loading") return L"正在从 B 获取 Claude 模型列表…";
+        if (phase == "error") return L"获取模型列表失败：" + Wide(model.value("modelsError", "请刷新重试。"));
+        if (phase == "ready") return L"已获取 " + std::to_wstring(modelIds_.size()) + L" 个模型，请在上方选择。";
+        const auto error = model.value("modelsError", "");
+        return error.empty() ? L"模型列表暂不可用，请开启 B 的 Claude 服务后刷新。" : Wide(error);
+    }
     void RenderStatus(const Json& status) {
         auto revision = status.value("revision", uint64_t{0});
         if (revision < lastStatusRevision_) return;
@@ -583,8 +628,9 @@ class Application {
         Report(online ? (role == "host" ? L"B 服务端 · " + std::to_wstring(connectedClients) + L" 个 A 已连接" : L"A 调用端 · 已配对连接") : !role.empty() ? (RoleLocked() ? L"身份已锁定 · 等待连接" : L"私有网络已退出") : L"请选择本机身份");
         auto pairing = status.value("pairing", Json::object());
         auto model = Model();
-        Text(modelStatus_, Wide(model.value("message", "等待 B 的 Claude 模型服务。")) + L"\r\n网络代理独立运行；模型不可用不会切断网络代理。");
-        Text(hostModelStatus_, Wide(model.value("message", "尚未开启 Claude 模型服务。")));
+        const auto modelsMessage = RenderModels(model);
+        Text(modelStatus_, Wide(model.value("message", "等待 B 的 Claude 模型服务。")) + L"\r\n" + modelsMessage);
+        Text(hostModelStatus_, Wide(model.value("message", "尚未开启 Claude 模型服务。")) + L"\r\n" + modelsMessage);
         Text(MODEL_ENABLE, model.value("enabled", false) ? L"保存配置并更新模型服务" : L"保存配置并开启模型服务");
         Text(identityMessage_, Wide(identity.value("message", RoleLocked() ? "身份已锁定；先退出私有网络才能切换。" : "请选择身份，再连接私有网络。")));
         bool roleChanged = role != observedRole_;
@@ -631,9 +677,9 @@ class Application {
         });
     }
     void StartTest() {
-        if (testing_ || !statusAvailable_ || Role() != "client" || !Capability("model") || !Model().value("available", false)) return;
+        if (testing_ || !statusAvailable_ || Role() != "client" || !Capability("model") || !Model().value("available", false) || !ModelsReady()) return;
         auto prompt = Utf8(Value(TEST_PROMPT)); if (prompt.empty()) throw std::runtime_error("请先输入要发送给 Claude 的内容");
-        auto model = Utf8(Value(API_MODEL)); if (model.empty()) throw std::runtime_error("请填写 Model ID");
+        auto model = Utf8(SelectedModel()); if (model.empty()) throw std::runtime_error("请先获取 B 端模型列表并选择模型");
         Json body = {{"model", model}, {"messages", Json::array({{{"role", "user"}, {"content", prompt}}})}, {"stream", true}};
         if (testThread_.joinable()) testThread_.join();
         testing_ = true; requestId_.clear(); Text(TEST_OUTPUT, L"正在调用 B 的 Claude…"); UpdateButtons();
@@ -671,6 +717,7 @@ class Application {
         if (reply.kind == "startup-error") { Report(L"启动失败"); Message(Wide(reply.text), true); return; }
         if (reply.kind == "poll-error") {
             Report(L"本机服务暂时不可用"); proxyAvailable_ = false; statusAvailable_ = false;
+            Text(modelStatus_, L"本地桥接服务不可用，当前无法读取 B 的模型列表。\r\n等待服务恢复后自动更新。");
             Text(proxyMessage_, L"本地桥接服务不可用 · 请检查后台进程。\r\n代理连接状态无法确认，等待服务恢复。");
             Text(proxyGuardMessage_, L"当前无法读取系统保护状态；请检查本地服务。\r\n此前已启用的系统保护需明确关闭才恢复直连。");
             Text(settingsGuardMessage_, L"本地服务不可用，当前无法确认系统保护状态。\r\n此前已启用的保护仍须明确关闭才恢复直连。");
@@ -743,6 +790,9 @@ class Application {
                 SaveSettings(); Action(L"/api/model", {{"enabled", true}, {"workspace", Utf8(Value(WORKSPACE))}, {"claudeCommand", Utf8(Value(CLAUDE_COMMAND))}, {"timeoutMs", seconds * 1000}, {"maxTurns", turns}}, "model"); break;
             }
             case MODEL_DISABLE: Action(L"/api/model", {{"enabled", false}}, "model"); break;
+            case MODELS_REFRESH:
+                Text(modelStatus_, L"正在从 B 刷新 Claude 模型列表…");
+                Action(L"/api/models/refresh", Json::object(), "models"); break;
             case PAIR_DISCONNECT: Action(L"/api/disconnect", Json::object(), "disconnect"); break;
             case PAIR_PAUSE: Action(L"/api/pause", Json::object(), "pause"); break;
             case PAIR_RESUME: Action(L"/api/reconnect", Json::object(), "reconnect"); break;
@@ -757,9 +807,9 @@ class Application {
             case COPY_INVITE: Clipboard(window_, Wide(invitation_)); Report(L"配对码已复制"); break;
             case COPY_ENDPOINT: Clipboard(window_, Value(API_ENDPOINT)); Report(L"模型 Base URL 已复制"); break;
             case COPY_TOKEN: Clipboard(window_, Wide(token_)); Report(L"API 令牌已复制"); break;
-            case COPY_MODEL: Clipboard(window_, Value(API_MODEL)); Report(L"Model ID 已复制"); break;
+            case COPY_MODEL: if (ModelsReady()) { Clipboard(window_, SelectedModel()); Report(L"Model ID 已复制"); } break;
             case COPY_EXAMPLE: {
-                Clipboard(window_, DesktopModelApi::PowerShellExample(options_.directory, options_.port)); Report(L"模型 API 的 PowerShell 示例已复制"); break;
+                if (ModelsReady()) { Clipboard(window_, DesktopModelApi::PowerShellExample(options_.directory, options_.port, SelectedModel())); Report(L"所选模型 API 的 PowerShell 示例已复制"); } break;
             }
             case TEST_SEND: StartTest(); break;
             case TEST_CANCEL: if (!requestId_.empty()) Action(L"/v1/requests/" + Wide(requestId_) + L"/cancel", Json::object(), "cancel"); break;
@@ -806,7 +856,10 @@ class Application {
             }
             break;
         }
-        case WM_COMMAND: if (HIWORD(wParam) == BN_CLICKED || HIWORD(wParam) == 0) Command(LOWORD(wParam)); return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == API_MODEL && HIWORD(wParam) == CBN_SELCHANGE) selectedModel_ = SelectedModel();
+            else if (HIWORD(wParam) == BN_CLICKED || HIWORD(wParam) == 0) Command(LOWORD(wParam));
+            return 0;
         case WM_CLOSE: HideToTray(); return 0;
         case WM_SIZE: if (wParam == SIZE_MINIMIZED) HideToTray(); else Layout(); return 0;
         case WM_DPICHANGED: { dpi_ = HIWORD(wParam); Fonts(); auto rect = reinterpret_cast<RECT*>(lParam); SetWindowPos(window_, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE); Layout(); return 0; }

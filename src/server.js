@@ -6,7 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Bridge } from './bridge.js';
 import { randomId, equalSecret } from './crypto.js';
 import { version } from './version.js';
-import { modelCatalog, modelInputLimit } from './model-protocol.js';
+import { modelInputLimit } from './model-protocol.js';
 import { serveModel, modelError } from './model-api.js';
 import { serveTask } from './task-api.js';
 import { sendJson as json, readJsonObject as readBody } from './http.js';
@@ -103,7 +103,16 @@ export function createLocalServer({ port = 3210, token, bridge = new Bridge(), w
         res.end(content); return;
       }
       if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return reject(401, '需要有效的 Authorization: Bearer <API_TOKEN>', 'invalid_api_key');
-      if (req.method === 'GET' && url.pathname === '/v1/models') return json(res, 200, { object: 'list', data: modelCatalog.map(({ id }) => ({ id, object: 'model', created: 0, owned_by: 'claude-code-bridge' })) });
+      if (req.method === 'GET' && url.pathname === '/v1/models') {
+        const models = await bridge.getModels();
+        return json(res, 200, { object: 'list', data: models.map(({ id, name, description, resolvedModel }) => ({ id, object: 'model', created: 0, owned_by: 'claude-code-bridge', name, description, ...(resolvedModel ? { resolved_model: resolvedModel } : {}) })) });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/models/refresh') {
+        const body = await readBody(req);
+        if (Object.keys(body).length) throw new Error('刷新模型列表无需额外参数');
+        await bridge.refreshModels();
+        return json(res, 200, status());
+      }
       if (req.method === 'POST' && ['/v1/responses', '/v1/messages'].includes(url.pathname)) return json(res, 400, { error: { message: '请选择 OpenAI Chat Completions 协议；当前仅提供 /v1/chat/completions', type: 'invalid_request_error', code: 'unsupported_protocol' } });
       if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
         await serveModel(req, res, await readBody(req, modelInputLimit), bridge, streams);

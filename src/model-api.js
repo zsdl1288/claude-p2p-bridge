@@ -36,6 +36,7 @@ export async function serveModel(req, res, body, bridge, streams) {
     if (!ok && res.writableLength > 2 * 1024 * 1024) throw new ModelError('模型响应接收过慢', 499, 'slow_consumer');
   };
   try {
+    await bridge.getModels();
     const requestId = bridge.run(request, (event) => {
       if (completed) return;
       if (event.type === 'error') fail(new ModelError(event.message || 'B 模型请求失败', event.code === 'PEER_DISCONNECTED' ? 503 : event.code === 'CANCEL_TIMEOUT' ? 499 : 502, event.code || 'model_process_error'));

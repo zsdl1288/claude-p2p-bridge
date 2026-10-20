@@ -8,9 +8,11 @@ import { runClaude, validateRequest, probeClaude } from './runner.js';
 import { NetworkProxy } from './network-proxy.js';
 import { hostname } from 'node:os';
 import path from 'node:path';
+import { discoverClaudeModels, normalizeModels } from './claude-models.js';
+import { ModelError } from './model-protocol.js';
 
 export class Bridge extends EventEmitter {
-  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {} } = {}) {
+  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {}, modelCatalogProvider = discoverClaudeModels } = {}) {
     super();
     this.demo = demo;
     this.networkProvider = networkProvider;
@@ -29,6 +31,9 @@ export class Bridge extends EventEmitter {
     this.modelGeneration = 0;
     this.remoteModel = null;
     this.networkGeneration = 0;
+    this.modelCatalogProvider = modelCatalogProvider;
+    this.models = []; this.modelsState = 'unavailable'; this.modelsError = ''; this.modelsAt = 0;
+    this.catalogEpoch = 0; this.catalogRequests = new Map();
   }
   log(message) { this.logs.unshift({ time: new Date().toISOString(), message }); this.logs = this.logs.slice(0, 40); this.emit('state'); }
   status() {
@@ -128,6 +133,7 @@ export class Bridge extends EventEmitter {
       this.emit('state');
     });
     if (role === 'host') await modelPeer.start();
+    if (role === 'host' && this.modelEnabled && this.config) void this.getModels().catch(() => {});
     this.proxyController?.synchronize();
     this.networkProxy.peerChanged();
     peer.on('state', () => { if (this.peer === peer) this.emit('state'); });
@@ -143,7 +149,7 @@ export class Bridge extends EventEmitter {
       if (role === 'host') {
         for (const candidate of modelPeer.connections) if (candidate.parentSession === connection.retiredSession) candidate.ws.terminate();
         this.log(`一台 A 端已断开，当前连接 ${peer.state.connectedClients} 台 A`);
-      } else { modelPeer.ws?.terminate(); this.remoteSharing = null; this.remoteModel = null; this.cancelAll(reason); this.log(reason); }
+      } else { modelPeer.ws?.terminate(); this.remoteSharing = null; this.remoteModel = null; this.rejectCatalogRequests(reason); this.cancelAll(reason); this.log(reason); }
     });
     try {
       await peer.start();
@@ -170,10 +176,12 @@ export class Bridge extends EventEmitter {
   }
   applyModel({ enabled, config }) {
     ++this.modelGeneration;
+    this.invalidateModelCatalog('Claude 配置已更新');
     this.cancelModelTasks('Claude 配置已更新，本次任务已停止');
     for (const sessions of this.sessions.values()) sessions.clear();
     this.modelEnabled = enabled; this.config = config ? { ...config } : null;
     this.broadcastModelStatus(); this.emit('state');
+    if (enabled && this.config && this.networkIdentity().role === 'host') void this.getModels().catch(() => {});
     return this.status();
   }
   async configureModel(input) { return this.applyModel(await this.prepareModel(input)); }
@@ -184,11 +192,13 @@ export class Bridge extends EventEmitter {
       const controlOnline = Boolean(this.peer?.state.online);
       const online = Boolean(this.modelPeer?.state.online && controlOnline);
       return { enabled: remote.enabled === true, configured: remote.configured === true, available: online && remote.available === true, online,
+        models: controlOnline ? remote.models || [] : [], modelsState: controlOnline ? remote.modelsState || 'unavailable' : 'unavailable', modelsError: controlOnline ? remote.modelsError || '' : '', modelsEpoch: remote.modelsEpoch || 0,
         state: !controlOnline ? 'offline' : this.modelPeer?.state.error && !online ? 'error' : !this.remoteModel ? 'checking' : !remote.enabled ? 'disabled' : online ? 'ready' : 'connecting',
         message: !controlOnline ? '尚未连接服务端' : this.modelPeer?.state.error && !online ? '独立 Claude 模型通道连接失败，请确认 A、B 使用相同新版；网络代理不受影响' : !this.remoteModel ? '正在读取 B 的 Claude 服务状态' : !remote.enabled ? 'B 尚未启用 Claude 模型服务' : !online ? '正在连接独立的 Claude 模型通道' : 'Claude 模型服务已就绪', config: null };
     }
     const configured = Boolean(this.config?.workspace), enabled = this.modelEnabled && configured, hosting = this.peer?.role === 'host';
     return { enabled, configured, available: enabled && hosting, online: Boolean(hosting && this.modelPeer?.state.listening),
+      models: this.models, modelsState: this.modelsState, modelsError: this.modelsError, modelsEpoch: this.catalogEpoch,
       state: !configured ? 'unconfigured' : !enabled ? 'disabled' : hosting ? 'ready' : 'offline',
       message: !configured ? '请先配置 Claude 工作目录与运行参数' : !enabled ? 'Claude 模型服务已关闭，网络共享不受影响' : hosting ? 'Claude 模型服务已就绪' : 'Claude 配置已保存，等待 B 服务端连接私有网络',
       config: this.peer?.role === 'client' ? null : this.config ? { ...this.config } : null };
@@ -196,10 +206,96 @@ export class Bridge extends EventEmitter {
   broadcastModelStatus() {
     const peer = this.peer;
     if (peer?.role !== 'host') return;
-    const { enabled, configured, available } = this.modelStatus();
+    const { enabled, configured, available, models, modelsState, modelsError, modelsEpoch } = this.modelStatus();
     for (const connection of peer.connections) if (peer.isConnected(connection)) {
-      try { peer.send({ type: 'model-status', id: randomUUID(), model: { enabled, configured, available } }, connection); } catch { connection.ws.terminate(); }
+      try { peer.send({ type: 'model-status', id: randomUUID(), model: { enabled, configured, available, models, modelsState, modelsError, modelsEpoch } }, connection); } catch { connection.ws.terminate(); }
     }
+  }
+  invalidateModelCatalog(reason) {
+    ++this.catalogEpoch;
+    this.modelsReading?.controller.abort(); this.modelsReading = null;
+    this.models = []; this.modelsState = 'unavailable'; this.modelsError = ''; this.modelsAt = 0;
+    this.rejectCatalogRequests(reason);
+  }
+  rejectCatalogRequests(reason) {
+    for (const request of this.catalogRequests.values()) { clearTimeout(request.timer); request.reject(new ModelError(reason, 503, 'model_catalog_unavailable')); }
+    this.catalogRequests.clear();
+  }
+  refreshModels() { return this.getModels({ refresh: true }); }
+  async getModels({ refresh = false } = {}) {
+    if (this.networkIdentity().role === 'client') return this.getRemoteModels(refresh);
+    if (this.networkIdentity().role !== 'host' || !this.modelEnabled || !this.config) throw new ModelError('B 尚未启用 Claude 模型服务，无法读取模型列表', 503, 'model_catalog_unavailable');
+    if (this.modelsReading) return this.modelsReading.promise;
+    if (!refresh && this.modelsState === 'ready' && Date.now() - this.modelsAt < 300000) return this.models;
+    const epoch = this.catalogEpoch, generation = this.modelGeneration, config = { ...this.config };
+    const reading = { controller: new AbortController() };
+    this.modelsReading = reading;
+    this.models = []; this.modelsState = 'loading'; this.modelsError = '';
+    reading.promise = Promise.resolve().then(() => this.modelCatalogProvider(config, { signal: reading.controller.signal })).then((raw) => {
+      if (epoch !== this.catalogEpoch || generation !== this.modelGeneration || reading.controller.signal.aborted) throw new ModelError('Claude 配置或配对已改变，请重新读取模型列表', 503, 'model_catalog_changed');
+      const models = normalizeModels(raw);
+      if (!models.length) throw new Error('B 端 Claude 未返回可选模型，请检查登录状态与模型权限');
+      this.models = models; this.modelsState = 'ready'; this.modelsError = ''; this.modelsAt = Date.now();
+      this.broadcastModelStatus(); this.emit('state');
+      return this.models;
+    }).catch((error) => {
+      if (epoch === this.catalogEpoch && generation === this.modelGeneration && !reading.controller.signal.aborted) {
+        this.models = []; this.modelsState = 'error'; this.modelsError = `读取 B 端 Claude 模型列表失败：${error.message}`;
+        this.broadcastModelStatus(); this.emit('state');
+      }
+      throw error instanceof ModelError ? error : new ModelError(this.modelsError || '模型目录读取已取消', 503, 'model_catalog_unavailable');
+    }).finally(() => { if (this.modelsReading === reading) this.modelsReading = null; });
+    this.broadcastModelStatus(); this.emit('state');
+    return reading.promise;
+  }
+  getRemoteModels(refresh) {
+    const peer = this.peer;
+    if (peer?.role !== 'client' || !peer.state.online) return Promise.reject(new ModelError('A 端尚未连接 B 端，无法读取模型列表', 503, 'peer_unavailable'));
+    if (this.remoteModel?.enabled === false) return Promise.reject(new ModelError('B 尚未启用 Claude 模型服务', 503, 'model_catalog_unavailable'));
+    const pending = [...this.catalogRequests.values()].find((request) => request.peer === peer);
+    if (pending) return pending.promise;
+    if (!refresh && this.remoteModel?.modelsState === 'ready' && Date.now() - (this.remoteModelsAt || 0) < 300000) return Promise.resolve(this.remoteModel.models);
+    const id = randomUUID();
+    let resolve, reject;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const request = { peer, connection: peer.clientConnection, resolve, reject, promise };
+    request.timer = setTimeout(() => {
+      if (!this.catalogRequests.delete(id)) return;
+      const message = '等待 B 端模型列表超时，请确认 A、B 已更新到相同新版并检查 B 的 Claude 登录状态';
+      if (this.peer === peer) { this.remoteModel = { ...this.remoteModel, models: [], modelsState: 'error', modelsError: message }; this.emit('state'); }
+      reject(new ModelError(message, 503, 'model_catalog_timeout'));
+    }, 35000);
+    this.catalogRequests.set(id, request);
+    this.remoteModel = { ...this.remoteModel, models: [], modelsState: 'loading', modelsError: '' }; this.emit('state');
+    try { peer.send({ type: 'models-refresh', id, refresh }); }
+    catch (error) { clearTimeout(request.timer); this.catalogRequests.delete(id); reject(error); }
+    return promise;
+  }
+  receiveModelStatus(model) {
+    const modelsEpoch = Number.isSafeInteger(model.modelsEpoch) && model.modelsEpoch >= 0 ? model.modelsEpoch : 0;
+    if (modelsEpoch < (this.remoteModel?.modelsEpoch || 0)) return this.remoteModel;
+    const state = ['loading', 'ready', 'error', 'unavailable'].includes(model.modelsState) ? model.modelsState : 'unavailable';
+    const status = { enabled: model.enabled === true, configured: model.configured === true, available: model.available === true,
+      models: [], modelsState: state, modelsError: typeof model.modelsError === 'string' ? model.modelsError.slice(0, 2000) : '', modelsEpoch };
+    try {
+      if (state === 'ready') {
+        status.models = normalizeModels(model.models);
+        if (!status.models.length) throw new Error('empty catalog');
+      }
+    }
+    catch { status.modelsState = 'error'; status.modelsError = 'B 返回了无效的模型列表，请刷新重试'; }
+    this.remoteModel = status; this.remoteModelsAt = Date.now(); this.emit('state');
+    return status;
+  }
+  selectModel(request) {
+    if (request.kind !== 'model') return request;
+    const catalog = this.modelStatus();
+    if (catalog.modelsState !== 'ready' || !catalog.models.length) throw new ModelError(catalog.modelsError || '模型列表尚未就绪，请先刷新 B 端模型列表', 503, 'model_catalog_unavailable');
+    // Retain the old default entry for existing clients, but advertise only
+    // the IDs actually returned by B's CLI. No family list is maintained here.
+    const model = request.model === 'claude-code' ? (catalog.models.find((entry) => entry.id === 'default') || catalog.models[0]).id : request.model;
+    if (!catalog.models.some((entry) => entry.id === model)) throw new ModelError('此模型不在 B 端当前可选列表中，请刷新 /v1/models 后重新选择', 400, 'model_not_available');
+    return { ...request, model };
   }
   cancelModelTasks(reason) {
     for (const task of this.active.values()) task.controller.abort();
@@ -219,6 +315,38 @@ export class Bridge extends EventEmitter {
   }
   onMessage(msg, connection) {
     if (!msg || typeof msg !== 'object' || !/^[a-f0-9-]{36}$/i.test(msg.id)) return;
+    if (this.peer?.role === 'host' && msg.type === 'models-refresh' && this.peer.isConnected(connection)) {
+      const peer = this.peer;
+      const modelsEpoch = this.catalogEpoch;
+      this.getModels({ refresh: msg.refresh === true }).then(() => {
+        if (this.peer !== peer || !peer.isConnected(connection)) return;
+        const { enabled, configured, available, models, modelsState, modelsError, modelsEpoch } = this.modelStatus();
+        peer.send({ type: 'models-result', id: msg.id, modelsEpoch, model: { enabled, configured, available, models, modelsState, modelsError, modelsEpoch } }, connection);
+      }).catch((error) => {
+        if (this.peer !== peer || !peer.isConnected(connection)) return;
+        try { peer.send({ type: 'models-result', id: msg.id, modelsEpoch, error: error.message }, connection); } catch { connection.ws.terminate(); }
+      });
+      return;
+    }
+    if (this.peer?.role === 'client' && msg.type === 'models-result') {
+      const request = this.catalogRequests.get(msg.id);
+      if (!request || request.peer !== this.peer || request.connection !== connection) return;
+      clearTimeout(request.timer); this.catalogRequests.delete(msg.id);
+      if (Number.isSafeInteger(msg.modelsEpoch) && msg.modelsEpoch < (this.remoteModel?.modelsEpoch || 0)) {
+        if (this.remoteModel.modelsState === 'ready') request.resolve(this.remoteModel.models);
+        else request.reject(new ModelError('B 的 Claude 配置已更新，请重新读取模型列表', 503, 'model_catalog_changed'));
+        return;
+      }
+      if (typeof msg.error === 'string') {
+        this.remoteModel = { ...this.remoteModel, models: [], modelsState: 'error', modelsError: msg.error.slice(0, 2000) }; this.emit('state');
+        request.reject(new ModelError(this.remoteModel.modelsError, 503, 'model_catalog_unavailable'));
+      } else {
+        const status = this.receiveModelStatus(msg.model || {});
+        if (status.modelsState === 'ready') request.resolve(status.models);
+        else request.reject(new ModelError(status.modelsError || 'B 尚未提供可用模型列表', 503, 'model_catalog_unavailable'));
+      }
+      return;
+    }
     if (this.peer?.role === 'host' && msg.type === 'run' && this.peer.isConnected(connection)) {
       // Older clients sent model jobs on the control channel. Fail explicitly
       // instead of leaving their HTTP request waiting until its response timeout.
@@ -234,7 +362,7 @@ export class Bridge extends EventEmitter {
       this.emit('state');
       return;
     }
-    if (this.peer?.role === 'client' && msg.type === 'model-status' && msg.model && typeof msg.model === 'object') { this.remoteModel = msg.model; this.emit('state'); }
+    if (this.peer?.role === 'client' && msg.type === 'model-status' && msg.model && typeof msg.model === 'object') this.receiveModelStatus(msg.model);
   }
   onModelMessage(msg, connection) {
     if (!msg || typeof msg !== 'object' || !/^[a-f0-9-]{36}$/i.test(msg.id)) return;
@@ -259,7 +387,7 @@ export class Bridge extends EventEmitter {
     if (this.active.has(key) || this.queue.some((task) => task.key === key)) return;
     try {
       if (!this.modelEnabled || !this.config) throw new Error('B 尚未启用 Claude 模型服务，网络共享不受影响');
-      const request = validateRequest(msg.request);
+      const request = this.selectModel(validateRequest(msg.request));
       if (request.sessionId && !this.sessions.get(connection)?.has(request.sessionId)) throw new Error('该会话不属于当前配对连接。请先不传 sessionId 创建会话');
       if ([...this.active.values(), ...this.queue].some((task) => task.connection === connection)) throw new Error('该 A 端已有任务执行或排队中');
       if (this.queue.length >= this.maxQueued) throw new Error('B 端任务队列已满，请稍后重试');
@@ -317,7 +445,7 @@ export class Bridge extends EventEmitter {
     this.updateQueue();
   }
   run(input, emit, signal) {
-    const request = validateRequest(input);
+    const request = this.selectModel(validateRequest(input));
     signal?.throwIfAborted();
     if (this.peer?.role !== 'client' || !this.peer.state.online) throw new Error('A 端尚未连接 B 端');
     if (!this.modelPeer?.state.online) throw new Error('Claude 模型通道尚未连接，网络代理不受影响');
@@ -379,16 +507,23 @@ export class Bridge extends EventEmitter {
   async disconnect() { await this.stopPeer(); }
   async stopPeer() {
     const peer = this.peer, modelPeer = this.modelPeer;
+    const catalogReading = this.modelsReading;
     this.peer = null;
     this.modelPeer = null;
     this.remoteSharing = null;
     this.remoteModel = null;
+    this.invalidateModelCatalog('配对已断开');
     this.networkProxy.peerChanged();
     this.cancelAll('配对已断开');
     this.invitation = null;
     this.sessions.clear();
     await modelPeer?.close();
     await peer?.close();
+    if (catalogReading) {
+      let timer;
+      try { await Promise.race([catalogReading.promise.catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, 2000); timer.unref(); })]); }
+      finally { clearTimeout(timer); }
+    }
     this.emit('state');
   }
 }

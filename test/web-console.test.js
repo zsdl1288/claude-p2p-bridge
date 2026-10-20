@@ -29,7 +29,9 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     elements.get(form[1]).elements = [...form[2].matchAll(/\bid="([^"]+)"/g)].map((match) => elements.get(match[1]));
   }
   for (const input of html.matchAll(/<(?:input|option)[^>]+id="([^"]+)"[^>]+value="([^"]*)"/g)) elements.get(input[1]).value = input[2];
-  elements.get('profile').value = 'read'; elements.get('model-id').value = 'claude-code';
+  elements.get('profile').value = 'read';
+  const availableModels = [{ id: 'future-sonnet-id', name: 'Sonnet Next', description: 'B 账号可用模型' }, { id: 'custom-opus-id', name: 'Opus Next' }];
+  const readyModel = { enabled: true, available: true, modelsState: 'ready', models: availableModels };
   const calls = [], intervals = [];
   let snapshot = { instanceId: 'backend-first', revision: 1, identity: { loaded: true, role: null, locked: false, desiredOnline: false, canSwitchRole: true }, capabilities: { model: false, proxy: false }, model: {}, proxy: { guard: { supported: true } }, logs: [], network: { running: false, devices: [], addresses: [] } };
   let holdDisconnect = false, releaseDisconnect;
@@ -65,6 +67,8 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
       snapshot = { ...snapshot, revision: snapshot.revision + 1, capabilities: { model: true, proxy: true }, pairing: { saved: true }, ...(route === '/api/host' ? { invitation: 'p2pcc://pair/test' } : { invitation: null, online: true }) };
     } else if (route === '/api/model') {
       snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { enabled: body.enabled, available: body.enabled, config: body.enabled ? body : snapshot.model.config } };
+    } else if (route === '/api/models/refresh') {
+      snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, models: [...availableModels].reverse() } };
     }
     return Response.json(structuredClone(snapshot));
   };
@@ -95,7 +99,30 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     await element('network-login').onclick(); element('invitation').value = 'p2pcc://pair/test';
     element('client-form').onsubmit({ preventDefault() {} }); await tick(); button('api').onclick();
     assert.equal(element('model-host-panel').hidden, true); assert.equal(element('model-client-panel').hidden, false);
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: structuredClone(readyModel) }; await intervals[0]();
+    assert.deepEqual(element('model-id').children.map((item) => item.value), availableModels.map((item) => item.id), 'the model picker contains B model IDs without fixed aliases');
+    assert.equal(element('model-id').value, 'future-sonnet-id');
+    element('model-id').value = 'custom-opus-id'; element('model-id').onchange();
+    assert.match(element('api-example').textContent, /"model":"custom-opus-id"/, 'the copied example uses the current raw B model ID');
+    await element('model-test-form').onsubmit({ preventDefault() {} });
+    assert.equal(calls.find((call) => call.route === '/v1/chat/completions').body.model, 'custom-opus-id', 'test calls use the selected B model');
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, models: [], modelsState: 'loading' } }; await intervals[0]();
+    assert.equal(element('model-test-submit').disabled, true);
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: structuredClone(readyModel) }; await intervals[0]();
+    assert.equal(element('model-id').value, 'custom-opus-id', 'temporary loading without a cached list preserves the user selection');
+    await element('refresh-models').onclick();
+    assert.equal(calls.some((call) => call.route === '/api/models/refresh'), true);
+    assert.equal(element('model-id').value, 'custom-opus-id', 'refreshing and reordering the catalogue preserves a valid selection');
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, models: [availableModels[0]] } }; await intervals[0]();
+    assert.equal(element('model-id').value, 'future-sonnet-id', 'a removed model is replaced by the first current B model');
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, modelsState: 'loading' } }; await intervals[0]();
+    assert.equal(element('model-test-submit').disabled, true); assert.match(element('model-list-status').textContent, /正在从 B 获取/);
+    snapshot = { ...snapshot, revision: snapshot.revision + 1, model: { ...readyModel, modelsState: 'error', modelsError: '请重新登录 Claude' } }; await intervals[0]();
+    assert.equal(element('model-id').disabled, true); assert.equal(element('copy-example').disabled, true);
+    assert.match(element('model-list-status').textContent, /请重新登录 Claude/);
     snapshot = { ...snapshot, revision: snapshot.revision + 1, online: false, network: { ...snapshot.network, running: false } }; await intervals[0]();
+    assert.equal(element('model-id').disabled, true); assert.equal(element('refresh-models').disabled, true);
+    assert.match(element('model-list-status').textContent, /B 未连接/, 'offline cached models are not presented as available');
     assert.equal(element('tab-host').disabled, true, 'transient loss does not unlock identity');
     assert.equal(button('api').disabled, false, 'transient loss keeps authorized pages accessible');
 
@@ -117,7 +144,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     snapshot = { ...firstInstance, instanceId: restartedInstance.instanceId, revision: 4 }; await intervals[0]();
     assert.equal(element('sidebar-identity').textContent, 'B · 服务端', 'older revision from the current instance is still rejected');
 
-    snapshot = { ...restartedInstance, revision: 6, capabilities: { model: true, proxy: true }, model: { enabled: true, available: true }, network: { running: true, devices: [], addresses: [], message: '当前网络' }, identity: { ...restartedInstance.identity, desiredOnline: true, locked: true } };
+    snapshot = { ...restartedInstance, revision: 6, capabilities: { model: true, proxy: true }, model: structuredClone(readyModel), network: { running: true, devices: [], addresses: [], message: '当前网络' }, identity: { ...restartedInstance.identity, desiredOnline: true, locked: true } };
     await intervals[0]();
     holdRoute = '/api/probe';
     const oldProbe = element('probe').onclick(); await tick();
@@ -127,7 +154,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
 
     holdRoute = '/api/tailscale';
     const oldRefresh = element('refresh-network').onclick(); await tick();
-    snapshot = { ...snapshot, instanceId: 'backend-network-restarted', revision: 0, role: 'client', identity: { ...snapshot.identity, role: 'client' }, network: { ...snapshot.network, message: '新进程网络' } };
+    snapshot = { ...snapshot, instanceId: 'backend-network-restarted', revision: 0, role: 'client', online: true, identity: { ...snapshot.identity, role: 'client' }, network: { ...snapshot.network, message: '新进程网络' } };
     await intervals[0]();
     deferredRequest.resolve(Response.json({ running: false, devices: [], addresses: [], message: '过期网络' })); await oldRefresh;
     assert.equal(element('network-status').textContent, '新进程网络', 'a late manual refresh cannot overwrite the new identity network');
@@ -145,7 +172,7 @@ test('web console keeps identity, pairing, Claude and proxy flows separate', asy
     secondModelRequest.reject(new DOMException('cancelled', 'AbortError')); await oldModelError;
     assert.equal(element('model-test-output').textContent, '', 'a cancelled model request cannot publish into a different role');
 
-    snapshot = { ...snapshot, revision: 2, role: 'client', identity: { ...snapshot.identity, role: 'client' }, capabilities: { model: true, proxy: true }, model: { enabled: true, available: true }, controlConnectionId: 'first-control-session' };
+    snapshot = { ...snapshot, revision: 2, role: 'client', identity: { ...snapshot.identity, role: 'client' }, capabilities: { model: true, proxy: true }, model: structuredClone(readyModel), controlConnectionId: 'first-control-session' };
     await intervals[0]();
     const oldSessionResult = element('model-test-form').onsubmit({ preventDefault() {} }); await tick();
     const sessionRequest = deferredRequest;

@@ -83,13 +83,15 @@ void CheckNativeState() {
     Require(rejected, "Invalid UTF-8 SSE JSON was accepted");
 
     Require(DesktopModelApi::BaseUrl(6543) == L"http://127.0.0.1:6543/v1", "Harness must receive the model provider base URL");
-    auto modelExample = DesktopModelApi::PowerShellExample(L"Q:\\one's profile", 6543);
+    auto modelExample = DesktopModelApi::PowerShellExample(L"Q:\\one's profile", 6543, L"claude-new-model-2099");
     Require(modelExample.find(L"-LiteralPath 'Q:\\one''s profile\\api-token'") != std::wstring::npos,
             "The model API example must quote token paths safely");
     Require(modelExample.find(L"http://127.0.0.1:6543/v1/chat/completions") != std::wstring::npos &&
-            modelExample.find(L"messages = @(@{") != std::wstring::npos && modelExample.find(L"model = 'claude-code'") != std::wstring::npos &&
+            modelExample.find(L"messages = @(@{") != std::wstring::npos && modelExample.find(L"model = 'claude-new-model-2099'") != std::wstring::npos &&
             modelExample.find(L"/v1/run") == std::wstring::npos,
             "The copied example must call the model API instead of the B task endpoint");
+    Require(DesktopModelApi::PowerShellExample(L"Q:\\profile", 6543, L"provider's-model").find(L"model = 'provider''s-model'") != std::wstring::npos,
+            "The selected model ID must be preserved and quoted safely in copied PowerShell");
 }
 }
 

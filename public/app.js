@@ -1,7 +1,7 @@
 import { pages, uiState, allowedPage, deviceIdentity, deviceConnection } from './ui-state.js';
 
 const $ = (id) => document.getElementById(id);
-let token, apiBase, currentStatus, lastConfig, lastInvitation, selectedPeer, toastTimer, lastError;
+let token, apiBase, currentStatus, lastConfig, lastInvitation, selectedPeer, toastTimer, lastError, lastModels, selectedModelId = '';
 let page = 'connection', actionBusy = false, proxyBusy = false, polling = false, networkPolling = false, localAvailable = false, modelTest, mutation = 0;
 let proxyStatus = {};
 const retiredInstances = new Set();
@@ -167,10 +167,44 @@ $('probe').onclick = async () => {
 $('copy-token').onclick = () => copy(token);
 $('copy-url').onclick = () => copy(`${apiBase}/v1`);
 $('copy-example').onclick = () => copy($('api-example').textContent);
+$('refresh-models').onclick = () => action('/api/models/refresh', {});
 function updateExample() {
+  if (!$('model-id').value) { $('api-example').textContent = '获取 B 端模型列表并选择模型后，生成调用示例。'; return; }
   $('api-example').textContent = [`curl ${apiBase}/v1/chat/completions`, '  -H "Authorization: Bearer <API_TOKEN>"', '  -H "Content-Type: application/json"', `  -d '${JSON.stringify({ model: $('model-id').value, messages: [{ role: 'user', content: '你好' }], stream: false })}'`].join(' \\\n');
 }
-$('model-id').onchange = updateExample;
+$('model-id').onchange = () => { selectedModelId = $('model-id').value; renderModel(currentStatus, state()); };
+function renderModels(status, ui) {
+  const model = status.model || {};
+  const models = Array.isArray(model.models) ? model.models.filter((item) => item && typeof item.id === 'string' && item.id) : [];
+  const serialized = JSON.stringify(models);
+  if (serialized !== lastModels) {
+    const selected = selectedModelId;
+    $('model-id').replaceChildren();
+    for (const item of models.length ? models : [{ id: '', name: '等待 B 端模型列表' }]) {
+      const option = document.createElement('option'); option.value = item.id;
+      option.textContent = item.name && item.name !== item.id ? `${item.name} · ${item.id}` : item.id || item.name;
+      option.title = item.description || ''; $('model-id').append(option);
+    }
+    $('model-id').value = models.some((item) => item.id === selected) ? selected : models[0]?.id || '';
+    if (models.length) selectedModelId = $('model-id').value;
+    lastModels = serialized;
+  }
+  const online = localAvailable && ui.role === 'client' && status.online === true && ui.model;
+  const ready = online && model.modelsState === 'ready' && models.length > 0;
+  $('model-id').disabled = !ready || actionBusy || proxyBusy || Boolean(modelTest);
+  $('refresh-models').disabled = !online || actionBusy || proxyBusy || model.modelsState === 'loading';
+  $('copy-example').disabled = !ready;
+  let message = !online ? 'B 未连接，模型列表暂不可用；连接后会自动更新。'
+    : model.modelsState === 'loading' ? '正在从 B 获取 Claude 模型列表…'
+    : model.modelsState === 'error' ? `获取 B 模型列表失败：${model.modelsError || '请重试刷新模型列表。'}`
+    : model.modelsState === 'ready' ? `已从 B 获取 ${models.length} 个模型。`
+    : model.modelsError || 'B 模型列表暂不可用，请开启 B 的 Claude 服务后刷新。';
+  const selected = models.find((item) => item.id === $('model-id').value);
+  if (ready && selected?.description) message += ` ${selected.description}`;
+  $('model-list-status').textContent = message;
+  updateExample();
+  return ready;
+}
 function renderModel(status, ui) {
   const model = status.model || {};
   const host = ui.role === 'host';
@@ -182,7 +216,8 @@ function renderModel(status, ui) {
   $('model-message').textContent = model.message || 'Claude 服务由 B 单独开启。';
   for (const input of $('model-form').elements) input.disabled = actionBusy || proxyBusy || !localAvailable || !ui.model || !host;
   $('model-disable').disabled ||= !model.enabled;
-  $('model-test-submit').disabled = actionBusy || proxyBusy || !localAvailable || !ui.model || ui.role !== 'client' || !ready || Boolean(modelTest);
+  const modelsReady = renderModels(status, ui);
+  $('model-test-submit').disabled = actionBusy || proxyBusy || !localAvailable || !ui.model || ui.role !== 'client' || !ready || !modelsReady || Boolean(modelTest);
   $('model-test-cancel').hidden = !modelTest;
   const config = model.config || {};
   if (JSON.stringify(config) !== lastConfig) {

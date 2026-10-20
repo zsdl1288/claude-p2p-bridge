@@ -6,6 +6,19 @@ import { modelError } from '../src/model-api.js';
 const request = (extra = {}) => ({ model: 'claude-code', messages: [{ role: 'user', content: 'next step' }], ...extra });
 const minimalTools = Array.from({ length: 128 }, (_, index) => ({ type: 'function', function: { name: `tool_${index}` } }));
 
+test('normalization preserves dynamic provider model IDs without a fixed model allowlist', () => {
+  for (const model of ['haiku', 'claude-opus-future-20261020', 'sonnet[1m]', 'provider/claude-new:preview[1m]']) {
+    const canonical = normalizeChatRequest(request({ model }));
+    assert.equal(canonical.model, model);
+    assert.deepEqual(normalizeChatRequest(canonical), canonical);
+  }
+  // Membership is checked against B's live catalog by Bridge, while malformed
+  // names must still fail before they can become a subprocess argument.
+  for (const model of ['', ' --model', '--dangerously-skip-permissions', 'claude\n--unsafe', 'claude\0x', 1, {}, 'x'.repeat(1025)]) {
+    assert.throws(() => normalizeChatRequest(request({ model })), (error) => error.status === 400, JSON.stringify(model));
+  }
+});
+
 test('normalization remains idempotent across A, B and the CLI, including near-limit tool histories', () => {
   const body = request({ tools: minimalTools });
   body.messages[0].content = 'x'.repeat(modelInputLimit - Buffer.byteLength(JSON.stringify(body)) - 16000);

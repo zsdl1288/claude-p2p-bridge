@@ -8,7 +8,14 @@ import { createLocalServer } from '../src/server.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const token = 'synthetic-model-api-test-token';
-const model = 'claude-code';
+const model = 'claude-haiku-fixture-20261020';
+const sonnetModel = 'claude-sonnet-fixture-20261020';
+const opusModel = 'claude-opus-fixture-20261020';
+const fixtureModels = [
+  { id: model, name: 'Fixture Haiku', description: 'A fixture-only account model.' },
+  { id: sonnetModel, name: 'Fixture Sonnet', description: 'Fixture Sonnet.' },
+  { id: opusModel, name: 'Fixture Opus', description: 'Fixture Opus.' },
+];
 const tool = {
   type: 'function',
   function: {
@@ -80,7 +87,12 @@ async function setup(t, { join = true, clients = 1 } = {}) {
   const command = path.join(workspace, 'fake-cli.cjs');
   await writeFile(command, fakeCli);
   await writeFile(path.join(harnessDirectory, 'harness-only.txt'), 'model-local-fixture-result: A-side only');
-  const host = new Bridge({ demo: true });
+  const catalog = { models: structuredClone(fixtureModels), error: null, probes: 0 };
+  const host = new Bridge({ demo: true, modelCatalogProvider: async () => {
+    ++catalog.probes;
+    if (catalog.error) throw catalog.error;
+    return structuredClone(catalog.models);
+  } });
   const peers = [];
   const apps = [];
   t.after(async () => {
@@ -107,7 +119,7 @@ async function setup(t, { join = true, clients = 1 } = {}) {
     try { return (await readFile(path.join(workspace, 'calls.ndjson'), 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)); }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   };
-  return { host, peers, client: peers[0].bridge, url: peers[0].url, harnessDirectory, calls };
+  return { host, peers, client: peers[0].bridge, url: peers[0].url, harnessDirectory, calls, catalog };
 }
 
 function request(url, route, body, headers = {}) {
@@ -135,18 +147,69 @@ function assertModelError(body) {
   assert.ok(body.error.message.length > 0);
 }
 
-test('model API authenticates, discovers models and reports an unpaired A', { timeout: 15000 }, async (t) => {
+test('model API authenticates and reports that an unpaired A cannot discover B models', { timeout: 15000 }, async (t) => {
   const { url } = await setup(t, { join: false });
   assert.equal((await fetch(`${url}/v1/models`)).status, 401);
   assert.equal((await request(url, '/v1/models', undefined, { Authorization: 'Bearer incorrect' })).status, 401);
   const listing = await request(url, '/v1/models');
-  assert.equal(listing.status, 200);
+  assert.equal(listing.status, 503);
   const list = await listing.json();
-  assert.equal(list.object, 'list');
-  assert.deepEqual(list.data.map((entry) => entry.id).sort(), ['claude-code', 'claude-code-opus', 'claude-code-sonnet']);
+  assertModelError(list);
+  assert.equal('data' in list, false);
   const response = await request(url, '/v1/chat/completions', completion());
   assert.equal(response.status, 503);
   assertModelError(await response.json());
+});
+
+test('A discovers B account models and receives additions and removals across both encrypted connections', { timeout: 20000 }, async (t) => {
+  const { peers, calls, catalog } = await setup(t, { clients: 2 });
+  const initial = await request(peers[0].url, '/v1/models');
+  assert.equal(initial.status, 200);
+  const initialList = await initial.json();
+  assert.equal(initialList.object, 'list');
+  assert.deepEqual(initialList.data.map((entry) => entry.id).sort(), fixtureModels.map((entry) => entry.id).sort());
+  assert.ok(initialList.data.every((entry) => entry.object === 'model'));
+  assert.equal(initialList.data.some((entry) => ['claude-code', 'claude-code-sonnet', 'claude-code-opus'].includes(entry.id)), false);
+  const newModel = 'vendor/claude-next-fixture:preview[1m]';
+  catalog.models = [{ id: newModel, name: 'New account model', description: 'Added after pairing.' }];
+  await peers[0].bridge.refreshModels();
+  await until(() => peers.every(({ bridge }) => bridge.modelStatus().models?.some((entry) => entry.id === newModel)));
+  for (const peer of peers) {
+    const listing = await request(peer.url, '/v1/models');
+    assert.equal(listing.status, 200);
+    assert.deepEqual((await listing.json()).data.map((entry) => entry.id), [newModel]);
+    const selected = await request(peer.url, '/v1/chat/completions', completion('MODEL_PLAIN', { model: newModel }));
+    assert.equal(selected.status, 200);
+    assert.equal((await selected.json()).model, newModel);
+  }
+  const removed = await request(peers[0].url, '/v1/chat/completions', completion('removed model', { model: sonnetModel }));
+  assert.equal(removed.status, 400);
+  assertModelError(await removed.json());
+  const recorded = await calls();
+  assert.equal(recorded.length, 2);
+  assert.ok(recorded.every((entry) => entry.args[entry.args.indexOf('--model') + 1] === newModel));
+});
+
+test('catalog refresh failures surface as errors instead of advertising an empty or fixed model list', { timeout: 15000 }, async (t) => {
+  const { host, client, url, catalog, calls } = await setup(t);
+  assert.equal((await request(url, '/v1/models')).status, 200);
+  catalog.error = new Error('Fixture model catalog authentication failure');
+  await assert.rejects(host.refreshModels(), /catalog authentication failure/);
+  await until(() => client.modelStatus().modelsState === 'error');
+  const listing = await request(url, '/v1/models');
+  assert.ok(listing.status >= 500);
+  const body = await listing.json();
+  assertModelError(body);
+  assert.match(body.error.message, /catalog authentication failure/);
+  assert.equal('data' in body, false);
+  const blocked = await request(url, '/v1/chat/completions', completion());
+  assert.ok(blocked.status >= 500);
+  assertModelError(await blocked.json());
+  assert.equal((await calls()).length, 0);
+  catalog.error = null;
+  await host.refreshModels();
+  await until(() => client.modelStatus().modelsState === 'ready');
+  assert.equal((await request(url, '/v1/models')).status, 200);
 });
 
 test('a model decision becomes a real Harness-side tool call, then returns the tool result to B', { timeout: 20000 }, async (t) => {
@@ -156,7 +219,7 @@ test('a model decision becomes a real Harness-side tool call, then returns the t
     { role: 'developer', content: 'Tools execute on A. Return the requested file content.' },
     { role: 'user', content: 'MODEL_TOOL_ROUND: read harness-only.txt on A.' },
   ];
-  const first = await request(url, '/v1/chat/completions', completion('', { model: 'claude-code-sonnet', messages, tools: [tool], tool_choice: 'required', max_completion_tokens: 1000, temperature: 0.2, top_p: 0.9, n: 1 }));
+  const first = await request(url, '/v1/chat/completions', completion('', { model: sonnetModel, messages, tools: [tool], tool_choice: 'required', max_completion_tokens: 1000, temperature: 0.2, top_p: 0.9, n: 1 }));
   assert.equal(first.status, 200);
   const firstBody = await first.json();
   assert.equal(firstBody.object, 'chat.completion');
@@ -174,7 +237,7 @@ test('a model decision becomes a real Harness-side tool call, then returns the t
   const output = await readFile(path.join(harnessDirectory, args.relativePath), 'utf8');
   await assert.rejects(readFile(path.join(host.config.workspace, args.relativePath)), { code: 'ENOENT' });
   messages.push(choice.message, { role: 'tool', tool_call_id: invocation.id, content: output });
-  const second = await request(url, '/v1/chat/completions', completion('', { model: 'claude-code-sonnet', messages, tools: [tool], tool_choice: 'auto' }));
+  const second = await request(url, '/v1/chat/completions', completion('', { model: sonnetModel, messages, tools: [tool], tool_choice: 'auto' }));
   assert.equal(second.status, 200);
   const secondBody = await second.json();
   assert.equal(secondBody.choices[0].finish_reason, 'stop');
@@ -196,7 +259,7 @@ test('a model decision becomes a real Harness-side tool call, then returns the t
     assert.equal(entry.args.includes('--allowedTools'), false);
     assert.ok(entry.args.includes('--json-schema'));
     JSON.parse(entry.args[entry.args.indexOf('--json-schema') + 1]);
-    assert.equal(entry.args[entry.args.indexOf('--model') + 1], 'sonnet');
+    assert.equal(entry.args[entry.args.indexOf('--model') + 1], sonnetModel);
   }
 });
 
@@ -222,10 +285,10 @@ test('buffered SSE contains standard deltas, finish reason, usage and one comple
   assert.equal(typeof usage.usage.completion_tokens, 'number');
 });
 
-test('text-only streaming honors the opus alias and omits an unrequested usage frame', { timeout: 15000 }, async (t) => {
+test('text-only streaming forwards the selected account model and omits an unrequested usage frame', { timeout: 15000 }, async (t) => {
   const { url, calls } = await setup(t);
   const response = await request(url, '/v1/chat/completions', completion('MODEL_PLAIN', {
-    model: 'claude-code-opus', stream: true, max_tokens: 1024, tools: [tool], tool_choice: 'none',
+    model: opusModel, stream: true, max_tokens: 1024, tools: [tool], tool_choice: 'none',
   }));
   assert.equal(response.status, 200);
   const events = readSse(await response.text());
@@ -236,7 +299,7 @@ test('text-only streaming honors the opus alias and omits an unrequested usage f
   assert.equal(chunks.some((chunk) => chunk.choices.length === 0), false);
   assert.equal(chunks.some((chunk) => chunk.choices[0]?.delta.tool_calls?.length), false);
   const [recorded] = await calls();
-  assert.equal(recorded.args[recorded.args.indexOf('--model') + 1], 'opus');
+  assert.equal(recorded.args[recorded.args.indexOf('--model') + 1], opusModel);
 });
 
 test('invalid model inputs fail before dispatch and do not break the paired connection', { timeout: 15000 }, async (t) => {
@@ -373,6 +436,7 @@ test('a dropped model connection fails once and accepts a fresh request after re
 test('an admission failure after an immediate error callback is handled once and cancels its request', { timeout: 10000 }, async (t) => {
   let aborted = false;
   const bridge = {
+    async getModels() { return structuredClone(fixtureModels); },
     run(_request, emit, signal) {
       signal.addEventListener('abort', () => { aborted = true; }, { once: true });
       emit({ type: 'error', code: 'IMMEDIATE_FAILURE', message: 'Immediate provider admission failure' });

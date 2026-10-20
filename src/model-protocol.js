@@ -1,12 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { isModelId } from './claude-models.js';
 
 // A model request is an inference step, not permission to run B's project tools.
 // Only Harness executes the function calls returned by this adapter.
-export const modelCatalog = Object.freeze([
-  { id: 'claude-code', alias: null },
-  { id: 'claude-code-sonnet', alias: 'sonnet' },
-  { id: 'claude-code-opus', alias: 'opus' }
-]);
 export const modelInputLimit = 768 * 1024;
 const maxTextBytes = 256 * 1024;
 const maxCalls = 32;
@@ -51,7 +47,7 @@ export function normalizeChatRequest(body) {
   if (!object(body)) invalid('请求体必须是 JSON 对象');
   serialized(body, modelInputLimit, '模型请求');
   const model = body.model ?? 'claude-code';
-  if (!modelCatalog.some((item) => item.id === model)) invalid('未知模型，请使用 /v1/models 返回的模型 ID');
+  if (!isModelId(model)) invalid('模型 ID 格式无效，请使用 /v1/models 返回的模型 ID');
   if (!Array.isArray(body.messages) || !body.messages.length || body.messages.length > 2048) invalid('messages 必须包含 1–2048 条消息');
   if (body.stream !== undefined && body.stream !== null && typeof body.stream !== 'boolean') invalid('stream 必须是布尔值');
   if (body.n !== undefined && body.n !== null && body.n !== 1) invalid('当前仅支持 n=1');

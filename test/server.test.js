@@ -11,6 +11,7 @@ const headers = { Authorization: 'Bearer server-fixture-token', 'Content-Type': 
 async function fixture(t, overrides = {}) {
   const dispatched = [];
   const bridge = {
+    async getModels() { return [{ id: 'claude-code', name: 'Fixture account model' }]; },
     run(request, emit) {
       dispatched.push(request);
       emit({ type: 'claude', event: { type: 'result', is_error: false, result: 'immediate task result' } });
