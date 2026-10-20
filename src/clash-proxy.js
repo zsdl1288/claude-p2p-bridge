@@ -5,15 +5,20 @@ import { NetworkGuard, networkGuardDiagnostics } from './network-guard.js';
 import { atomicWrite } from './storage.js';
 
 const NODE = 'B 网络出口';
+// Claude's own service/content domains and the CLI's two documented telemetry
+// hosts. Shared registries, CDNs and source hosts remain outside this list.
+const claudeDomains = ['claude.ai', 'claude.com', 'claude.app', 'anthropic.com', 'claudeusercontent.com', 'claudemcpcontent.com'];
+const claudeTelemetry = ['http-intake.logs.us5.datadoghq.com', 'browser-intake-us5-datadoghq.com'];
 const safeGuard = { supported: false, active: false, message: '系统保护仅支持 Windows 内置组网模式；未启用时不能保证 Clash 退出后继续阻断。' };
 
 // JSON is a YAML 1.2 subset accepted by Mihomo. No executable scripts or
 // third-party subscription converters are involved in generating a profile.
-export function clashProfile({ port, username, password, helperName = 'bridge-net.exe', system = false }) {
+export function clashProfile({ port, username, password, helperName = 'bridge-net.exe', system = false, scope = 'all' }) {
   if (!Number.isInteger(port) || port < 1 || port > 65535 || !username || !password) throw new Error('本地代理尚未就绪');
   if (/[\r\n,]/.test(helperName)) throw new Error('网络组件名称无效');
+  if (!['all', 'claude'].includes(scope)) throw new Error('未知网络代理配置范围');
   const node = { name: NODE, type: 'socks5', server: '127.0.0.1', port, username, password, udp: true };
-  return {
+  const profile = {
     'mixed-port': 7890, 'allow-lan': false, 'bind-address': '127.0.0.1', mode: 'rule',
     'log-level': 'info', ipv6: true, 'find-process-mode': 'always',
     profile: { 'store-selected': false, 'store-fake-ip': true },
@@ -32,6 +37,27 @@ export function clashProfile({ port, username, password, helperName = 'bridge-ne
       'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve', 'IP-CIDR6,::1/128,DIRECT,no-resolve',
       `MATCH,${NODE}`]
   };
+  if (scope === 'claude') {
+    const directDns = ['223.5.5.5#DIRECT', '119.29.29.29#DIRECT'];
+    const claudeDns = [`https://1.1.1.1/dns-query#${NODE}`, `https://1.0.0.1/dns-query#${NODE}`];
+    profile.dns.nameserver = directDns;
+    profile.dns['proxy-server-nameserver'] = directDns;
+    profile.dns['fake-ip-filter-mode'] = 'whitelist';
+    profile.dns['fake-ip-filter'] = [...claudeDomains.map((domain) => `+.${domain}`), ...claudeTelemetry];
+    profile.dns['nameserver-policy'] = Object.fromEntries([
+      ...claudeDomains.map((domain) => [`+.${domain}`, claudeDns]),
+      ...claudeTelemetry.map((domain) => [domain, claudeDns])
+    ]);
+    // Sniff HTTP Host / TLS or QUIC SNI when a client still has a cached IP.
+    // Traffic without a recoverable domain cannot be identified by this list.
+    profile.sniffer = { enable: true, 'force-dns-mapping': true, 'parse-pure-ip': true, 'override-destination': true,
+      sniff: { HTTP: { ports: [80, '8080-8880'] }, TLS: { ports: [443, 8443] }, QUIC: { ports: [443, 8443] } } };
+    profile.rules = [
+      ...claudeDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${NODE}`),
+      ...claudeTelemetry.map((domain) => `DOMAIN,${domain},${NODE}`),
+      ...profile.rules.slice(0, -1), 'MATCH,DIRECT'];
+  }
+  return profile;
 }
 
 export class ClashProxy {
@@ -103,9 +129,13 @@ export class ClashProxy {
     else if (enabled) { phase = online ? 'ready' : 'blocked'; message = online ? 'B 出口已连接；请在 Clash 导入完整配置并开启 TUN。' : this.bridge.remoteSharing === false ? 'B 未开启网络共享，代理流量已阻断。' : 'B 已断开或正在恢复，代理流量已阻断，等待自动重连。'; }
     else if (role === 'client') message = '启用本地节点后，可将完整配置订阅导入 Mihomo / Clash Meta 客户端。';
     if (this.error) { phase = enabled ? 'blocked' : 'disabled'; message = this.error; }
+    if (online && phase === 'ready' && state.lastError?.code === 'PROXY_CAPACITY') message = '代理连接数已达上限，请等待空闲连接释放后重试';
+    const subscription = enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}` : '';
     return { enabled, sharing, online, state: phase, message, port: state.listenPort,
       connections: state.connections, uploadBytes: state.uploadBytes, downloadBytes: state.downloadBytes,
-      subscriptionUrl: enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}/config.yaml` : '',
+      connectionLimit: state.connectionLimit, sessionConnectionLimit: state.sessionConnectionLimit, lastError: state.lastError || null,
+      subscriptionUrl: subscription ? `${subscription}/config.yaml` : '',
+      claudeSubscriptionUrl: subscription ? `${subscription}/claude.yaml` : '',
       clients: state.clients || [], devices: this.devices(state.clients || []), guard: this.guardState };
   }
   devices(clients) {
@@ -153,10 +183,10 @@ export class ClashProxy {
       return this.status();
     });
   }
-  profile(nodesOnly = false) {
+  profile(nodesOnly = false, scope = 'all') {
     if (!this.proxy.enabled || !this.proxy.server?.listening) throw Object.assign(new Error('请先启用 A 本地 Clash 节点'), { status: 503 });
     const config = clashProfile({ port: this.proxy.port, username: this.proxy.username, password: this.proxy.password,
-      helperName: path.basename(this.bridge.networkAdapter?.command || 'bridge-net.exe'), system: !this.bridge.demo && !this.bridge.networkAdapter });
+      helperName: path.basename(this.bridge.networkAdapter?.command || 'bridge-net.exe'), system: !this.bridge.demo && !this.bridge.networkAdapter, scope });
     return JSON.stringify(nodesOnly ? { proxies: config.proxies } : config, null, 2) + '\n';
   }
   refreshGuard() {

@@ -174,6 +174,60 @@ func TestGuardFilterUsesMaskEqualityAndDetectsTampering(t *testing.T) {
 	}
 }
 
+func TestGuardFilterAcceptsIndexedRules(t *testing.T) {
+	appBytes := []byte{1, 2, 3, 0}
+	app := guardBlob{Size: uint32(len(appBytes)), Data: &appBytes[0]}
+	for _, rule := range guardRules() {
+		built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, rule, &app, 0x123400005678)
+		indexed := built.filter
+		indexed.Flags |= guardIndexed
+		if reason := guardFilterMismatch(&indexed, &built.filter); reason != "" || !guardEqualFilter(&indexed, &built.filter) {
+			t.Fatal("indexed rule failed verification", rule.id, reason)
+		}
+	}
+}
+
+func TestGuardFilterRejectsUnsafeFlagsWithOrWithoutIndexing(t *testing.T) {
+	built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, guardRule{id: "diagnostic", family: 4, dnsPort: 53, weight: 800}, nil, 0)
+	for _, test := range []struct {
+		name  string
+		flags uint32
+	}{
+		{"missing persistent", 0},
+		{"indexed without persistent", guardIndexed},
+		{"disabled", guardPersistent | guardDisabled},
+		{"indexed disabled", guardPersistent | guardIndexed | guardDisabled},
+		{"unknown flag", guardPersistent | 0x80000000},
+		{"indexed unknown flag", guardPersistent | guardIndexed | 0x80000000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := built.filter
+			changed.Flags = test.flags
+			if reason := guardFilterMismatch(&changed, &built.filter); !strings.HasPrefix(reason, "flags ") || guardEqualFilter(&changed, &built.filter) {
+				t.Fatal("unsafe filter flags passed verification", test.flags, reason)
+			}
+		})
+	}
+}
+
+func TestGuardIndexedFilterStillRejectsChangedPolicy(t *testing.T) {
+	built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, guardRule{id: "diagnostic", family: 4, dnsPort: 53, weight: 800}, nil, 0)
+	indexed := built.filter
+	indexed.Flags |= guardIndexed
+	changed := indexed
+	changed.Action.Type = guardPermit
+	if reason := guardFilterMismatch(&changed, &built.filter); !strings.HasPrefix(reason, "action ") || guardEqualFilter(&changed, &built.filter) {
+		t.Fatal("indexed filter with changed action passed verification", reason)
+	}
+	changed = indexed
+	condition := *built.filter.Conditions
+	condition.Value.Value = 54
+	changed.Conditions = &condition
+	if reason := guardFilterMismatch(&changed, &built.filter); !strings.Contains(reason, "condition 1 does not match") || guardEqualFilter(&changed, &built.filter) {
+		t.Fatal("indexed filter with changed condition passed verification", reason)
+	}
+}
+
 func TestGuardConditionIgnoresInactiveScalarUnionBytes(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("x64 ABI")

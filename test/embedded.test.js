@@ -184,8 +184,8 @@ test('embedded adapter keeps network listeners private while preserving encrypte
   let localPort;
   const released = [];
   const adapter = {
-    async listen({ port, targetPort }) { assert.equal(port, 3211); localPort = targetPort; return { id: 'host-listener', port }; },
-    async dial({ host, port }) { assert.equal(host, '100.100.1.2'); assert.equal(port, 3211); return { id: 'client-dial', port: localPort }; },
+    async listen({ port, targetPort, maxConnections }) { assert.equal(port, 3211); assert.equal(maxConnections, 0); localPort = targetPort; return { id: 'host-listener', port }; },
+    async dial({ host, port, maxConnections }) { assert.equal(host, '100.100.1.2'); assert.equal(port, 3211); assert.equal(maxConnections, 0); return { id: 'client-dial', port: localPort }; },
     async release(resource) { if (resource) released.push(resource.id); }
   };
   const pairing = makePairing('100.100.1.2', 3211);

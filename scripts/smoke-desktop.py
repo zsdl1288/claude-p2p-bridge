@@ -261,10 +261,13 @@ try:
     assert request(a2, "/api/join", {"invitation": host["invitation"]}, token_a2)["online"]
     wait_all_connected(a, token_a, a2, token_a2, b, token_b)
     listing = request(a, "/v1/models", token=token_a)
-    assert {item["id"] for item in listing["data"]} == {"default", "sonnet", "opus"}, listing
+    advertised = request(b, "/api/status", token=token_b)["model"]["models"]
+    assert listing["data"] and {item["id"] for item in listing["data"]} == {item["id"] for item in advertised}
+    model_id = listing["data"][0]["id"]
     messages = [{"role": "user", "content": "[tool] Read the A-only fixture."}]
     tools = [{"type": "function", "function": {"name": "read_local_fixture", "description": "Read a file on A.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}]
-    model_first = request(a, "/v1/chat/completions", {"model": "claude-code", "messages": messages, "tools": tools, "tool_choice": "required", "stream": False}, token_a)
+    model_first = request(a, "/v1/chat/completions", {"model": model_id, "messages": messages, "tools": tools, "tool_choice": "required", "stream": False}, token_a)
+    assert model_first["model"] == model_id, model_first
     model_message = model_first["choices"][0]["message"]
     assert model_first["choices"][0]["finish_reason"] == "tool_calls", model_first
     model_call = model_message["tool_calls"][0]
@@ -273,7 +276,7 @@ try:
     local_fixture = directory / "caller/harness-only.txt"
     local_fixture.write_text("EXE-HARNESS-A-ONLY-RESULT", encoding="utf-8")
     messages += [model_message, {"role": "tool", "tool_call_id": model_call["id"], "content": local_fixture.read_text(encoding="utf-8")}]
-    model_final = request(a, "/v1/chat/completions", {"model": "claude-code", "messages": messages, "tools": tools, "stream": False}, token_a)
+    model_final = request(a, "/v1/chat/completions", {"model": model_id, "messages": messages, "tools": tools, "stream": False}, token_a)
     assert model_final["choices"][0]["finish_reason"] == "stop", model_final
     assert "EXE-HARNESS-A-ONLY-RESULT" in model_final["choices"][0]["message"]["content"]
     print("PASS: packaged model discovery and structured tool round-trip; Harness fixture runs on A and returns its result to B.", flush=True)
@@ -333,7 +336,7 @@ try:
     restored = request(b, "/api/status", token=token_b)
     assert restored["invitation"] == host["invitation"], "B changed its pairing code on restart"
     assert restored["model"]["config"]["workspace"] == configured_host["model"]["config"]["workspace"]
-    restored_model = request(a, "/v1/chat/completions", {"model": "claude-code", "messages": [{"role": "user", "content": "model after saved pairing restart"}], "stream": False}, token_a)
+    restored_model = request(a, "/v1/chat/completions", {"model": model_id, "messages": [{"role": "user", "content": "model after saved pairing restart"}], "stream": False}, token_a)
     assert "model after saved pairing restart" in restored_model["choices"][0]["message"]["content"]
     result = request(a, "/v1/run", {"prompt": "after automatic restart", "stream": False}, token_a)
     assert result["success"] and "after automatic restart" in result["result"]["result"]

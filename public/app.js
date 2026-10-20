@@ -17,8 +17,8 @@ async function api(route, body, signal) {
   if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error?.message || data.error || `HTTP ${response.status}`); }
   return response;
 }
-async function copy(text) {
-  try { await navigator.clipboard.writeText(text); toast('已复制'); }
+async function copy(text, successMessage = '已复制') {
+  try { await navigator.clipboard.writeText(text); toast(successMessage); }
   catch { toast('复制失败，请手动选择文本复制', true); }
 }
 function readInvitation(invitation) {
@@ -262,6 +262,7 @@ function renderProxy(proxy = {}, ui = state()) {
   $('proxy-enable').textContent = proxy.enabled ? '关闭本地 Clash 节点' : '启用本地 Clash 节点';
   $('proxy-enable').disabled = actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client';
   $('proxy-subscription').value = proxy.subscriptionUrl || ''; $('copy-subscription').disabled = actionBusy || proxyBusy || !localAvailable || !proxy.subscriptionUrl;
+  $('copy-claude-subscription').disabled = actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client' || !proxy.claudeSubscriptionUrl;
   renderDevices($('proxy-device-list'), proxy.devices || [], { empty: '等待本机与已配对 B 的连接状态。' });
   $('proxy-clients').replaceChildren();
   const clients = proxy.clients || [];
@@ -275,12 +276,13 @@ function renderProxy(proxy = {}, ui = state()) {
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
   const guard = proxy.guard || {}, unknown = guard.state === 'unknown' || guard.verification === 'unknown';
-  const guardMessage = `${unknown ? '保护状态未验证，请检查或明确关闭' : guard.state === 'partial' ? '保护规则未通过校验' : guard.active ? '系统保护已验证生效' : '系统保护未启用'}${guard.message ? ` · ${guard.message}` : ''}`;
+  const guardMessage = `${unknown ? '全局保护状态未验证，请检查或明确关闭' : guard.state === 'partial' ? '全局保护规则未通过校验' : guard.active ? '全局系统保护已验证生效' : '全局系统保护未启用'}${guard.message ? ` · ${guard.message}` : ''}`;
   $('proxy-guard-state').textContent = $('settings-guard-state').textContent = guardMessage;
   const unavailable = actionBusy || proxyBusy || !localAvailable || !guard.supported;
   $('proxy-guard').disabled = unavailable || ui.role !== 'client' || !ui.proxy || !proxy.enabled;
   for (const id of ['proxy-guard-verify', 'proxy-guard-disable', 'settings-guard-verify', 'settings-guard-disable']) $(id).disabled = unavailable;
-  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${proxy.connections || 0} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
+  const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : proxy.connectionLimit === 0 ? '（不设数量上限）' : ''}`;
+  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
 }
 async function proxyAction(route, body) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -300,6 +302,22 @@ $('proxy-guard').onclick = () => proxyAction('/api/proxy/guard', { enabled: true
 for (const id of ['proxy-guard-verify', 'settings-guard-verify']) $(id).onclick = () => proxyAction('/api/proxy/guard/verify', {});
 for (const id of ['proxy-guard-disable', 'settings-guard-disable']) $(id).onclick = () => proxyAction('/api/proxy/guard', { enabled: false });
 $('copy-subscription').onclick = () => { if (proxyStatus.subscriptionUrl) copy(proxyStatus.subscriptionUrl); };
+$('copy-claude-subscription').onclick = async () => {
+  const ui = state();
+  if (actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client') return;
+  const revision = mutation;
+  proxyBusy = true; render(currentStatus);
+  try {
+    const result = await (await api('/api/proxy')).json();
+    if (revision !== mutation) return;
+    const proxy = result.proxy || result, subscription = proxy.claudeSubscriptionUrl;
+    if (!subscription) { toast('请先启用本地 Clash 节点，并确认客户端支持 Claude 专用配置。', true); return; }
+    const guard = proxy.guard || {};
+    const warning = guard.active === true || guard.state === 'partial' || guard.state === 'unknown' || guard.verification === 'unknown';
+    await copy(subscription, `Claude 专用配置已复制，请在 Clash 导入并切换此完整配置，保持规则模式与 TUN${warning ? '。全局保护未确认关闭，可能阻断其他网站，请在原数据目录明确关闭（UAC）' : ''}`);
+  } catch (error) { if (revision === mutation) toast(error.message, true); }
+  finally { proxyBusy = false; render(currentStatus); }
+};
 
 function render(status) {
   if (!status) return;
