@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { NetworkGuard, networkGuardArguments, networkGuardProfile } from '../src/network-guard.js';
+import { NetworkGuard, networkGuardArguments, networkGuardDiagnostics, networkGuardProfile } from '../src/network-guard.js';
 
 test('guard commands cannot turn profile identifiers into shell commands or paths', () => {
   for (const id of ['', '../a', 'a b', 'a;whoami', 'A', '--disable', 'a\nstatus']) assert.throws(() => networkGuardArguments('enable', id));
@@ -47,6 +47,49 @@ test('guard refuses partial, inconsistent, wrong-profile or unverified enabled s
   ]) {
     const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async () => ({ stdout: JSON.stringify({ supported: true, profileId: 'profile-a', ...result }) }) });
     await assert.rejects(guard.enable());
+  }
+});
+
+test('failed guard changes preserve verified partial rules and their full diagnostics', async () => {
+  const status = { supported: true, profileId: 'profile-a', state: 'partial', enabled: false,
+    filterCount: 46, expectedFilters: 46, issues: ['changed filter: out-v4-dns', 'verified 42 of 46 required filters'] };
+  for (const action of ['enable', 'disable']) {
+    const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async () => ({ stdout: JSON.stringify(status) }) });
+    await assert.rejects(guard[action](), (error) => {
+      assert.deepEqual(error.guardStatus, status);
+      assert.match(error.message, /检测到 46 条过滤规则，预期 46 条/);
+      assert.match(error.message, /verified 42 of 46 required filters/);
+      assert.match(error.message, action === 'enable' ? /规则已存在但验证未通过/ : /规则仍存在，尚未恢复直连/);
+      return true;
+    });
+    assert.equal(guard.mutating, false);
+  }
+});
+
+test('brief guard diagnostics retain the verified count after many individual mismatches', () => {
+  const status = { filterCount: 46, expectedFilters: 46,
+    issues: [...Array.from({ length: 8 }, (_, index) => `changed filter: ${index}`), 'verified 38 of 46 required filters'] };
+  const diagnostic = networkGuardDiagnostics(status);
+  assert.match(diagnostic, /检测到 46 条过滤规则，预期 46 条/);
+  assert.match(diagnostic, /verified 38 of 46 required filters/);
+  assert.match(diagnostic, /changed filter: 0/);
+  assert.doesNotMatch(diagnostic, /changed filter: 2/);
+  assert.match(diagnostic, /另有 6 项诊断信息/);
+  assert.equal(status.issues.length, 9);
+});
+
+test('failed changes distinguish absent rules from an unreadable protection state', async () => {
+  for (const { action, result, message } of [
+    { action: 'enable', result: { state: 'disabled', filterCount: 0, expectedFilters: 46 }, message: /未检测到保护规则/ },
+    { action: 'disable', result: { state: 'unknown' }, message: /关闭状态未验证，不能确认已恢复直连/ },
+  ]) {
+    const status = { supported: true, profileId: 'profile-a', enabled: false, ...result };
+    const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async () => ({ stdout: JSON.stringify(status) }) });
+    await assert.rejects(guard[action](), (error) => {
+      assert.deepEqual(error.guardStatus, status);
+      assert.match(error.message, message);
+      return true;
+    });
   }
 });
 

@@ -35,6 +35,22 @@ function validateGuardStatus(result, profileId) {
   return result;
 }
 
+export function networkGuardDiagnostics(value) {
+  const details = [];
+  if (Number.isSafeInteger(value.filterCount) && value.filterCount >= 0 &&
+      Number.isSafeInteger(value.expectedFilters) && value.expectedFilters > 0) {
+    details.push(`检测到 ${value.filterCount} 条过滤规则，预期 ${value.expectedFilters} 条`);
+  }
+  const issues = Array.isArray(value.issues) ? value.issues.filter((issue) => typeof issue === 'string' && issue) : [];
+  // The total installed count is not the verified count. Keep the native
+  // verification summary even when individual mismatches fill the issue list.
+  const summary = issues.find((issue) => /^verified \d+ of \d+ required filters$/.test(issue));
+  const ordered = summary ? [summary, ...issues.filter((issue) => issue !== summary)] : issues;
+  details.push(...ordered.slice(0, 3));
+  if (ordered.length > 3) details.push(`另有 ${ordered.length - 3} 项诊断信息`);
+  return details.join('；');
+}
+
 export function networkGuardProfile(directory) {
   if (typeof directory !== 'string' || !directory) throw new Error('保护配置目录不能为空');
   const normalized = path.resolve(directory).toLowerCase();
@@ -106,8 +122,14 @@ export class NetworkGuard {
     this.mutating = true;
     try {
       const result = await this.call(action);
-      if (action === 'enable' && result.state !== 'enabled') throw new Error('网络保护未完整生效，请检查过滤规则状态');
-      if (action === 'disable' && result.state !== 'disabled') throw new Error('网络保护尚未完全移除，请检查过滤规则状态');
+      if ((action === 'enable' && result.state !== 'enabled') || (action === 'disable' && result.state !== 'disabled')) {
+        const message = action === 'enable'
+          ? result.state === 'partial' ? '网络保护规则已存在但验证未通过，不能保证完整阻断'
+            : result.state === 'disabled' ? '网络保护未启用，未检测到保护规则' : '网络保护启用状态未验证，请检查系统保护'
+          : result.state === 'unknown' ? '网络保护关闭状态未验证，不能确认已恢复直连' : '网络保护规则仍存在，尚未恢复直连';
+        const diagnostic = networkGuardDiagnostics(result);
+        throw Object.assign(new Error(`${message}${diagnostic ? `；${diagnostic}` : ''}`), { guardStatus: result });
+      }
       return result;
     } finally { this.mutating = false; }
   }

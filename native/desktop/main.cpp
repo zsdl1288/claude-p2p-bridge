@@ -238,14 +238,14 @@ class Application {
         Label(L"Clash 完整配置订阅 · 仅在 A 本机使用", 228, 378, 580, 20, 3, 1, 3, true);
         Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 404, 556, 30, 3, 1, false, true, true);
         Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 404, 192, 30, 3, 1, true);
-        Label(L"导入完整配置，仅开启 Clash TUN；关闭指向本机 Clash 的系统代理 / 代理脚本。", 228, 444, 764, 20, 3, 1, 3, true); widgets_.back().stretch = true;
+        Label(L"导入完整配置，仅开启 Clash TUN（无需改网卡名）；关闭本机 Clash 的系统代理 / 代理脚本。", 228, 444, 764, 20, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"设备在线表示配对连接可用；“使用中”表示该设备正连接网络共享。\r\n停止共享仅关闭代理连接，不会中断 Claude 模型服务。", 228, 634, 764, 42, 3, 2, 3, true); widgets_.back().stretch = true;
         Label(L"本机 · 系统断线保护", 228, 502, 700, 24, 3, 1, 1);
         proxyGuardMessage_ = Label(L"正在读取保护状态…", 228, 536, 764, 40, 3, 1, 3); widgets_.back().stretch = true;
         Button(L"启用 / 刷新保护（UAC）", PROXY_GUARD, 228, 584, 252, 32, 3, 1);
         Button(L"检查保护（UAC）", PROXY_GUARD_VERIFY, 492, 584, 224, 32, 3, 1);
         Button(L"关闭保护并恢复本机直连（UAC）", PROXY_GUARD_DISABLE, 228, 626, 488, 32, 3, 1);
-        Label(L"须先导入完整配置并开启 ClaudeBridgeTun。退出私网或切换身份不会自动撤除系统保护。", 228, 666, 764, 18, 3, 1, 3, true); widgets_.back().stretch = true;
+        Label(L"支持 ClaudeBridgeTun / Mihomo；网卡重建后请刷新保护。退出私网或切换身份不会撤除保护。", 228, 666, 764, 18, 3, 1, 3, true); widgets_.back().stretch = true;
         Label(L"后台运行", 228, 132, 540, 24, 4, 0, 1);
         Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, 172, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
         Button(L"收起到托盘", MINIMIZE_TRAY, 228, 224, 220, 34, 4);
@@ -523,7 +523,8 @@ class Application {
         const auto guard = proxy.value("guard", Json::object());
         const bool active = guard.is_object() && guard.value("active", false);
         const bool unknown = guard.is_object() && (guard.value("state", "") == "unknown" || guard.value("verification", "") == "unknown");
-        auto guardMessage = std::wstring(unknown ? L"保护状态未验证，请检查或明确关闭" : active ? L"系统保护已验证生效" : L"系统保护未启用") + L"\r\n" + Wide(guard.is_object() ? guard.value("message", "") : "");
+        const bool partial = guard.is_object() && guard.value("state", "") == "partial";
+        auto guardMessage = std::wstring(unknown ? L"保护状态未验证，请检查或明确关闭" : partial ? L"保护规则未通过校验" : active ? L"系统保护已验证生效" : L"系统保护未启用") + L"\r\n" + Wide(guard.is_object() ? guard.value("message", "") : "");
         Text(proxyGuardMessage_, guardMessage); Text(settingsGuardMessage_, guardMessage);
         RenderDevices(proxyPeerList_, proxy.value("devices", Json::array()), lastProxyDevices_, true);
         UpdateButtons();

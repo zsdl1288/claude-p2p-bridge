@@ -3,6 +3,7 @@
 package netcore
 
 import (
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -10,6 +11,99 @@ import (
 )
 
 // These tests never open the filtering engine, launch UAC or add policy rules.
+func guardTestAdapter(name string, luid uint64) *windows.IpAdapterAddresses {
+	friendlyName, _ := windows.UTF16PtrFromString(name)
+	return &windows.IpAdapterAddresses{FriendlyName: friendlyName, IfType: 53, Luid: luid, OperStatus: windows.IfOperStatusUp}
+}
+
+func guardTestAdapterChain(adapters ...*windows.IpAdapterAddresses) *windows.IpAdapterAddresses {
+	for i := 1; i < len(adapters); i++ {
+		adapters[i-1].Next = adapters[i]
+	}
+	if len(adapters) == 0 {
+		return nil
+	}
+	return adapters[0]
+}
+
+func TestGuardSupportsOnlyFixedTunNames(t *testing.T) {
+	for _, name := range []string{"ClaudeBridgeTun", "Mihomo", "mihomo", "CLAUDEBRIDGETUN"} {
+		if !supportedTunAdapterName(name) {
+			t.Fatal("supported TUN name rejected", name)
+		}
+	}
+	for _, name := range []string{"", "Ethernet", "Wi-Fi", "Mihomo 2", "OtherMihomo", " ClaudeBridgeTun"} {
+		if supportedTunAdapterName(name) {
+			t.Fatal("arbitrary adapter name accepted", name)
+		}
+	}
+}
+
+func TestGuardSelectsUniqueActiveTunWithInactiveLeftovers(t *testing.T) {
+	for _, name := range []string{"ClaudeBridgeTun", "Mihomo", "mihomo"} {
+		t.Run(name, func(t *testing.T) {
+			stale := guardTestAdapter("ClaudeBridgeTun", 11)
+			stale.OperStatus = windows.IfOperStatusDown
+			live := guardTestAdapter(name, 22)
+			unrelated := guardTestAdapter("Ethernet", 33)
+			unrelated.IfType = 6
+			first := guardTestAdapterChain(stale, unrelated, live, guardTestAdapter(name, 22))
+			match, err := guardSelectTun(first)
+			if err != nil || match.name != name || match.luid != 22 {
+				t.Fatal("unique active Wintun was not selected", match, err)
+			}
+		})
+	}
+}
+
+func TestGuardRejectsAbsentInvalidOrAmbiguousTun(t *testing.T) {
+	physical := guardTestAdapter("Mihomo", 11)
+	physical.IfType = 6
+	mac := guardTestAdapter("Mihomo", 11)
+	mac.PhysicalAddressLength = 6
+	inactive := guardTestAdapter("Mihomo", 11)
+	inactive.OperStatus = windows.IfOperStatusDown
+	cases := map[string]*windows.IpAdapterAddresses{
+		"absent":          nil,
+		"unapproved name": guardTestAdapter("OtherTun", 11),
+		"physical":        physical,
+		"has MAC":         mac,
+		"zero LUID":       guardTestAdapter("Mihomo", 0),
+		"inactive":        inactive,
+		"both names":      guardTestAdapterChain(guardTestAdapter("Mihomo", 11), guardTestAdapter("ClaudeBridgeTun", 22)),
+		"duplicate name":  guardTestAdapterChain(guardTestAdapter("Mihomo", 11), guardTestAdapter("Mihomo", 22)),
+	}
+	for name, first := range cases {
+		t.Run(name, func(t *testing.T) {
+			match, err := guardSelectTun(first)
+			if err == nil || match.luid != 0 || !strings.Contains(err.Error(), "ClaudeBridgeTun") || !strings.Contains(err.Error(), "Mihomo") {
+				t.Fatal("invalid adapter selection was accepted or returned an unclear error", match, err)
+			}
+		})
+	}
+}
+
+func TestGuardRecreatedTunNeedsNewLUIDPermit(t *testing.T) {
+	original, err := guardSelectTun(guardTestAdapter("Mihomo", 11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := guardSelectTun(guardTestAdapter("Mihomo", 22))
+	if err != nil || recreated.name != original.name || recreated.luid == original.luid {
+		t.Fatal("same name must not imply the same interface", recreated, err)
+	}
+	for _, rule := range guardRules() {
+		if !rule.tun {
+			continue
+		}
+		stored := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, rule, nil, original.luid)
+		replacement := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, rule, nil, recreated.luid)
+		if guardEqualFilter(&stored.filter, &replacement.filter) {
+			t.Fatal("a recreated interface was authorized by the old persistent permit")
+		}
+	}
+}
+
 func TestGuardWindowsX64ABI(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("x64 ABI")
@@ -77,6 +171,65 @@ func TestGuardFilterUsesMaskEqualityAndDetectsTampering(t *testing.T) {
 		if guardEqualFilter(&changed, &built.filter) {
 			t.Fatal("changed action was accepted")
 		}
+	}
+}
+
+func TestGuardConditionIgnoresInactiveScalarUnionBytes(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("x64 ABI")
+	}
+	for _, scalar := range []struct {
+		kind     uint32
+		inactive uintptr
+	}{{guardUint8, ^uintptr(0xff)}, {guardUint16, ^uintptr(0xffff)}, {guardUint32, ^uintptr(0xffffffff)}} {
+		for _, value := range []uintptr{0, 58} {
+			expected := guardCondition{Key: guardCondRemotePort, Value: guardValue{Type: scalar.kind, Value: value}}
+			actual := expected
+			// RPC only defines the selected 1/2/4-byte integer member. The
+			// remaining bytes may contain unrelated allocation contents.
+			actual.Value.Value |= scalar.inactive
+			if !guardEqualCondition(actual, expected) || !guardEqualCondition(expected, actual) {
+				t.Fatal("inactive union bytes changed a scalar condition", scalar.kind, value)
+			}
+			actual.Value.Value ^= 1
+			if guardEqualCondition(actual, expected) {
+				t.Fatal("changed scalar value was accepted", scalar.kind, value)
+			}
+		}
+	}
+}
+
+func TestGuardConditionStillChecksPointerValues(t *testing.T) {
+	luid := uint64(0x123400005678)
+	changedLUID := luid + 1
+	expected := guardCondition{Key: guardCondInterface, Value: guardValue{Type: guardUint64, Value: uintptr(unsafe.Pointer(&luid))}}
+	actual := expected
+	actual.Value.Value = 0
+	if guardEqualCondition(actual, expected) || guardEqualCondition(expected, actual) {
+		t.Fatal("missing LUID pointer was accepted")
+	}
+	actual.Value.Value = uintptr(unsafe.Pointer(&changedLUID))
+	if guardEqualCondition(actual, expected) {
+		t.Fatal("changed LUID was accepted")
+	}
+}
+
+func TestGuardFilterMismatchDiagnosesFlagsAndConditions(t *testing.T) {
+	built := guardBuildFilter("profile-a", `C:\Trusted\bridge-net.exe`, guardRule{id: "diagnostic", family: 4, dnsPort: 53, weight: 800}, nil, 0)
+	if reason := guardFilterMismatch(&built.filter, &built.filter); reason != "" || !guardEqualFilter(&built.filter, &built.filter) {
+		t.Fatal("unchanged filter failed verification", reason)
+	}
+	changed := built.filter
+	changed.Flags |= guardDisabled
+	if reason := guardFilterMismatch(&changed, &built.filter); reason != "flags 0x00000021; expected 0x00000001" || guardEqualFilter(&changed, &built.filter) {
+		t.Fatal("disabled filter diagnostic was inaccurate", reason)
+	}
+	changed = built.filter
+	condition := *built.filter.Conditions
+	condition.Value.Value = 54
+	changed.Conditions = &condition
+	if reason := guardFilterMismatch(&changed, &built.filter); !strings.Contains(reason, "condition 1 does not match") || !strings.Contains(reason, guardCondRemotePort.String()) || guardEqualFilter(&changed, &built.filter) {
+		t.Fatal("changed condition diagnostic was inaccurate", reason)
 	}
 }
 

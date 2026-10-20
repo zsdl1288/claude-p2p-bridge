@@ -29,7 +29,7 @@ func ConfigureBootstrapNetwork() {
 		if err != nil {
 			return nil, err
 		}
-		if iface == nil || iface.FriendlyName() == "ClaudeBridgeTun" {
+		if iface == nil || supportedTunAdapterName(iface.FriendlyName()) {
 			return nil, errors.New("no physical default route available for network bootstrap")
 		}
 		var servers []string

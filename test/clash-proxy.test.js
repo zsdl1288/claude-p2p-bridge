@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import { Bridge } from '../src/bridge.js';
 import { createLocalServer } from '../src/server.js';
 import { clashProfile } from '../src/clash-proxy.js';
+import { NetworkGuard } from '../src/network-guard.js';
 
 const token = 'clash-proxy-test-token';
 const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -151,6 +152,33 @@ test('network protection startup, settings recovery, status reads and close neve
   assert.equal(guard.calls.some((call) => call !== 'status'), false);
 });
 
+test('an unavailable protected TUN stays active and requests an explicit refresh without changing rules', async (t) => {
+  const calls = [];
+  const guard = {
+    async status() { calls.push('status'); return { supported: true, state: 'enabled', enabled: true, tunName: 'Mihomo', tunReady: false }; },
+    async enable() { calls.push('enable'); },
+    async disable() { calls.push('disable'); }
+  };
+  const { app, request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
+  const status = await (await request('/api/proxy')).json();
+  assert.equal(status.guard.active, true); assert.equal(status.guard.tunReady, false);
+  assert.match(status.guard.message, /仍在阻断/); assert.match(status.guard.message, /Mihomo/);
+  assert.match(status.guard.message, /启用 \/ 刷新系统保护/);
+  await app.proxy.refreshGuard(); await app.close();
+  assert.equal(calls.every((call) => call === 'status'), true);
+});
+
+test('a ready Mihomo TUN reports its actual name without requiring ClaudeBridgeTun', async (t) => {
+  const guard = {
+    async status() { return { supported: true, state: 'enabled', enabled: true, verified: true, tunName: 'Mihomo', tunReady: true }; }
+  };
+  const { request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
+  const status = await (await request('/api/proxy')).json();
+  assert.equal(status.guard.active, true); assert.equal(status.guard.tunReady, true);
+  assert.match(status.guard.message, /系统保护已验证启用（Mihomo）/);
+  assert.doesNotMatch(status.guard.message, /ClaudeBridgeTun|请开启|请启动/);
+});
+
 test('a restored occupied SOCKS port blocks visibly and never silently chooses another port', { timeout: 15000 }, async (t) => {
   const directory = await temporaryDirectory(t), fixture = await paired(t, { directory });
   await enable(fixture); const originalPort = fixture.a.app.proxy.status().port; await fixture.a.app.close();
@@ -212,6 +240,71 @@ test('explicit enable preserves verified native result even when ordinary status
   assert.equal(result.guard.state, 'enabled'); assert.equal(result.guard.active, true); assert.equal(result.guard.verified, true);
   assert.equal(calls.filter((call) => call === 'enable').length, 1);
   assert.equal(calls.filter((call) => call === 'status').length, before);
+});
+
+test('partial enable keeps administrator diagnostics and ignores an older unknown poll', { timeout: 15000 }, async (t) => {
+  const stale = Promise.withResolvers();
+  const unknown = { supported: true, profileId: 'profile-a', state: 'unknown', enabled: false };
+  const partial = { supported: true, profileId: 'profile-a', state: 'partial', enabled: false,
+    filterCount: 46, expectedFilters: 46, issues: ['changed filter: out-v4-dns', 'verified 42 of 46 required filters'] };
+  let reads = 0;
+  const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async (_command, args) => {
+    if (args[1] === 'status') return ++reads === 2 ? stale.promise : { stdout: JSON.stringify(unknown) };
+    assert.equal(args[1], 'elevate-enable');
+    return { stdout: JSON.stringify(partial) };
+  } });
+  const fixture = await paired(t, { proxyGuard: guard }); await enable(fixture);
+  const poll = fixture.a.app.proxy.refreshGuard();
+  assert.equal(reads, 2);
+  const response = await fixture.a.request('/api/proxy/guard', { enabled: true });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /verified 42 of 46 required filters/);
+  assert.equal(reads, 2);
+  const result = fixture.a.app.proxy.status().guard;
+  assert.equal(result.state, 'partial'); assert.equal(result.active, false);
+  assert.equal(result.filterCount, 46); assert.equal(result.expectedFilters, 46);
+  assert.deepEqual(result.issues, partial.issues);
+  assert.match(result.message, /不能保证完整阻断/);
+  assert.match(result.message, /verified 42 of 46 required filters/);
+  stale.resolve({ stdout: JSON.stringify(unknown) }); await poll;
+  assert.equal(fixture.a.app.proxy.status().guard.state, 'partial');
+  // A genuinely later failed read is still unknown, never a verified removal.
+  await fixture.a.app.proxy.refreshGuard();
+  assert.equal(fixture.a.app.proxy.status().guard.state, 'unknown');
+  assert.equal(fixture.a.app.proxy.status().guard.active, false);
+});
+
+test('partial disable keeps remaining rules visible without claiming restored access', async (t) => {
+  const calls = [];
+  const partial = { supported: true, profileId: 'profile-a', state: 'partial', enabled: false,
+    filterCount: 1, expectedFilters: 46, issues: ['verified 1 of 46 required filters'] };
+  const guard = new NetworkGuard({ platform: 'win32', profileId: 'profile-a', execute: async (_command, args) => {
+    calls.push(args[1]);
+    return { stdout: JSON.stringify(args[1] === 'status'
+      ? { supported: true, profileId: 'profile-a', state: 'unknown', enabled: false } : partial) };
+  } });
+  const { app, request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
+  const response = await request('/api/proxy/guard', { enabled: false });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /规则仍存在，尚未恢复直连/);
+  assert.equal(app.proxy.status().guard.state, 'partial');
+  assert.equal(app.proxy.status().guard.active, false);
+  assert.equal(app.proxy.status().guard.filterCount, 1);
+  assert.deepEqual(calls, ['status', 'elevate-disable']);
+});
+
+test('explicit protection verification reports partial rules without enabling protection', async (t) => {
+  const guard = {
+    async status() { return { supported: true, enabled: false, state: 'unknown' }; },
+    async verify() { return { supported: true, enabled: false, state: 'partial', filterCount: 46, expectedFilters: 46,
+      issues: ['verified 42 of 46 required filters'] }; }
+  };
+  const { request } = await localApp(t, new Bridge({ demo: true }), { proxyGuard: guard });
+  const response = await request('/api/proxy/guard/verify', {});
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.guard.state, 'partial'); assert.equal(result.guard.active, false);
+  assert.match(result.guard.message, /verified 42 of 46 required filters/);
 });
 
 test('explicit protection disable remains available without any saved or active pairing', { timeout: 15000 }, async (t) => {

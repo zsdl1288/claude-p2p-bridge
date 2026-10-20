@@ -240,7 +240,7 @@ function renderProxy(proxy = {}, ui = state()) {
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
   const guard = proxy.guard || {}, unknown = guard.state === 'unknown' || guard.verification === 'unknown';
-  const guardMessage = `${unknown ? '保护状态未验证，请检查或明确关闭' : guard.active ? '系统保护已验证生效' : '系统保护未启用'}${guard.message ? ` · ${guard.message}` : ''}`;
+  const guardMessage = `${unknown ? '保护状态未验证，请检查或明确关闭' : guard.state === 'partial' ? '保护规则未通过校验' : guard.active ? '系统保护已验证生效' : '系统保护未启用'}${guard.message ? ` · ${guard.message}` : ''}`;
   $('proxy-guard-state').textContent = $('settings-guard-state').textContent = guardMessage;
   const unavailable = actionBusy || proxyBusy || !localAvailable || !guard.supported;
   $('proxy-guard').disabled = unavailable || ui.role !== 'client' || !ui.proxy || !proxy.enabled;

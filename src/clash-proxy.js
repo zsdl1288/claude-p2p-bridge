@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { digest, encodeInvitation, parseInvitation } from './crypto.js';
-import { NetworkGuard } from './network-guard.js';
+import { NetworkGuard, networkGuardDiagnostics } from './network-guard.js';
 import { atomicWrite } from './storage.js';
 
 const NODE = 'B 网络出口';
@@ -177,11 +177,13 @@ export class ClashProxy {
     return this.guardRead;
   }
   applyGuardState(value) {
+    const tun = typeof value.tunName === 'string' && value.tunName ? `（${value.tunName}）` : '';
+    const diagnostic = ['partial', 'unknown'].includes(value.state) ? networkGuardDiagnostics(value) : '';
     this.guardState = { ...value, active: value.enabled === true,
-      message: value.state === 'unknown' ? '当前权限无法核实系统保护；请点“检查系统保护（UAC）”，或明确关闭保护恢复直连。'
-        : value.enabled ? value.tunReady === false ? '系统保护仍在阻断；请启动 ClaudeBridgeTun，再重新启用保护更新接口。' : '系统保护已验证启用；退出 Clash 或桥接后仍阻断，需在此明确关闭。'
-        : value.state === 'partial' ? '保护规则不完整，请重新启用或明确关闭；当前不能保证完整阻断。'
-        : '系统保护未启用；请先在 Clash 开启完整配置的 TUN，再在此启用保护。' };
+      message: (value.state === 'unknown' ? '当前权限无法核实系统保护；请点“检查系统保护（UAC）”，或明确关闭保护恢复直连。'
+        : value.enabled ? value.tunReady === false ? '系统保护仍在阻断；请开启 Clash TUN（ClaudeBridgeTun / Mihomo），再点“启用 / 刷新系统保护”更新接口。' : `系统保护已验证启用${tun}；退出 Clash 或桥接后仍阻断，需在此明确关闭。`
+        : value.state === 'partial' ? '保护规则未通过校验，请重新启用或明确关闭；当前不能保证完整阻断。'
+        : '系统保护未启用；请先在 Clash 开启完整配置的 TUN，再在此启用保护。') + (diagnostic ? ` ${diagnostic}。` : '') };
   }
   async changeGuard(operation) {
     // Polls already in flight describe the state before this authorized action.
@@ -191,8 +193,13 @@ export class ClashProxy {
       const value = await operation();
       this.applyGuardState(value || await this.guard.status());
     } catch (error) {
-      try { this.applyGuardState(await this.guard.status()); }
-      catch (statusError) { this.guardState = { supported: process.platform === 'win32', state: 'unknown', active: false, message: `系统保护状态无法确认：${statusError.message}` }; }
+      // A committed operation can return verified partial rules. Keep that
+      // result instead of replacing it with an unprivileged read's unknown.
+      if (error.guardStatus) this.applyGuardState(error.guardStatus);
+      else {
+        try { this.applyGuardState(await this.guard.status()); }
+        catch (statusError) { this.guardState = { supported: process.platform === 'win32', state: 'unknown', active: false, message: `系统保护状态无法确认：${statusError.message}` }; }
+      }
       throw error;
     } finally { ++this.guardRevision; this.guardChanging = false; }
   }

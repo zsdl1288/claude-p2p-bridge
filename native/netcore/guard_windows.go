@@ -118,7 +118,6 @@ const (
 	guardV4AddressMask = 0x100
 	guardV6AddressMask = 0x101
 	guardFWPNotFound   = 0x80320007 // FWP_E_SUBLAYER_NOT_FOUND
-	guardTunName       = "ClaudeBridgeTun"
 )
 
 func guardParseGUID(value string) windows.GUID {
@@ -285,6 +284,17 @@ func guardEqualCondition(actual, expected guardCondition) bool {
 	if actual.Key != expected.Key || actual.Match != expected.Match || actual.Value.Type != expected.Value.Type {
 		return false
 	}
+	// FWP_CONDITION_VALUE0 stores narrow integers directly in a pointer-sized
+	// union. Only the active member's bytes belong to the value returned by RPC.
+	// In particular, a scalar zero is a valid condition, not a null pointer.
+	switch actual.Value.Type {
+	case guardUint8:
+		return uint8(actual.Value.Value) == uint8(expected.Value.Value)
+	case guardUint16:
+		return uint16(actual.Value.Value) == uint16(expected.Value.Value)
+	case guardUint32:
+		return uint32(actual.Value.Value) == uint32(expected.Value.Value)
+	}
 	if actual.Value.Value == 0 || expected.Value.Value == 0 {
 		return actual.Value.Value == expected.Value.Value
 	}
@@ -302,28 +312,51 @@ func guardEqualCondition(actual, expected guardCondition) bool {
 	}
 }
 
-func guardEqualFilter(actual, expected *guardFilter) bool {
-	if actual.Key != expected.Key || actual.Sublayer != expected.Sublayer || actual.Layer != expected.Layer || actual.Provider != nil ||
-		actual.Flags != guardPersistent || actual.Action.Type != expected.Action.Type || actual.ConditionCount != expected.ConditionCount ||
-		actual.Weight.Type != guardUint64 || actual.Weight.Value == 0 ||
-		*(*uint64)(unsafe.Pointer(actual.Weight.Value)) != *(*uint64)(unsafe.Pointer(expected.Weight.Value)) ||
-		!bytes.Equal(guardBlobBytes(actual.Data), guardBlobBytes(expected.Data)) {
-		return false
+func guardFilterMismatch(actual, expected *guardFilter) string {
+	switch {
+	case actual.Key != expected.Key:
+		return "filter key does not match"
+	case actual.Sublayer != expected.Sublayer:
+		return "sublayer does not match"
+	case actual.Layer != expected.Layer:
+		return "layer does not match"
+	case actual.Provider != nil:
+		return "unexpected provider"
+	case actual.Flags != guardPersistent:
+		return fmt.Sprintf("flags 0x%08x; expected 0x%08x", actual.Flags, guardPersistent)
+	case actual.Action.Type != expected.Action.Type:
+		return fmt.Sprintf("action 0x%x; expected 0x%x", actual.Action.Type, expected.Action.Type)
+	case actual.ConditionCount != expected.ConditionCount:
+		return fmt.Sprintf("condition count %d; expected %d", actual.ConditionCount, expected.ConditionCount)
+	case actual.Weight.Type != guardUint64:
+		return fmt.Sprintf("weight type %d; expected %d", actual.Weight.Type, guardUint64)
+	case actual.Weight.Value == 0:
+		return "weight pointer is null"
+	case *(*uint64)(unsafe.Pointer(actual.Weight.Value)) != *(*uint64)(unsafe.Pointer(expected.Weight.Value)):
+		return fmt.Sprintf("weight %d; expected %d", *(*uint64)(unsafe.Pointer(actual.Weight.Value)), *(*uint64)(unsafe.Pointer(expected.Weight.Value)))
+	case !bytes.Equal(guardBlobBytes(actual.Data), guardBlobBytes(expected.Data)):
+		return "rule signature does not match"
 	}
 	if actual.ConditionCount == 0 {
-		return true
+		return ""
 	}
 	if actual.Conditions == nil || actual.ConditionCount > 16 {
-		return false
+		return "condition array is missing or invalid"
 	}
 	conditions := unsafe.Slice(actual.Conditions, int(actual.ConditionCount))
 	expectedConditions := unsafe.Slice(expected.Conditions, int(expected.ConditionCount))
 	for i := range conditions {
 		if !guardEqualCondition(conditions[i], expectedConditions[i]) {
-			return false
+			return fmt.Sprintf("condition %d does not match (field %s; expected %s, match %d/%d, type %d/%d)",
+				i+1, conditions[i].Key.String(), expectedConditions[i].Key.String(),
+				conditions[i].Match, expectedConditions[i].Match, conditions[i].Value.Type, expectedConditions[i].Value.Type)
 		}
 	}
-	return true
+	return ""
+}
+
+func guardEqualFilter(actual, expected *guardFilter) bool {
+	return guardFilterMismatch(actual, expected) == ""
 }
 
 func guardEnumerate(handle windows.Handle, sublayer windows.GUID, visit func(*guardFilter) error) error {
@@ -361,14 +394,13 @@ func guardEnumerate(handle windows.Handle, sublayer windows.GUID, visit func(*gu
 	}
 }
 
-// Match the fixed adapter name from our generated Clash profile. Interface type
-// 53 is IANA propVirtual (Wintun), not an Ethernet/Wi-Fi adapter. No arbitrary
-// adapter name or LUID can be supplied through the elevated command line.
-func guardFindTun() (uint64, error) {
+// No arbitrary adapter name or LUID can be supplied through the elevated command
+// line. The fixed supported names and Wintun properties are checked together.
+func guardFindTun() (guardTunAdapter, error) {
 	size := uint32(15000)
 	for attempt := 0; attempt < 4; attempt++ {
 		if size == 0 || size > 1024*1024 {
-			return 0, errors.New("invalid network adapter enumeration size")
+			return guardTunAdapter{}, errors.New("invalid network adapter enumeration size")
 		}
 		buffer := make([]byte, size)
 		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
@@ -377,25 +409,13 @@ func guardFindTun() (uint64, error) {
 			continue
 		}
 		if err != nil {
-			return 0, err
+			return guardTunAdapter{}, err
 		}
-		var match uint64
-		for adapter := first; adapter != nil; adapter = adapter.Next {
-			if !strings.EqualFold(windows.UTF16PtrToString(adapter.FriendlyName), guardTunName) {
-				continue
-			}
-			if adapter.IfType != 53 || adapter.PhysicalAddressLength != 0 || adapter.Luid == 0 || adapter.OperStatus != windows.IfOperStatusUp {
-				return 0, errors.New("ClaudeBridgeTun must be an active Wintun virtual interface")
-			}
-			if match != 0 {
-				return 0, errors.New("more than one ClaudeBridgeTun interface was found")
-			}
-			match = adapter.Luid
-		}
+		match, err := guardSelectTun(first)
 		runtime.KeepAlive(buffer)
-		return match, nil
+		return match, err
 	}
-	return 0, errors.New("network adapter list changed repeatedly")
+	return guardTunAdapter{}, errors.New("network adapter list changed repeatedly")
 }
 
 func guardStoredTun(handle windows.Handle, profile string) (uint64, error) {
@@ -435,30 +455,35 @@ func guardStoredTun(handle windows.Handle, profile string) (uint64, error) {
 }
 
 func guardStatus(handle windows.Handle, profile, helperPath string, appID *guardBlob) (NetworkGuardStatus, error) {
-	status := NetworkGuardStatus{Supported: true, ProfileID: profile, State: "disabled", Scope: "windows-bfe-runtime", HelperPath: helperPath, AllowLAN: true, ExpectedFilters: len(guardRules()), TunName: guardTunName}
+	status := NetworkGuardStatus{Supported: true, ProfileID: profile, State: "disabled", Scope: "windows-bfe-runtime", HelperPath: helperPath, AllowLAN: true, ExpectedFilters: len(guardRules())}
 	tunLUID, err := guardStoredTun(handle, profile)
 	if err != nil {
 		status.State = "unknown"
 		return status, err
 	}
 	currentTun, tunErr := guardFindTun()
-	status.TunReady = tunErr == nil && currentTun != 0 && currentTun == tunLUID
+	status.TunName = currentTun.name
+	status.TunReady = tunErr == nil && currentTun.luid != 0 && currentTun.luid == tunLUID
 	if tunLUID != 0 {
 		status.TunLUID = strconv.FormatUint(tunLUID, 10)
 	}
 	expected := make(map[windows.GUID]guardBuiltFilter)
+	ruleIDs := make(map[windows.GUID]string)
 	for _, rule := range guardRules() {
 		built := guardBuildFilter(profile, helperPath, rule, appID, tunLUID)
 		expected[built.filter.Key] = built
+		ruleIDs[built.filter.Key] = rule.id
 	}
 	matched := 0
 	err = guardEnumerate(handle, guardKey(profile, "sublayer"), func(actual *guardFilter) error {
 		status.FilterCount++
 		built, ok := expected[actual.Key]
-		if ok && guardEqualFilter(actual, &built.filter) {
+		if !ok {
+			status.Issues = append(status.Issues, "obsolete or unexpected filter: "+actual.Key.String())
+		} else if reason := guardFilterMismatch(actual, &built.filter); reason == "" {
 			matched++
 		} else {
-			status.Issues = append(status.Issues, "missing, disabled, changed or obsolete filter: "+actual.Key.String())
+			status.Issues = append(status.Issues, fmt.Sprintf("filter %s (%s): %s", ruleIDs[actual.Key], actual.Key.String(), reason))
 		}
 		return nil
 	})
@@ -468,7 +493,7 @@ func guardStatus(handle windows.Handle, profile, helperPath string, appID *guard
 		return status, err
 	}
 	if status.FilterCount == 0 {
-		status.TunReady = tunErr == nil && currentTun != 0
+		status.TunReady = tunErr == nil && currentTun.luid != 0
 		return status, nil
 	}
 	status.State = "partial"
@@ -489,7 +514,7 @@ func guardStatus(handle windows.Handle, profile, helperPath string, appID *guard
 		status.Issues = append(status.Issues, fmt.Sprintf("verified %d of %d required filters", matched, status.ExpectedFilters))
 	}
 	if !status.TunReady {
-		status.Issues = append(status.Issues, "protected TUN is unavailable or was recreated; public traffic stays blocked, enable protection again after restoring ClaudeBridgeTun")
+		status.Issues = append(status.Issues, "受保护的 TUN 网卡不可用或已重建；外网仍保持阻断，请恢复 ClaudeBridgeTun 或 Mihomo 后刷新系统保护")
 	}
 	return status, nil
 }
@@ -497,14 +522,11 @@ func guardStatus(handle windows.Handle, profile, helperPath string, appID *guard
 func guardApply(handle windows.Handle, profile, helperPath string, appID *guardBlob, enable bool) error {
 	var tunLUID uint64
 	if enable {
-		var err error
-		tunLUID, err = guardFindTun()
+		tun, err := guardFindTun()
 		if err != nil {
 			return err
 		}
-		if tunLUID == 0 {
-			return errors.New("start Clash TUN with device ClaudeBridgeTun before enabling protection")
-		}
+		tunLUID = tun.luid
 	}
 	if err := guardCall(guardBegin, "begin policy transaction", uintptr(handle), 0); err != nil {
 		return err
