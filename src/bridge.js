@@ -6,13 +6,15 @@ import { makePairing, encodeInvitation, parseInvitation } from './crypto.js';
 import { getTailscaleStatus, networkDevices } from './tailscale.js';
 import { runClaude, validateRequest, probeClaude } from './runner.js';
 import { NetworkProxy } from './network-proxy.js';
+import { ChannelRecovery } from './channel-recovery.js';
+import { ChannelProbe } from './channel-probe.js';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { discoverClaudeModels, normalizeModels } from './claude-models.js';
 import { ModelError } from './model-protocol.js';
 
 export class Bridge extends EventEmitter {
-  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {}, modelCatalogProvider = discoverClaudeModels } = {}) {
+  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {}, recoveryOptions = {}, modelCatalogProvider = discoverClaudeModels } = {}) {
     super();
     this.demo = demo;
     this.networkProvider = networkProvider;
@@ -34,6 +36,8 @@ export class Bridge extends EventEmitter {
     this.modelCatalogProvider = modelCatalogProvider;
     this.models = []; this.modelsState = 'unavailable'; this.modelsError = ''; this.modelsAt = 0;
     this.catalogEpoch = 0; this.catalogRequests = new Map();
+    this.channelRecovery = new ChannelRecovery({ ...recoveryOptions, bridge: this });
+    this.channelProbe = new ChannelProbe({ bridge: this });
   }
   log(message) { this.logs.unshift({ time: new Date().toISOString(), message }); this.logs = this.logs.slice(0, 40); this.emit('state'); }
   status() {
@@ -45,6 +49,7 @@ export class Bridge extends EventEmitter {
       connectedClients: state.connectedClients || 0, queuedRequests: this.queue.length,
       demo: this.demo, network: this.networkStatus(),
       model: this.modelStatus(),
+      channelRecovery: this.channelRecovery.status(),
       config: this.networkIdentity().role === 'host' && config ? { workspace: config.workspace, profile: config.profile, claudeCommand: config.claudeCommand,
         timeoutMs: config.timeoutMs, maxTurns: config.maxTurns, tailscaleIp: config.tailscaleIp, bridgePort: config.bridgePort } : null,
       invitation: this.invitation || null, activeRequests: this.active.size + this.queue.length + this.pending.size, logs: this.logs
@@ -160,6 +165,7 @@ export class Bridge extends EventEmitter {
     try {
       await peer.start();
       if (role === 'client' && peer.state.online) await modelPeer.connect().catch(() => modelPeer.scheduleReconnect());
+      if (this.peer === peer) this.channelRecovery.start();
     } catch (error) { await modelPeer.close(); await peer.close(); if (this.peer === peer) this.peer = null; if (this.modelPeer === modelPeer) this.modelPeer = null; this.invitation = null; throw error; }
   }
   deviceMetadata() { return { name: this.network?.hostname || hostname(), address: this.network?.addresses?.[0] || '' }; }
@@ -321,6 +327,7 @@ export class Bridge extends EventEmitter {
   }
   onMessage(msg, connection) {
     if (!msg || typeof msg !== 'object' || !/^[a-f0-9-]{36}$/i.test(msg.id)) return;
+    if (msg.type === 'proxy-health') { this.channelRecovery.onHint(msg, connection); return; }
     if (this.peer?.role === 'host' && msg.type === 'models-refresh' && this.peer.isConnected(connection)) {
       const peer = this.peer;
       const modelsEpoch = this.catalogEpoch;
@@ -512,6 +519,8 @@ export class Bridge extends EventEmitter {
   }
   async disconnect() { await this.stopPeer(); }
   async stopPeer() {
+    this.channelProbe.cancel();
+    this.channelRecovery.stop();
     const peer = this.peer, modelPeer = this.modelPeer;
     const catalogReading = this.modelsReading;
     this.peer = null;

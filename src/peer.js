@@ -240,6 +240,20 @@ export class BridgePeer extends EventEmitter {
       throw error;
     }
   }
+  // Health evidence is optional. Skip it under control-channel pressure and
+  // never turn a failed hint write into an explicit session termination.
+  trySendHealthHint(body, connection) {
+    if (this.channel !== 'control' || this.role !== 'host' || !this.isConnected(connection) ||
+        body?.type !== 'proxy-health' || body.v !== 1 || connection.ws.bufferedAmount >= 64 * 1024) return false;
+    try {
+      if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;
+      const sequence = connection.sendSequence + 1;
+      const packet = JSON.stringify(connection.crypto.seal({ kind: 'message', session: connection.session, sequence, body }));
+      connection.ws.send(packet, () => {});
+      connection.sendSequence = sequence;
+      return true;
+    } catch { return false; }
+  }
   async close() {
     if (this.closing) return this.closing;
     this.closed = true;

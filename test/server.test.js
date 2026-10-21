@@ -84,6 +84,35 @@ test('task and model endpoints cannot silently exchange execution modes', async 
   assert.equal(dispatched.length, 0);
 });
 
+test('manual channel probes are authenticated management jobs and cannot accept arbitrary addresses', async (t) => {
+  let reads = 0, starts = 0, cancels = 0;
+  const job = { id, state: 'running', report: { v: 1, results: [] } };
+  const status = { available: true, busy: false, retryAfterMs: 0, targets: [{ id: 'current-control', role: 'host', address: '100.100.100.100' }], job: null };
+  const channelProbe = { status() { reads++; return status; }, start(body) { starts++; assert.deepEqual(body, { targetId: 'current-control' }); return job; },
+    cancel(jobId) { assert.equal(jobId, id); cancels++; } };
+  const { url, modelUrl } = await fixture(t, { channelProbe }, { modelApi: true });
+  const route = '/api/network/diagnostics/channel-probe';
+  for (const [method, suffix, body] of [['GET', '', undefined], ['POST', '', '{"targetId":"current-control"}'], ['POST', '/cancel', JSON.stringify({ jobId: id })]]) {
+    const options = { method, ...(body ? { body } : {}) };
+    assert.equal((await fetch(`${url}${route}${suffix}`, options)).status, 401);
+    assert.equal((await fetch(`${url}${route}${suffix}`, { ...options, headers: { ...headers, Origin: 'https://example.invalid' } })).status, 403);
+    assert.equal((await fetch(`${modelUrl}${route}${suffix}`, { ...options, headers })).status, 404);
+  }
+  assert.equal(reads + starts + cancels, 0);
+  const response = await fetch(`${url}${route}`, { headers });
+  assert.equal(response.headers.get('cache-control'), 'no-store'); assert.deepEqual(await response.json(), status);
+  for (const body of [{}, { host: '8.8.8.8' }, { targetId: 'current-control', host: '8.8.8.8' }, { targetId: 42 }]) {
+    assert.equal((await fetch(`${url}${route}`, { method: 'POST', headers, body: JSON.stringify(body) })).status, 400);
+  }
+  const started = await fetch(`${url}${route}`, { method: 'POST', headers, body: '{"targetId":"current-control"}' });
+  assert.equal(started.status, 202); assert.deepEqual(await started.json(), job); assert.equal(starts, 1);
+  assert.equal((await fetch(`${url}${route}/cancel`, { method: 'POST', headers, body: '{}' })).status, 400);
+  assert.equal((await fetch(`${url}${route}/cancel`, { method: 'POST', headers, body: JSON.stringify({ jobId: id }) })).status, 200);
+  assert.equal(cancels, 1);
+  assert.equal((await fetch(`${url}${route}`, { method: 'PUT', headers })).status, 405);
+  const module = await fetch(`${url}/channel-probe.js`); assert.equal(module.status, 200); assert.match(module.headers.get('content-type'), /javascript/);
+});
+
 test('task responses handle synchronous completion without missing headers, IDs or cleanup', async (t) => {
   const { url } = await fixture(t);
   const result = await (await fetch(`${url}/v1/run`, { method: 'POST', headers, body: JSON.stringify({ prompt: 'test', stream: false }) })).json();

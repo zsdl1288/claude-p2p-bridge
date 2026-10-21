@@ -29,6 +29,22 @@ async function fakeCore(t, options = {}) {
       methods.push(method);
       if (method === 'hang') return;
       if (method === 'diagnostics' && ${Boolean(options.diagnosticsHang)}) return;
+      if (method === 'refresh-transport' && ${Boolean(options.refreshHang)}) return;
+      if (method === 'refresh-transport' && ${JSON.stringify(options.refreshError || null)}) {
+        process.stdout.write(JSON.stringify({ id, error: ${JSON.stringify(options.refreshError || null)} }) + '\\n'); return;
+      }
+      if (method === 'refresh-transport') {
+        process.stdout.write(JSON.stringify({ id, result: ${JSON.stringify(options.refreshResult || { refreshed: true, reason: 'refreshed' })} }) + '\\n'); return;
+      }
+      if (method === 'channel-probe' && ${Boolean(options.probeHang)}) return;
+      if (method === 'channel-probe' && ${JSON.stringify(options.probeError || null)}) {
+        process.stdout.write(JSON.stringify({ id, error: ${JSON.stringify(options.probeError || null)} }) + '\\n'); return;
+      }
+      if (method === 'channel-probe') {
+        const result = ${JSON.stringify(options.probeResult || null)} || { type: params.type, size: params.size,
+          outcome: 'reply', latencySeconds: 0.25, actualVia: params.type === 'TSMP' ? 'unknown' : 'direct' };
+        process.stdout.write(JSON.stringify({ id, result }) + '\\n'); return;
+      }
       if (method === 'diagnostics' && ${JSON.stringify(options.diagnosticsResult || null)}) {
         process.stdout.write(JSON.stringify({ id, result: ${JSON.stringify(options.diagnosticsResult || null)} }) + '\\n');
         return;
@@ -118,6 +134,189 @@ test('a diagnostics timeout leaves the live helper and its transport resources i
   assert.equal(core.resources.get(resource), child); assert.equal(core.pending.size, 0); assert.equal(resets, 0);
   core.requestTimeoutMs = 1000;
   assert.deepEqual((await core.status()).methods, ['init', 'dial', 'diagnostics', 'status']);
+});
+
+test('transport refresh never starts an absent, uninitialized, disconnected or closed helper', async () => {
+  const core = new EmbeddedNetwork();
+  let starts = 0, requests = 0;
+  core.start = async () => { starts++; throw new Error('Refresh must not start a helper'); };
+  core.request = async () => { requests++; throw new Error('Refresh must not send a request'); };
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  const child = { stdin: { writable: true } };
+  core.child = child; core.wantRunning = true;
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  core.initialized.add(child); core.wantRunning = false;
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  core.closed = true; core.wantRunning = true;
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  assert.equal(starts, 0); assert.equal(requests, 0); assert.equal(core.pending.size, 0);
+  assert.equal(core.child, child); core.child = null;
+});
+
+test('transport refresh preserves the same initialized helper and forwarding resource', async (t) => {
+  const core = await fakeCore(t);
+  await core.start(); await core.connect(); const resource = await core.dial({ host: '100.64.0.2', port: 3211 });
+  const child = core.child; let resets = 0; core.on('reset', () => resets++);
+  assert.deepEqual(await core.refreshTransport(), { refreshed: true, reason: 'refreshed' });
+  assert.deepEqual((await core.status()).methods, ['init', 'connect', 'dial', 'refresh-transport', 'status']);
+  assert.equal(core.child, child); assert.equal(core.resources.get(resource), child);
+  assert.equal(core.wantRunning, true); assert.equal(resets, 0);
+});
+
+test('transport refresh returns only safe whitelisted results and cooldown', async (t) => {
+  const core = await fakeCore(t, { refreshResult: { refreshed: false, reason: 'cooldown', retryAfterMs: 119000, secret: 'must not escape' } });
+  await core.connect();
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'cooldown', retryAfterMs: 119000 });
+  const child = core.child;
+  core.request = async () => ({ refreshed: false, reason: 'refreshed', error: 'must not escape' });
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  assert.equal(core.child, child);
+});
+
+test('a transport refresh timeout is single-flight and never retires live forwarding', async (t) => {
+  const core = await fakeCore(t, { refreshHang: true });
+  await core.start(); await core.connect(); const resource = await core.dial({ host: '100.64.0.2', port: 3211 });
+  const child = core.child; let resets = 0; core.on('reset', () => resets++); core.requestTimeoutMs = 40;
+  const refreshing = core.refreshTransport();
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'busy' });
+  assert.deepEqual(await refreshing, { refreshed: false, reason: 'unavailable' });
+  assert.equal(core.pending.size, 0); assert.equal(core.child, child); assert.equal(child.killed, false);
+  assert.equal(core.resources.get(resource), child); assert.equal(core.wantRunning, true); assert.equal(resets, 0);
+  core.requestTimeoutMs = 1000;
+  assert.deepEqual((await core.status()).methods, ['init', 'connect', 'dial', 'refresh-transport', 'status']);
+});
+
+test('transport refresh RPC rejection and write failure do not reset a helper', async (t) => {
+  const core = await fakeCore(t, { refreshError: 'private endpoint must not escape' });
+  await core.connect(); const child = core.child;
+  assert.deepEqual(await core.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  assert.equal(core.child, child); assert.equal(child.killed, false); assert.equal(core.pending.size, 0);
+  const standalone = new EmbeddedNetwork(); let kills = 0;
+  const fakeChild = { stdin: { writable: true, write() { throw new Error('synthetic write failure'); } }, kill() { kills++; } };
+  standalone.child = fakeChild; standalone.initialized.add(fakeChild); standalone.wantRunning = true;
+  assert.deepEqual(await standalone.refreshTransport(), { refreshed: false, reason: 'unavailable' });
+  assert.equal(standalone.child, fakeChild); assert.equal(standalone.pending.size, 0); assert.equal(kills, 0);
+  standalone.child = null; await standalone.close();
+});
+
+test('channel probes never start absent, uninitialized, stale, disconnected or closed helpers', async () => {
+  const core = new EmbeddedNetwork(); let starts = 0, requests = 0;
+  core.start = async () => { starts++; throw new Error('Probe must not start a helper'); };
+  core.request = async () => { requests++; throw new Error('Probe must not request an unavailable helper'); };
+  const params = { host: '100.95.24.20', type: 'TSMP', size: 0 };
+  assert.equal((await core.channelProbe(params)).outcome, 'unavailable');
+  const child = { stdin: { writable: true } }; core.child = child; core.wantRunning = true;
+  assert.equal((await core.channelProbe(params)).outcome, 'unavailable');
+  core.initialized.add(child); core.wantRunning = false;
+  assert.equal((await core.channelProbe(params)).outcome, 'unavailable');
+  core.wantRunning = true;
+  assert.equal((await core.channelProbe(params, { stdin: { writable: true } })).outcome, 'unavailable');
+  child.stdin.writable = false; assert.equal((await core.channelProbe(params)).outcome, 'unavailable');
+  child.stdin.writable = true; core.closed = true;
+  assert.equal((await core.channelProbe(params)).outcome, 'unavailable');
+  assert.equal(starts, 0); assert.equal(requests, 0); assert.equal(core.pending.size, 0);
+  assert.equal(core.child, child); core.child = null;
+});
+
+test('channel probe target and type validation cannot issue arbitrary RPCs', async () => {
+  const core = new EmbeddedNetwork(); let requests = 0;
+  const child = { stdin: { writable: true } }; core.child = child; core.initialized.add(child); core.wantRunning = true;
+  core.request = async () => { requests++; return {}; };
+  for (const host of ['8.8.8.8', '127.0.0.1', '100.63.1.1', '100.128.1.1', '100.095.24.20',
+    '100.95.24.20:3211', '::ffff:100.95.24.20', 'example.com', '100.95.24.256']) {
+    assert.equal((await core.channelProbe({ host, type: 'TSMP', size: 0 })).outcome, 'invalid-request');
+  }
+  for (const params of [{ type: 'ICMP', size: 0 }, { type: 'TSMP', size: 1200 }, { type: 'disco', size: 0 },
+    { type: 'disco', size: 65535 }, { type: 'disco', size: '128' }]) {
+    assert.equal((await core.channelProbe({ host: '100.95.24.20', ...params })).outcome, 'invalid-request');
+  }
+  assert.equal(requests, 0); assert.equal(core.pending.size, 0); core.child = null; await core.close();
+});
+
+test('channel probe replies preserve the captured helper and resources and omit endpoint identity', async (t) => {
+  const core = await fakeCore(t, { probeResult: { type: 'disco', size: 128, outcome: 'reply', latencySeconds: 0.26,
+    actualVia: 'derp', derpRegionId: 3, derpRegionCode: 'tok', endpoint: '203.0.113.2:55555',
+    NodeName: 'private-name', key: 'private-key', rawError: 'private-error' } });
+  await core.start(); await core.connect(); const resource = await core.dial({ host: '100.95.24.20', port: 3211 });
+  const child = core.child; let resets = 0; core.on('reset', () => resets++);
+  assert.deepEqual(await core.channelProbe({ host: '100.95.24.20', type: 'disco', size: 128 }, child),
+    { type: 'disco', size: 128, outcome: 'reply', actualVia: 'derp', discoPayloadBytes: 128, latencySeconds: 0.26, derpRegionId: 3, derpRegionCode: 'tok' });
+  assert.deepEqual((await core.status()).methods, ['init', 'connect', 'dial', 'channel-probe', 'status']);
+  assert.equal(core.child, child); assert.equal(core.resources.get(resource), child); assert.equal(child.killed, false);
+  assert.equal(core.wantRunning, true); assert.equal(core.pending.size, 0); assert.equal(resets, 0);
+});
+
+test('channel probe sanitization never invents TSMP paths or serializes malformed results', async (t) => {
+  const core = await fakeCore(t); await core.start(); await core.connect();
+  core.request = async () => ({ type: 'TSMP', size: 0, outcome: 'reply', actualVia: 'direct', latencySeconds: 0.2,
+    endpoint: '203.0.113.1:55555', derpRegionId: 3, derpRegionCode: 'tok', raw: 'secret' });
+  assert.deepEqual(await core.channelProbe({ host: '100.95.24.20', type: 'TSMP', size: 0 }),
+    { type: 'TSMP', size: 0, outcome: 'reply', actualVia: 'unknown', innerIPv4Bytes: 29, latencySeconds: 0.2 });
+  for (const changes of [{ type: 'disco' }, { size: 128 }, { outcome: 'private-error' }, { latencySeconds: -1 },
+    { latencySeconds: Infinity }, { latencySeconds: NaN }, { latencySeconds: '0.2' }]) {
+    core.request = async () => ({ type: 'TSMP', size: 0, outcome: 'reply', latencySeconds: 0.2, actualVia: 'unknown', ...changes });
+    assert.equal((await core.channelProbe({ host: '100.95.24.20', type: 'TSMP', size: 0 })).outcome, 'invalid-result');
+  }
+});
+
+test('channel probe timeouts are single-flight and nonfatal to existing transports', async (t) => {
+  const core = await fakeCore(t, { probeHang: true }); await core.start(); await core.connect();
+  const resource = await core.dial({ host: '100.95.24.20', port: 3211 }), child = core.child;
+  let resets = 0; core.on('reset', () => resets++); core.requestTimeoutMs = 40;
+  const params = { host: '100.95.24.20', type: 'TSMP', size: 0 }, probing = core.channelProbe(params, child);
+  assert.equal((await core.channelProbe(params, child)).outcome, 'busy');
+  assert.equal((await probing).outcome, 'unavailable');
+  assert.equal(core.child, child); assert.equal(child.killed, false); assert.equal(core.resources.get(resource), child);
+  assert.equal(core.wantRunning, true); assert.equal(core.pending.size, 0); assert.equal(resets, 0);
+  core.requestTimeoutMs = 1000;
+  assert.deepEqual((await core.status()).methods, ['init', 'connect', 'dial', 'channel-probe', 'status']);
+});
+
+test('channel probe RPC rejection and synchronous write failure never invalidate a helper', async (t) => {
+  const core = await fakeCore(t, { probeError: 'private endpoint and raw failure' }); await core.start(); await core.connect();
+  const params = { host: '100.95.24.20', type: 'disco', size: 1200 }, child = core.child;
+  assert.equal((await core.channelProbe(params, child)).outcome, 'unavailable');
+  assert.equal(core.child, child); assert.equal(child.killed, false); assert.equal(core.pending.size, 0);
+  const standalone = new EmbeddedNetwork(); let kills = 0;
+  const fakeChild = { stdin: { writable: true, write() { throw new Error('private write error'); } }, kill() { kills++; } };
+  standalone.child = fakeChild; standalone.initialized.add(fakeChild); standalone.wantRunning = true;
+  assert.deepEqual(await standalone.channelProbe(params, fakeChild), { type: 'disco', size: 1200, outcome: 'unavailable', actualVia: 'unknown' });
+  assert.equal(standalone.child, fakeChild); assert.equal(standalone.pending.size, 0); assert.equal(kills, 0);
+  standalone.child = null; await standalone.close();
+});
+
+test('a late channel probe reply cannot describe a stopped or replaced helper', async () => {
+  const params = { host: '100.95.24.20', type: 'TSMP', size: 0 };
+  for (const change of [(core) => { core.wantRunning = false; }, (core) => { core.closed = true; },
+    (core) => { core.child = { stdin: { writable: true } }; core.initialized.add(core.child); }]) {
+    const core = new EmbeddedNetwork(), child = { stdin: { writable: true } }, resource = { id: 'saved-dial' };
+    core.child = child; core.initialized.add(child); core.wantRunning = true; core.resources.set(resource, child);
+    let finish;
+    core.request = async (method, value, captured) => {
+      assert.equal(method, 'channel-probe'); assert.equal(captured, child); assert.deepEqual(value, params);
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    const probing = core.channelProbe(params, child); change(core);
+    finish({ type: 'TSMP', size: 0, outcome: 'reply', latencySeconds: 0.25, actualVia: 'unknown' });
+    assert.equal((await probing).outcome, 'unavailable');
+    assert.equal(core.resources.get(resource), child); assert.equal(core.pending.size, 0);
+    assert.equal(core.channelProbeChild, null); core.child = null; await core.close();
+  }
+});
+
+test('channel probe RPC timeout is bounded to four seconds even with the normal 25-second setting', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const core = new EmbeddedNetwork(); let kills = 0, requests = 0;
+  const child = { stdin: { writable: true, write(line, callback) {
+    const message = JSON.parse(line); assert.equal(message.method, 'channel-probe'); requests++; callback?.();
+  } }, kill() { kills++; } };
+  core.child = child; core.initialized.add(child); core.wantRunning = true;
+  let result;
+  const probing = core.channelProbe({ host: '100.95.24.20', type: 'disco', size: 128 }, child).then((value) => { result = value; return value; });
+  t.mock.timers.tick(3999); await Promise.resolve(); assert.equal(result, undefined);
+  t.mock.timers.tick(1); assert.equal((await probing).outcome, 'unavailable');
+  assert.equal(requests, 1); assert.equal(core.child, child); assert.equal(kills, 0); assert.equal(core.pending.size, 0);
+  core.child = null; await core.close();
 });
 
 test('deliberate network disconnect retains the helper identity and never resumes after replacement', { timeout: 10000 }, async (t) => {

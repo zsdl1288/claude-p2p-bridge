@@ -5,6 +5,7 @@
 #include "profile-lock.hpp"
 #include "model-api.hpp"
 #include "network-diagnostics.hpp"
+#include "channel-probe.hpp"
 #include "options.hpp"
 #include "role-ui.hpp"
 #include "theme.hpp"
@@ -51,11 +52,22 @@ class Application {
     uint64_t viewEpoch_ = 0, lastStatusRevision_ = 0;
     std::atomic<bool> stopping_{false}, ready_{false};
     std::mutex engineMutex_; KernelHandle process_, job_, wake_;
-    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_;
+    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_, channelProbeThread_, probeCancelThread_;
+    std::mutex probeCancelMutex_;
+    std::condition_variable probeCancelWake_;
+    std::string pendingProbeCancel_;
+    bool probeCancelStopping_ = false;
     HWND diagnosticsWindow_ = nullptr, diagnosticsOutput_ = nullptr, diagnosticsRefresh_ = nullptr, diagnosticsClose_ = nullptr;
     HFONT diagnosticsFont_ = nullptr;
     bool diagnosticsBusy_ = false, diagnosticsReadPending_ = false;
     uint64_t diagnosticsEpoch_ = 0;
+    HWND channelProbeTarget_ = nullptr, channelProbeStart_ = nullptr, channelProbeCancel_ = nullptr, channelProbeExport_ = nullptr, channelProbeOutput_ = nullptr;
+    Json channelProbeState_ = Json::object(), channelProbeReport_;
+    std::vector<std::string> channelProbeTargets_;
+    std::string lastChannelProbeTargets_, channelProbeScope_;
+    bool channelProbeCommandBusy_ = false;
+    uint64_t channelProbeView_ = 0;
+    DesktopChannelProbe::OwnedJobs ownedChannelProbes_;
     std::string token_, authUrl_, requestId_, invitation_, lastDevices_, lastProxyDevices_, lastConfig_, lastModels_, observedRole_, testScope_;
     std::vector<std::wstring> modelIds_;
     std::wstring selectedModel_;
@@ -448,7 +460,7 @@ class Application {
         }
         if (diagnosticsWindow_) {
             DesktopTheme::TitleBar(diagnosticsWindow_, dark_, colors_);
-            SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            for (auto child : {diagnosticsOutput_, channelProbeOutput_, channelProbeTarget_}) SetWindowTheme(child, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             RedrawWindow(diagnosticsWindow_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
         RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
@@ -722,7 +734,8 @@ class Application {
             connections += L" / " + std::to_wstring(proxy["connectionLimit"].get<int>());
         else if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() == 0)
             connections += L"（不设数量上限）";
-        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + L"\r\n" + (sharing ? L"服务端网络共享已开启" : L"服务端网络共享已关闭"));
+        const auto recovery = proxy.value("recoveryMessage", "");
+        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + L"\r\n" + (sharing ? L"服务端网络共享已开启" : L"服务端网络共享已关闭") + (recovery.empty() ? L"" : L" · " + Wide(recovery)));
         Text(PROXY_ENABLE, proxy.value("enabled", false) ? L"关闭本地 Clash 节点" : L"启用本地 Clash 节点");
         Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 调用端 使用本机网络");
         auto subscription = proxy.value("subscriptionUrl", "");
@@ -807,6 +820,9 @@ class Application {
         lastStatusRevision_ = revision;
         statusAvailable_ = true;
         status_ = status;
+        const auto probeScope = status.value("instanceId", "") + "|" + Role();
+        if (!channelProbeScope_.empty() && channelProbeScope_ != probeScope && diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
+        channelProbeScope_ = probeScope;
         const auto identity = Identity();
         const auto role = Role();
         bool online = status.value("online", false);
@@ -912,20 +928,35 @@ class Application {
         });
     }
     void OnReply(const Reply& reply) {
+        if (reply.kind == "channel-probe-command" || reply.kind == "channel-probe-error") {
+            channelProbeCommandBusy_ = false;
+            if (channelProbeThread_.joinable()) channelProbeThread_.join();
+            if (!diagnosticsWindow_ || !ownedChannelProbes_.Current(reply.viewEpoch)) return;
+            if (reply.kind == "channel-probe-command") UpdateChannelProbeState(reply.data);
+            else Text(channelProbeOutput_, L"探测请求未完成，请稍后刷新状态；不会自动重试。\r\n" + Wide(reply.text));
+            UpdateChannelProbeControls(); ReadNetworkDiagnostics(true); return;
+        }
         if (reply.kind == "diagnostics" || reply.kind == "diagnostics-error") {
             diagnosticsBusy_ = false;
             if (diagnosticsThread_.joinable()) diagnosticsThread_.join();
             if (!diagnosticsWindow_) return;
             if (diagnosticsReadPending_) { diagnosticsReadPending_ = false; ReadNetworkDiagnostics(); return; }
             if (reply.viewEpoch != diagnosticsEpoch_) return;
-            const auto diagnostics = reply.kind == "diagnostics" ? reply.data : Json{{"available", false}, {"message", "读取失败：" + reply.text}};
-            DWORD selectionStart = 0, selectionEnd = 0;
-            SendMessageW(diagnosticsOutput_, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
-            const auto firstLine = SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0);
-            Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format(diagnostics));
-            SendMessageW(diagnosticsOutput_, EM_SETSEL, selectionStart, selectionEnd);
-            SendMessageW(diagnosticsOutput_, EM_LINESCROLL, 0, firstLine - SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0));
-            EnableWindow(diagnosticsRefresh_, ready_ && !stopping_);
+            if (reply.data.contains("probe")) UpdateChannelProbeState(reply.data["probe"], reply.data.value("probeAuthoritative", false));
+            if (reply.data.contains("probeError")) {
+                channelProbeState_["available"] = false;
+                if (!DesktopChannelProbe::Running(channelProbeState_)) Text(channelProbeOutput_, L"读取探测状态失败，请稍后重试。\r\n" + Wide(reply.data["probeError"].get<std::string>()));
+            }
+            if (reply.data.contains("passive") || reply.kind == "diagnostics-error") {
+                const auto diagnostics = reply.kind == "diagnostics" ? reply.data["passive"] : Json{{"available", false}, {"message", "读取失败：" + reply.text}};
+                DWORD selectionStart = 0, selectionEnd = 0;
+                SendMessageW(diagnosticsOutput_, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+                const auto firstLine = SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0);
+                Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format(diagnostics));
+                SendMessageW(diagnosticsOutput_, EM_SETSEL, selectionStart, selectionEnd);
+                SendMessageW(diagnosticsOutput_, EM_LINESCROLL, 0, firstLine - SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0));
+            }
+            UpdateChannelProbeControls();
             return;
         }
         if (reply.kind == "ready") { Text(API_TOKEN, Wide(token_)); SetStatus(L"服务已就绪 · 正在读取身份", DesktopConnectionStatus::Tone::Waiting); UpdateButtons(); return; }
@@ -978,12 +1009,151 @@ class Application {
         }
         dialog->Release();
     }
+    void CancelOwnedChannelProbe(const std::string& id) {
+        if (!ownedChannelProbes_.ClaimCancel(id)) return;
+        bool success = false;
+        try {
+            Json body = {{"jobId", id}};
+            LocalRequest request(ControlPort(), token_, L"/api/network/diagnostics/channel-probe/cancel", &body, 2000);
+            if (request.status != 404) request.ReadJson();
+            success = true; // A missing old ID cannot still own a running job.
+        }
+        catch (...) { /* The backend deadline remains bounded if a local cancel cannot be delivered. */ }
+        ownedChannelProbes_.FinishCancel(id, success);
+    }
+    void RetireChannelProbeView() {
+        const auto owned = ownedChannelProbes_.Retire();
+        channelProbeView_ = 0;
+        if (owned.empty()) return;
+        {
+            std::lock_guard lock(probeCancelMutex_);
+            // Backend single-flight permits only the newest owned job to be
+            // live. One pending slot plus one worker bounds both IDs/handles.
+            pendingProbeCancel_ = owned.back();
+            if (!probeCancelThread_.joinable()) probeCancelThread_ = std::thread([this] {
+                for (;;) {
+                    std::string id;
+                    {
+                        std::unique_lock lock(probeCancelMutex_);
+                        probeCancelWake_.wait(lock, [this] { return probeCancelStopping_ || !pendingProbeCancel_.empty(); });
+                        if (probeCancelStopping_) return;
+                        id = std::move(pendingProbeCancel_); pendingProbeCancel_.clear();
+                    }
+                    CancelOwnedChannelProbe(id);
+                }
+            });
+        }
+        probeCancelWake_.notify_one();
+    }
+    void UpdateChannelProbeControls() {
+        if (!diagnosticsWindow_) return;
+        const bool active = DesktopChannelProbe::Running(channelProbeState_);
+        const bool enabled = ready_ && !stopping_ && !channelProbeCommandBusy_;
+        EnableWindow(channelProbeTarget_, enabled && !active && !channelProbeTargets_.empty());
+        EnableWindow(channelProbeStart_, enabled && !diagnosticsBusy_ && DesktopChannelProbe::CanStart(channelProbeState_));
+        EnableWindow(channelProbeCancel_, enabled && active && !DesktopChannelProbe::Text(DesktopChannelProbe::Job(channelProbeState_), "id").empty());
+        EnableWindow(channelProbeExport_, !stopping_ && !active && channelProbeReport_.is_object());
+        EnableWindow(diagnosticsRefresh_, ready_ && !stopping_ && !active && !channelProbeCommandBusy_ && !diagnosticsBusy_);
+    }
+    void UpdateChannelProbeState(const Json& response, bool authoritative = false) {
+        if (!diagnosticsWindow_ || !response.is_object()) return;
+        if (response.contains("targets")) channelProbeState_ = response;
+        else if (const auto job = DesktopChannelProbe::Job(response); !job.empty()) {
+            channelProbeState_["job"] = job; channelProbeState_["busy"] = DesktopChannelProbe::Text(job, "state") == "running";
+        }
+        const auto targets = DesktopChannelProbe::Targets(channelProbeState_);
+        const auto serialized = Json(targets).dump();
+        if (serialized != lastChannelProbeTargets_) {
+            const auto previous = SendMessageW(channelProbeTarget_, CB_GETCURSEL, 0, 0);
+            const auto selectedId = previous >= 0 && static_cast<size_t>(previous) < channelProbeTargets_.size() ? channelProbeTargets_[previous] : std::string{};
+            SendMessageW(channelProbeTarget_, CB_RESETCONTENT, 0, 0); channelProbeTargets_.clear();
+            size_t selection = 0;
+            for (const auto& target : targets) {
+                const auto id = DesktopChannelProbe::Text(target, "id");
+                const auto name = DesktopChannelProbe::Text(target, "name", 256), address = DesktopChannelProbe::Text(target, "address", 64);
+                const auto label = (DesktopChannelProbe::Text(target, "role") == "host" ? std::wstring(L"B 服务端 · ") : L"A 调用端 · ") +
+                    Wide(name.empty() ? address : name + (address.empty() ? "" : " · " + address));
+                SendMessageW(channelProbeTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                if (id == selectedId) selection = channelProbeTargets_.size();
+                channelProbeTargets_.push_back(id);
+            }
+            if (targets.empty()) SendMessageW(channelProbeTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"当前没有可探测的配对通道"));
+            SendMessageW(channelProbeTarget_, CB_SETCURSEL, selection, 0); lastChannelProbeTargets_ = serialized;
+        }
+        const auto job = DesktopChannelProbe::Job(channelProbeState_);
+        // Reads started during a POST may describe the pre-start job. They
+        // must not erase a newly registered late start's cancellation owner.
+        if (authoritative) ownedChannelProbes_.ObserveOnly(DesktopChannelProbe::Text(job, "id"));
+        if (job.contains("report")) {
+            const auto report = DesktopChannelProbe::Report(job["report"]);
+            if (report.is_object()) channelProbeReport_ = report;
+        }
+        if (!job.empty() && !DesktopChannelProbe::Running(channelProbeState_)) ownedChannelProbes_.Forget(DesktopChannelProbe::Text(job, "id"));
+        Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_));
+        UpdateChannelProbeControls();
+    }
+    void ChannelProbeCommand(bool cancel) {
+        if (!diagnosticsWindow_ || !ready_ || stopping_ || channelProbeCommandBusy_) return;
+        std::string id;
+        if (cancel) {
+            if (!DesktopChannelProbe::Running(channelProbeState_)) return;
+            id = DesktopChannelProbe::Text(DesktopChannelProbe::Job(channelProbeState_), "id");
+        } else {
+            if (diagnosticsBusy_ || !DesktopChannelProbe::CanStart(channelProbeState_)) return;
+            const auto selected = SendMessageW(channelProbeTarget_, CB_GETCURSEL, 0, 0);
+            if (selected < 0 || static_cast<size_t>(selected) >= channelProbeTargets_.size()) return;
+            id = channelProbeTargets_[selected]; channelProbeReport_ = Json();
+        }
+        if (id.empty()) return;
+        if (channelProbeThread_.joinable()) channelProbeThread_.join();
+        channelProbeCommandBusy_ = true; UpdateChannelProbeControls();
+        Text(channelProbeOutput_, cancel ? L"正在取消本次探测…" : L"正在提交当前配对通道探测…\r\n发送少量探测包，可能更新 Bridge 路径；不是带宽测速。");
+        const auto epoch = channelProbeView_;
+        try {
+            channelProbeThread_ = std::thread([this, cancel, id, epoch] {
+                try {
+                    Json body = {{cancel ? "jobId" : "targetId", id}};
+                    const auto route = cancel ? L"/api/network/diagnostics/channel-probe/cancel" : L"/api/network/diagnostics/channel-probe";
+                    const auto response = Api(ControlPort(), token_, route, &body, 3000);
+                    const auto createdId = cancel ? std::string{} : DesktopChannelProbe::Text(DesktopChannelProbe::Job(response), "id");
+                    if (!createdId.empty() && ownedChannelProbes_.Register(createdId, epoch)) CancelOwnedChannelProbe(createdId);
+                    if (cancel) ownedChannelProbes_.Forget(id);
+                    Post({"channel-probe-command", response, {}, {}, epoch});
+                } catch (const std::exception& error) { Post({"channel-probe-error", {}, error.what(), {}, epoch}); }
+            });
+        } catch (...) { channelProbeCommandBusy_ = false; UpdateChannelProbeControls(); throw; }
+    }
+    void ExportChannelProbeReport() {
+        if (!diagnosticsWindow_ || !channelProbeReport_.is_object() || DesktopChannelProbe::Running(channelProbeState_)) return;
+        const auto payload = channelProbeReport_.dump(2) + "\n";
+        IFileSaveDialog* raw = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&raw)))) throw std::runtime_error("无法创建报告保存窗口");
+        std::unique_ptr<IFileSaveDialog, void(*)(IFileSaveDialog*)> dialog(raw, [](IFileSaveDialog* item) { item->Release(); });
+        const COMDLG_FILTERSPEC types[] = {{L"JSON 探测报告", L"*.json"}};
+        dialog->SetFileTypes(1, types); dialog->SetDefaultExtension(L"json"); dialog->SetTitle(L"导出通道探测报告");
+        FILEOPENDIALOGOPTIONS options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options))) dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_NOREADONLYRETURN);
+        SYSTEMTIME utc{}; GetSystemTime(&utc); wchar_t filename[96];
+        swprintf_s(filename, 96, L"Bridge-channel-probe-%04u%02u%02u-%02u%02u%02u.json", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+        dialog->SetFileName(filename);
+        const auto shown = dialog->Show(diagnosticsWindow_);
+        if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return;
+        if (FAILED(shown)) throw std::runtime_error("无法选择报告保存位置");
+        IShellItem* item = nullptr; if (FAILED(dialog->GetResult(&item))) throw std::runtime_error("无法读取报告保存位置");
+        PWSTR chosen = nullptr; const auto location = item->GetDisplayName(SIGDN_FILESYSPATH, &chosen); item->Release();
+        if (FAILED(location) || !chosen) throw std::runtime_error("报告必须保存到本地文件");
+        const fs::path target(chosen); CoTaskMemFree(chosen);
+        // Freeze the whitelisted report before writing; no status or target metadata.
+        std::ofstream file(target, std::ios::binary | std::ios::trunc);
+        if (!file || !file.write(payload.data(), static_cast<std::streamsize>(payload.size())) || !file.flush()) throw std::runtime_error("报告保存失败");
+        Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_) + L"\r\n\r\nJSON 探测报告已导出。");
+    }
     void DiagnosticsFont() {
         const auto dpi = GetDpiForWindow(diagnosticsWindow_);
         auto font = CreateFontW(-MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
         if (!font) throw std::runtime_error(WindowsError("创建诊断窗口字体"));
-        for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_, channelProbeTarget_, channelProbeStart_, channelProbeCancel_, channelProbeExport_, channelProbeOutput_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         if (diagnosticsFont_) DeleteObject(diagnosticsFont_);
         diagnosticsFont_ = font;
     }
@@ -992,10 +1162,20 @@ class Application {
         RECT rect; GetClientRect(diagnosticsWindow_, &rect);
         const auto dpi = GetDpiForWindow(diagnosticsWindow_);
         auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
-        const int margin = scale(18), buttonW = scale(104), buttonH = scale(32), gap = scale(12);
+        const int margin = scale(18), buttonW = scale(104), buttonH = scale(32), gap = scale(10);
         const int footer = rect.bottom - margin - buttonH;
-        MoveWindow(diagnosticsOutput_, margin, margin, std::max(0, static_cast<int>(rect.right) - margin * 2), std::max(0, footer - margin - gap), TRUE);
-        MoveWindow(diagnosticsRefresh_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW * 2 - gap), footer, buttonW, buttonH, TRUE);
+        const int width = std::max(0, static_cast<int>(rect.right) - margin * 2);
+        const int passiveHeight = std::max(scale(80), (footer - margin - gap * 3 - buttonH) * 45 / 100);
+        const int targetTop = margin + passiveHeight + gap;
+        const int reportTop = targetTop + buttonH + gap;
+        MoveWindow(diagnosticsOutput_, margin, margin, width, passiveHeight, TRUE);
+        MoveWindow(channelProbeTarget_, margin, targetTop, width, scale(220), TRUE);
+        MoveWindow(channelProbeOutput_, margin, reportTop, width, std::max(scale(50), footer - reportTop - gap), TRUE);
+        MoveWindow(diagnosticsRefresh_, margin, footer, buttonW, buttonH, TRUE);
+        const int runWidth = std::max(scale(120), width - buttonW * 4 - gap * 4);
+        MoveWindow(channelProbeStart_, margin + buttonW + gap, footer, runWidth, buttonH, TRUE);
+        MoveWindow(channelProbeCancel_, margin + buttonW + runWidth + gap * 2, footer, buttonW, buttonH, TRUE);
+        MoveWindow(channelProbeExport_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW * 2 - gap), footer, buttonW, buttonH, TRUE);
         MoveWindow(diagnosticsClose_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW), footer, buttonW, buttonH, TRUE);
     }
     void ReadNetworkDiagnostics(bool automatic = false) {
@@ -1014,11 +1194,20 @@ class Application {
         if (diagnosticsThread_.joinable()) diagnosticsThread_.join();
         const auto epoch = ++diagnosticsEpoch_;
         diagnosticsBusy_ = true; EnableWindow(diagnosticsRefresh_, FALSE);
-        if (!automatic) Text(diagnosticsOutput_, L"正在读取本机节点网络诊断…\r\n窗口打开期间每 2 秒自动刷新，仅读取已有计数，不发起测速。\r\n\r\n本机节点启动以来累计，包含模型和代理；重传不等于公网丢包率。");
+        UpdateChannelProbeControls();
+        if (!automatic && !DesktopChannelProbe::Running(channelProbeState_)) Text(diagnosticsOutput_, L"正在读取本机节点网络诊断…\r\n窗口打开期间每 2 秒自动刷新；手动探测运行期间暂停被动采样。\r\n\r\n本机节点启动以来累计，包含模型和代理；重传不等于公网丢包率。");
+        const bool readPassive = !DesktopChannelProbe::Running(channelProbeState_) && !channelProbeCommandBusy_;
+        const bool observeCurrentJob = !channelProbeCommandBusy_;
         try {
-            diagnosticsThread_ = std::thread([this, epoch] {
-                try { Post({"diagnostics", Api(ControlPort(), token_, L"/api/network/diagnostics", nullptr, 5000), {}, {}, epoch}); }
-                catch (const std::exception& error) { Post({"diagnostics-error", {}, error.what(), {}, epoch}); }
+            diagnosticsThread_ = std::thread([this, epoch, readPassive, observeCurrentJob] {
+                Json result = {{"probeAuthoritative", observeCurrentJob}};
+                try { result["probe"] = Api(ControlPort(), token_, L"/api/network/diagnostics/channel-probe", nullptr, 3000); }
+                catch (const std::exception& error) { result["probeError"] = error.what(); }
+                if (readPassive && (!result.contains("probe") || !DesktopChannelProbe::Running(result["probe"]))) {
+                    try { result["passive"] = Api(ControlPort(), token_, L"/api/network/diagnostics", nullptr, 5000); }
+                    catch (const std::exception& error) { result["passive"] = {{"available", false}, {"message", "读取失败：" + std::string(error.what())}}; }
+                }
+                Post({"diagnostics", result, {}, {}, epoch});
             });
         } catch (const std::exception& error) {
             diagnosticsBusy_ = false; EnableWindow(diagnosticsRefresh_, TRUE);
@@ -1030,22 +1219,39 @@ class Application {
         case WM_CREATE: {
             diagnosticsOutput_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_OUTPUT), instance_, nullptr);
-            diagnosticsRefresh_ = CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            diagnosticsRefresh_ = CreateWindowExW(0, L"BUTTON", L"刷新统计", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_REFRESH), instance_, nullptr);
             diagnosticsClose_ = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_CLOSE), instance_, nullptr);
-            if (!diagnosticsOutput_ || !diagnosticsRefresh_ || !diagnosticsClose_) throw std::runtime_error(WindowsError("创建诊断窗口控件"));
-            for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) {
+            channelProbeTarget_ = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_TARGET), instance_, nullptr);
+            channelProbeStart_ = CreateWindowExW(0, L"BUTTON", L"探测配对通道", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_START), instance_, nullptr);
+            channelProbeCancel_ = CreateWindowExW(0, L"BUTTON", L"取消探测", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_CANCEL), instance_, nullptr);
+            channelProbeExport_ = CreateWindowExW(0, L"BUTTON", L"导出 JSON", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_EXPORT), instance_, nullptr);
+            channelProbeOutput_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_OUTPUT), instance_, nullptr);
+            if (!diagnosticsOutput_ || !diagnosticsRefresh_ || !diagnosticsClose_ || !channelProbeTarget_ || !channelProbeStart_ || !channelProbeCancel_ || !channelProbeExport_ || !channelProbeOutput_) throw std::runtime_error(WindowsError("创建诊断窗口控件"));
+            for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_, channelProbeTarget_, channelProbeStart_, channelProbeCancel_, channelProbeExport_, channelProbeOutput_}) {
                 SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(this));
                 DesktopTheme::NativeControls(child, dark_);
             }
             DesktopTheme::TitleBar(window, dark_, colors_);
             SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             SendMessageW(diagnosticsOutput_, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
-            DiagnosticsFont(); LayoutDiagnostics(); return 0;
+            SendMessageW(channelProbeOutput_, EM_SETLIMITTEXT, 256 * 1024, 0);
+            channelProbeView_ = ownedChannelProbes_.BeginView();
+            channelProbeState_ = Json::object(); channelProbeReport_ = Json(); channelProbeTargets_.clear(); lastChannelProbeTargets_.clear();
+            Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_));
+            DiagnosticsFont(); LayoutDiagnostics(); UpdateChannelProbeControls(); return 0;
         }
         case WM_COMMAND:
             if (LOWORD(wParam) == DIAGNOSTICS_REFRESH && HIWORD(wParam) == BN_CLICKED) ReadNetworkDiagnostics();
+            else if (LOWORD(wParam) == CHANNEL_PROBE_START && HIWORD(wParam) == BN_CLICKED) ChannelProbeCommand(false);
+            else if (LOWORD(wParam) == CHANNEL_PROBE_CANCEL && HIWORD(wParam) == BN_CLICKED) ChannelProbeCommand(true);
+            else if (LOWORD(wParam) == CHANNEL_PROBE_EXPORT && HIWORD(wParam) == BN_CLICKED) ExportChannelProbeReport();
             else if (LOWORD(wParam) == DIAGNOSTICS_CLOSE || LOWORD(wParam) == IDCANCEL) DestroyWindow(window);
             return 0;
         case WM_CLOSE: DestroyWindow(window); return 0;
@@ -1060,7 +1266,7 @@ class Application {
         }
         case WM_GETMINMAXINFO: {
             const auto dpi = GetDpiForWindow(window);
-            RECT rect{0, 0, MulDiv(580, dpi, 96), MulDiv(350, dpi, 96)};
+            RECT rect{0, 0, MulDiv(680, dpi, 96), MulDiv(500, dpi, 96)};
             AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, dpi);
             reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
         }
@@ -1071,10 +1277,16 @@ class Application {
         case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT:
             SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
             return reinterpret_cast<LRESULT>(input_);
+        case WM_CTLCOLORLISTBOX:
+            SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
+            return reinterpret_cast<LRESULT>(input_);
         case WM_DESTROY:
             KillTimer(window, DIAGNOSTICS_TIMER);
             ++diagnosticsEpoch_; diagnosticsReadPending_ = false;
+            RetireChannelProbeView();
             diagnosticsWindow_ = diagnosticsOutput_ = diagnosticsRefresh_ = diagnosticsClose_ = nullptr;
+            channelProbeTarget_ = channelProbeStart_ = channelProbeCancel_ = channelProbeExport_ = channelProbeOutput_ = nullptr;
+            channelProbeState_ = Json::object(); channelProbeReport_ = Json(); channelProbeTargets_.clear(); lastChannelProbeTargets_.clear();
             if (diagnosticsFont_) { DeleteObject(diagnosticsFont_); diagnosticsFont_ = nullptr; }
             return 0;
         }
@@ -1104,10 +1316,11 @@ class Application {
             if (!RegisterClassExW(&type)) throw std::runtime_error(WindowsError("注册诊断窗口"));
         }
         RECT owner; GetWindowRect(window_, &owner);
-        RECT rect{0, 0, S(840), S(640)}; const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
+        RECT rect{0, 0, S(840), S(680)}; const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
         AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, extra, dpi_);
-        const int width = rect.right - rect.left, height = rect.bottom - rect.top;
         MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
+        const int width = std::min(rect.right - rect.left, monitor.rcWork.right - monitor.rcWork.left);
+        const int height = std::min(rect.bottom - rect.top, monitor.rcWork.bottom - monitor.rcWork.top);
         const int x = std::max(monitor.rcWork.left, owner.left + (owner.right - owner.left - width) / 2);
         const int y = std::max(monitor.rcWork.top, owner.top + (owner.bottom - owner.top - height) / 2);
         if (!CreateWindowExW(extra, name.c_str(), L"网络诊断 · 本机节点", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, width, height, window_, nullptr, instance_, this))
@@ -1198,7 +1411,12 @@ class Application {
             DrainOwnedJob(job_.value, process_.value);
             job_.reset();
         }
-        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_}) if (thread->joinable()) thread->join();
+        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &channelProbeThread_}) if (thread->joinable()) thread->join();
+        {
+            std::lock_guard lock(probeCancelMutex_); probeCancelStopping_ = true; pendingProbeCancel_.clear();
+        }
+        probeCancelWake_.notify_one();
+        if (probeCancelThread_.joinable()) probeCancelThread_.join();
         if (trayAdded_) { NOTIFYICONDATAW icon{}; icon.cbSize = sizeof(icon); icon.hWnd = window_; icon.uID = 1; Shell_NotifyIconW(NIM_DELETE, &icon); trayAdded_ = false; }
         MSG message; while (PeekMessageW(&message, window_, MSG_REPLY, MSG_REPLY, PM_REMOVE)) delete reinterpret_cast<Reply*>(message.lParam);
     }

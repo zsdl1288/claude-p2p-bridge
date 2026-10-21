@@ -80,6 +80,8 @@ func Run(input io.Reader, output io.Writer) error {
 				ID             string `json:"id"`
 				Data           string `json:"data"`
 				MaxConnections *int   `json:"maxConnections"`
+				Type           string `json:"type"`
+				Size           int    `json:"size"`
 			}
 			if len(req.Params) > 0 {
 				err = json.Unmarshal(req.Params, &params)
@@ -94,6 +96,17 @@ func Run(input io.Reader, output io.Writer) error {
 					result, err = manager.Status(callCtx)
 				case "diagnostics":
 					result, err = manager.Diagnostics(callCtx)
+				case "channel-probe":
+					result, err = manager.ChannelProbe(callCtx, params.Host, params.Type, params.Size)
+				case "refresh-transport":
+					// The operation is fixed. Reject options instead of exposing a
+					// generic debug-action proxy over the private RPC interface.
+					var fields map[string]json.RawMessage
+					if err = json.Unmarshal(req.Params, &fields); err == nil && fields != nil && len(fields) == 0 {
+						result = manager.RefreshTransport(callCtx)
+					} else {
+						err = errors.New("refresh-transport requires an empty object")
+					}
 				case "login":
 					result, err = manager.Login(callCtx)
 				case "connect":

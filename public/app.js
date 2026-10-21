@@ -1,5 +1,6 @@
 import { pages, uiState, allowedPage, deviceIdentity, deviceConnection } from './ui-state.js';
 import { networkDiagnosticsView } from './network-diagnostics.js';
+import { createChannelProbeView } from './channel-probe.js';
 
 const $ = (id) => document.getElementById(id);
 let token, apiBase, currentStatus, lastConfig, lastInvitation, selectedPeer, toastTimer, lastError, lastModels, selectedModelId = '';
@@ -9,13 +10,14 @@ let diagnosticsOpen = false, diagnosticsRequest = null, diagnosticsTimer = null;
 const retiredInstances = new Set();
 const roleName = (role) => role === 'host' ? 'B · 服务端' : role === 'client' ? 'A · 调用端' : '尚未选择身份';
 const state = () => uiState(currentStatus, actionBusy || proxyBusy || !localAvailable);
+const channelProbeView = createChannelProbeView({ api, $, available: () => localAvailable && state().proxy, toast });
 
 function toast(message, error = false) {
   $('toast').textContent = message; $('toast').className = `toast${error ? ' error' : ''}`; $('toast').hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('toast').hidden = true; }, error ? 8000 : 3000);
 }
-async function api(route, body, signal) {
-  const response = await fetch(route, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal });
+async function api(route, body, signal, keepalive = false) {
+  const response = await fetch(route, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal, keepalive });
   if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error?.message || data.error || `HTTP ${response.status}`); }
   return response;
 }
@@ -44,6 +46,7 @@ function navigate(next, updateHash = true) {
 }
 for (const button of document.querySelectorAll('[data-page]')) button.onclick = () => { if (!button.disabled) navigate(button.dataset.page); };
 window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
+window.addEventListener('pagehide', () => channelProbeView.close());
 
 async function action(route, body, message) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -289,7 +292,7 @@ function renderProxy(proxy = {}, ui = state()) {
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
   const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : proxy.connectionLimit === 0 ? '（不设数量上限）' : ''}`;
-  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
+  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}${proxy.recoveryMessage ? ` · ${proxy.recoveryMessage}` : ''}`;
 }
 async function proxyAction(route, body) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -311,7 +314,7 @@ function renderDiagnosticsControls() {
   $('network-diagnostics-panel').hidden = !diagnosticsOpen;
   $('network-diagnostics-open').setAttribute('aria-expanded', String(diagnosticsOpen));
   $('network-diagnostics-open').disabled = !localAvailable || !state().proxy;
-  $('network-diagnostics-refresh').disabled = Boolean(diagnosticsRequest) || !localAvailable || !state().proxy;
+  $('network-diagnostics-refresh').disabled = Boolean(diagnosticsRequest) || channelProbeView.busy() || !localAvailable || !state().proxy;
 }
 function renderDiagnostics(snapshot) {
   const view = networkDiagnosticsView(snapshot);
@@ -340,6 +343,7 @@ function renderDiagnostics(snapshot) {
   }
 }
 function retireNetworkDiagnostics() {
+  channelProbeView.close();
   diagnosticsOpen = false;
   if (diagnosticsTimer !== null) clearInterval(diagnosticsTimer);
   diagnosticsTimer = null;
@@ -347,7 +351,7 @@ function retireNetworkDiagnostics() {
   renderDiagnostics(null); renderDiagnosticsControls();
 }
 async function refreshNetworkDiagnostics() {
-  if (!diagnosticsOpen || diagnosticsRequest || !localAvailable || !state().proxy) return;
+  if (!diagnosticsOpen || diagnosticsRequest || channelProbeView.busy() || !localAvailable || !state().proxy) return;
   const controller = diagnosticsRequest = new AbortController();
   $('network-diagnostics-status').textContent = '正在更新本机网络诊断…'; renderDiagnosticsControls();
   try {
@@ -362,9 +366,10 @@ async function refreshNetworkDiagnostics() {
 $('network-diagnostics-open').onclick = () => {
   if ($('network-diagnostics-open').disabled || diagnosticsOpen) return;
   diagnosticsOpen = true;
+  void channelProbeView.open();
   renderDiagnostics({ available: false, message: '正在读取本机网络诊断…' });
   const timer = diagnosticsTimer = setInterval(() => {
-    if (diagnosticsTimer === timer) return refreshNetworkDiagnostics();
+    if (diagnosticsTimer === timer) { void channelProbeView.refresh(); return refreshNetworkDiagnostics(); }
   }, 2000);
   return refreshNetworkDiagnostics();
 };

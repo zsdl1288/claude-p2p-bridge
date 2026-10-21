@@ -29,6 +29,26 @@ async function setup(t, { join = true } = {}) {
 }
 function call(url, route, body, extra = {}) { return fetch(`${url}${route}`, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer test-local-token', 'Content-Type': 'application/json', ...extra }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }); }
 
+test('channel monitoring follows peer lifecycle without leaving timers or resetting the recovery budget', async (t) => {
+  const timers = new Set();
+  const bridge = new Bridge({ demo: true, recoveryOptions: {
+    setIntervalFn: () => { const timer = { unref() {} }; timers.add(timer); return timer; },
+    clearIntervalFn: (timer) => timers.delete(timer)
+  } });
+  t.after(async () => { await bridge.disconnect(); await bridge.networkProxy.close(); });
+  assert.equal(timers.size, 0);
+  const first = await bridge.host({ tailscaleIp: '127.0.0.1', bridgePort: 0 });
+  assert.equal(timers.size, 1);
+  bridge.channelRecovery.attempts.push(performance.now());
+  await bridge.disconnect(); assert.equal(timers.size, 0);
+  assert.equal(bridge.channelRecovery.status().attemptsInWindow, 1);
+  await bridge.host({ tailscaleIp: '127.0.0.1', bridgePort: 0 });
+  assert.equal(timers.size, 1); assert.equal(bridge.channelRecovery.status().attemptsInWindow, 1);
+  assert.equal(first.channelRecovery.enabled, false, 'Loopback demo never enables transport refresh');
+  await bridge.networkProxy.close(); assert.equal(timers.size, 0);
+  bridge.channelRecovery.start(); assert.equal(timers.size, 0, 'A closed application cannot restart monitoring');
+});
+
 test('network diagnostics only forwards an embedded snapshot and never polls or changes network state', async () => {
   const snapshot = { available: true, source: 'embedded', scope: 'node', capturedAt: '2026-10-20T12:34:56Z',
     netstack: { counter_tcp_retransmits: 3 }, transport: [] };

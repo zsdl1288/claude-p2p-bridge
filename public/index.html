@@ -62,6 +62,14 @@
         <section id="network-diagnostics-panel" class="network-diagnostics" aria-label="本机网络诊断" hidden>
           <div class="card-heading"><h3>本机网络诊断</h3><div><button type="button" class="secondary" id="network-diagnostics-refresh">刷新</button><button type="button" class="text-button" id="network-diagnostics-close">收起</button></div></div>
           <p id="network-diagnostics-status" class="field-hint" role="status" aria-live="polite">尚未读取。</p>
+          <div class="channel-probe-panel">
+            <h3>手动通道探测</h3>
+            <p class="field-hint">发送少量探测包，可能更新 Bridge 路径；不是带宽测速。探测期间暂停本面板的被动采样，最多 35 秒。</p>
+            <label for="channel-probe-target">当前配对设备</label><select id="channel-probe-target" disabled></select>
+            <div class="form-actions"><button type="button" class="secondary" id="channel-probe-start" disabled>开始探测</button><button type="button" class="secondary" id="channel-probe-cancel" disabled>取消探测</button><button type="button" class="secondary" id="channel-probe-export" disabled>导出报告</button></div>
+            <p id="channel-probe-status" class="field-hint" role="status" aria-live="polite">等待当前配对设备及网络组件就绪。</p>
+            <pre id="channel-probe-result" class="test-output">尚未探测。</pre>
+          </div>
           <p class="field-hint">统计范围是本机内置节点，包含模型和代理流量。计数器自该节点启动以来累计；“当前已建立连接”是当前值。TCP 重传不能当作公网丢包率。面板打开期间每 2 秒更新，关闭即停止；也可手动刷新，缺失项显示 —。</p>
           <p class="subtle">采样时间：<time id="network-diagnostics-time">—</time></p>
           <dl id="network-diagnostics-tcp" class="diagnostics-counters"></dl>

@@ -144,7 +144,14 @@ test('authenticated SOCKS TCP transfers independent streams, early data and half
   first.socket.write(payload); second.socket.write('separate');
   assert.deepEqual(await first.reader.read(payload.length), payload);
   assert.equal((await second.reader.read(8)).toString(), 'separate');
+  assert.equal(a.diagnostics(), undefined); assert.equal(b.diagnostics(), undefined);
+  const aHealth = a.recoverySnapshot()[0], bHealth = b.recoverySnapshot()[0];
+  assert.equal(aHealth.activeFlows, 2); assert.equal(bHealth.activeFlows, 2);
+  assert.equal(aHealth.consumerBlocked, false); assert.equal(bHealth.consumerBlocked, false);
+  assert.ok(aHealth.completedBytes >= payload.length + 8); assert.ok(bHealth.completedBytes >= payload.length + 8);
+  assert.equal(aHealth.blockedFlows, 0); assert.equal(bHealth.pendingBytes, 0);
   first.socket.end(); second.socket.end(); await until(() => a.flows.size === 0 && b.flows.size === 0);
+  assert.deepEqual(a.recoverySnapshot(), []); assert.deepEqual(b.recoverySnapshot(), []);
   assert.ok(a.uploadBytes >= payload.length && a.downloadBytes >= payload.length);
 });
 
@@ -205,6 +212,10 @@ test('TCP backpressure across several heartbeats preserves the stream and every 
   assert.equal(sending.tcpPaused, true); assert.ok(sending.sourceReadBytes > 0);
   assert.ok(sending.pendingDataBytes > 0); assert.ok(sending.pendingDataAgeMs >= 0);
   assert.ok(sending.wsBufferedAmount > 0);
+  const [aHealth] = a.recoverySnapshot(), [bHealth] = b.recoverySnapshot();
+  assert.equal(aHealth.activeFlows, 1); assert.equal(aHealth.consumerBlocked, true);
+  assert.equal(bHealth.activeFlows, 1); assert.equal(bHealth.consumerBlocked, false);
+  assert.ok(bHealth.pendingBytes > 0);
   const projected = JSON.stringify([a.diagnostics(), b.diagnostics()]);
   for (const secret of [a.username, a.password, b.username, b.password, pairing.room, pairing.secret, '127.0.0.1']) assert.equal(projected.includes(secret), false);
   t.diagnostic(`TCP receive backpressure reached; WebSocket paused: ${flow.ws.isPaused}`);
@@ -272,6 +283,7 @@ test('UDP ASSOCIATE relays real datagrams, resolves names on B and pins local so
   const association = await socks(3, { host: '0.0.0.0', port: 0 }); assert.equal(association.reply[1], 0);
   assert.equal(a.flows.size, 1); assert.equal(b.flows.size, 1);
   assert.deepEqual(a.diagnostics().active, []); assert.deepEqual(b.diagnostics().active, []);
+  assert.deepEqual(a.recoverySnapshot(), []); assert.deepEqual(b.recoverySnapshot(), []);
   const send = (socket, text) => socket.send(Buffer.concat([Buffer.from([0, 0, 0]), encodeSocksAddress('dns.example', port), Buffer.from(text)]), association.address.port, '127.0.0.1');
   let result = once(udp, 'message'); send(udp, 'dns-query');
   let [reply] = await result, target = decodeSocksAddress(reply, 3);

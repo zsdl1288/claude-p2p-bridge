@@ -13,7 +13,7 @@ import { sendJson as json, readJsonObject as readBody } from './http.js';
 import { ClashProxy } from './clash-proxy.js';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
-const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/network-diagnostics.js': ['network-diagnostics.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
+const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/network-diagnostics.js': ['network-diagnostics.js', 'text/javascript; charset=utf-8'], '/channel-probe.js': ['channel-probe.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
 const modelPaths = new Set(['/v1/chat/completions', '/v1/models', '/v1/responses', '/v1/messages']);
 const tokenLoads = new Map();
 export function getApiToken(directory) {
@@ -183,6 +183,21 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
       if (proxy && req.method === 'POST' && url.pathname === '/api/proxy') return json(res, 200, await proxy.configure(await readBody(req)));
       if (req.method === 'GET' && url.pathname === '/api/tailscale') return json(res, 200, await bridge.networkInfo(true));
       if (!modelListener && req.method === 'GET' && url.pathname === '/api/network/diagnostics') return json(res, 200, await bridge.networkDiagnostics());
+      if (!modelListener && url.pathname === '/api/network/diagnostics/channel-probe') {
+        if (req.method === 'GET') return json(res, 200, bridge.channelProbe.status());
+        if (req.method === 'POST') {
+          const body = await readBody(req, 1024);
+          if (Object.keys(body).length !== 1 || typeof body.targetId !== 'string') throw new Error('请选择当前配对通道，无需其他参数');
+          return json(res, 202, bridge.channelProbe.start(body));
+        }
+        return reject(405, '仅支持 GET 或 POST', 'method_not_allowed');
+      }
+      if (!modelListener && req.method === 'POST' && url.pathname === '/api/network/diagnostics/channel-probe/cancel') {
+        const body = await readBody(req, 1024);
+        if (Object.keys(body).length !== 1 || typeof body.jobId !== 'string') throw new Error('需要当前探测任务编号');
+        bridge.channelProbe.cancel(body.jobId);
+        return json(res, 200, bridge.channelProbe.status());
+      }
       if (req.method === 'POST' && url.pathname === '/api/network/login') { await readBody(req); return json(res, 200, actionStatus(await bridge.loginNetwork())); }
       if (req.method === 'POST' && url.pathname === '/api/network/disconnect') {
         await readBody(req);

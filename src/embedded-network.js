@@ -76,17 +76,18 @@ export class EmbeddedNetwork extends EventEmitter {
       if (this.closed || child !== this.child || !child?.stdin.writable) { reject(new Error('组网进程未启动或已关闭')); return; }
       const id = ++this.sequence;
       const line = `${JSON.stringify({ id, method, params })}\n`;
+      const nonfatal = method === 'diagnostics' || method === 'refresh-transport' || method === 'channel-probe';
       const fail = (error) => {
-        if (method !== 'diagnostics') return this.invalidate(child, error);
-        // A failed snapshot must not revoke live transports owned by this helper.
+        if (!nonfatal) return this.invalidate(child, error);
+        // A failed maintenance request must not revoke this helper's live transports.
         if (!this.pending.delete(id)) return;
         clearTimeout(timer); reject(error);
       };
       const timer = setTimeout(() => {
         // A timed-out listen/dial may still allocate a proxy. Reset its owner
         // so those resources cannot survive without a corresponding JS handle.
-        fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : '内置组网响应超时，将在下次连接时重试'));
-      }, this.requestTimeoutMs);
+        fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : method === 'refresh-transport' ? '内置组网通道刷新响应超时' : method === 'channel-probe' ? '内置组网探针响应超时' : '内置组网响应超时，将在下次连接时重试'));
+      }, method === 'channel-probe' ? Math.min(this.requestTimeoutMs, 4000) : method === 'refresh-transport' ? Math.min(this.requestTimeoutMs, 5000) : this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer, child });
       try { child.stdin.write(line, (error) => { if (error) fail(error); }); }
       catch (error) { fail(error); }
@@ -104,6 +105,52 @@ export class EmbeddedNetwork extends EventEmitter {
     if (this.closed || !child || !this.initialized.has(child) || !child.stdin?.writable) return unavailable('内置组网进程尚未就绪，未启动诊断');
     try { return await this.request('diagnostics', {}, child); }
     catch { return unavailable('内置组网诊断暂不可用'); }
+  }
+  async refreshTransport() {
+    const unavailable = () => ({ refreshed: false, reason: 'unavailable' });
+    const child = this.child;
+    if (this.closed || this.wantRunning !== true || !child || !this.initialized.has(child) || !child.stdin?.writable) return unavailable();
+    if (this.transportRefreshChild === child) return { refreshed: false, reason: 'busy' };
+    this.transportRefreshChild = child;
+    try {
+      const result = await this.request('refresh-transport', {}, child);
+      if (!result || !['refreshed', 'cooldown', 'unavailable', 'busy'].includes(result.reason) ||
+          result.refreshed !== (result.reason === 'refreshed')) return unavailable();
+      const safe = { refreshed: result.refreshed, reason: result.reason };
+      if (result.reason === 'cooldown' && Number.isSafeInteger(result.retryAfterMs) && result.retryAfterMs > 0 && result.retryAfterMs <= 120000) safe.retryAfterMs = result.retryAfterMs;
+      return safe;
+    } catch { return unavailable(); }
+    finally { if (this.transportRefreshChild === child) this.transportRefreshChild = null; }
+  }
+  async channelProbe(params, child = this.child) {
+    const unavailable = () => ({ type, size, outcome: 'unavailable', actualVia: 'unknown' });
+    const host = params?.host, type = params?.type, size = params?.size;
+    const octets = typeof host === 'string' && host.split('.');
+    if (!octets || octets.length !== 4 || !octets.every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255) ||
+        Number(octets[0]) !== 100 || Number(octets[1]) < 64 || Number(octets[1]) > 127 ||
+        !((type === 'TSMP' && size === 0) || (type === 'disco' && [128, 1200].includes(size)))) return { outcome: 'invalid-request', actualVia: 'unknown' };
+    if (this.closed || this.wantRunning !== true || !child || child !== this.child || !this.initialized.has(child) || !child.stdin?.writable) return unavailable();
+    if (this.channelProbeChild === child) return { type, size, outcome: 'busy', actualVia: 'unknown' };
+    this.channelProbeChild = child;
+    try {
+      const value = await this.request('channel-probe', { host, type, size }, child);
+      if (this.closed || this.wantRunning !== true || child !== this.child) return unavailable();
+      const safe = { type, size, outcome: 'invalid-result', actualVia: 'unknown' };
+      if (type === 'TSMP') safe.innerIPv4Bytes = 29; else safe.discoPayloadBytes = size;
+      if (!value || value.type !== type || value.size !== size ||
+          !['reply', 'timeout', 'cancelled', 'busy', 'unavailable', 'probe-error', 'invalid-request'].includes(value.outcome)) return safe;
+      safe.outcome = value.outcome;
+      if (value.outcome !== 'reply') return safe;
+      if (typeof value.latencySeconds !== 'number' || !Number.isFinite(value.latencySeconds) || value.latencySeconds < 0) { safe.outcome = 'invalid-result'; return safe; }
+      safe.latencySeconds = value.latencySeconds;
+      if (type === 'TSMP') return safe;
+      if (value.actualVia === 'derp' && Number.isInteger(value.derpRegionId) && value.derpRegionId > 0 && value.derpRegionId <= 65535) {
+        safe.actualVia = 'derp'; safe.derpRegionId = value.derpRegionId;
+        if (typeof value.derpRegionCode === 'string' && /^[A-Za-z0-9_-]{1,16}$/.test(value.derpRegionCode)) safe.derpRegionCode = value.derpRegionCode;
+      } else if (['direct', 'peer-relay'].includes(value.actualVia)) safe.actualVia = value.actualVia;
+      return safe;
+    } catch { return unavailable(); }
+    finally { if (this.channelProbeChild === child) this.channelProbeChild = null; }
   }
   login() { this.wantRunning = true; return this.networkState('login'); }
   connect() { this.wantRunning = true; return this.networkState('connect'); }

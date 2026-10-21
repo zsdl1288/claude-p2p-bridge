@@ -191,6 +191,29 @@ export class NetworkProxy extends EventEmitter {
     return { scope: 'process', activeCount, truncated: Math.max(0, activeCount - active.length), active,
       closed: this.diagnosticClosed.map(({ at, snapshot }) => ({ ...snapshot, closedAgoMs: diagnosticAge(now, at) })) };
   }
+  // Internal aggregate evidence only: no destinations, credentials or payloads.
+  // A pending local write is evidence of backpressure, never proof of WAN loss.
+  recoverySnapshot() {
+    const now = performance.now(), sessions = new Map();
+    for (const flow of this.flows) {
+      if (!flow.health || flow.dead || !this.valid(flow)) continue;
+      const connection = flow.connection;
+      let sample = sessions.get(connection);
+      if (!sample) {
+        sample = { connection, side: flow.side, activeFlows: 0, blockedFlows: 0, pendingBytes: 0,
+          oldestPendingMs: 0, completedBytes: connection.recoveryCompletedBytes || 0, consumerBlocked: false };
+        sessions.set(connection, sample);
+      }
+      sample.activeFlows++;
+      const health = flow.health;
+      const age = health.pendingAt === null ? 0 : Math.max(0, now - health.pendingAt);
+      sample.pendingBytes = diagnosticAdd(sample.pendingBytes, health.pendingBytes);
+      sample.oldestPendingMs = Math.max(sample.oldestPendingMs, age);
+      if (health.pendingBytes >= 32768 && age >= 3000) sample.blockedFlows++;
+      if (flow.side === 'client' && (health.socket.writableNeedDrain || health.socket.writableLength >= 65536 || flow.ws.isPaused)) sample.consumerBlocked = true;
+    }
+    return [...sessions.values()];
+  }
   closeDiagnosticFlow(flow, reason) {
     if (!flow.diagnostics) return;
     const now = performance.now();
@@ -309,12 +332,24 @@ export class NetworkProxy extends EventEmitter {
   }
   send(flow, frame, outgoing = true, callback) {
     if (!this.account(flow, frame.length, outgoing) || flow.ws.readyState !== WebSocket.OPEN) return false;
-    const diagnostics = flow.diagnostics, bytes = diagnostics && frame[0] === DATA ? frame.length - 1 : null;
+    const payloadBytes = frame[0] === DATA ? frame.length - 1 : null;
+    const health = flow.health;
+    if (health && payloadBytes !== null) {
+      if (!health.pendingFrames) health.pendingAt = performance.now();
+      health.pendingFrames++; health.pendingBytes = diagnosticAdd(health.pendingBytes, payloadBytes);
+    }
+    const diagnostics = flow.diagnostics, bytes = diagnostics ? payloadBytes : null;
     if (bytes !== null) {
       if (!diagnostics.pendingDataFrames) diagnostics.pendingDataAt = performance.now();
       diagnostics.pendingDataFrames++; diagnostics.pendingDataBytes = diagnosticAdd(diagnostics.pendingDataBytes, bytes);
     }
     flow.ws.send(frame, (error) => {
+      if (health && payloadBytes !== null) {
+        health.pendingFrames = Math.max(0, health.pendingFrames - 1);
+        health.pendingBytes = Math.max(0, health.pendingBytes - payloadBytes);
+        if (!health.pendingFrames) health.pendingAt = null;
+        if (!error && flow.connection) flow.connection.recoveryCompletedBytes = diagnosticAdd(flow.connection.recoveryCompletedBytes || 0, payloadBytes);
+      }
       if (bytes !== null) {
         diagnostics.pendingDataFrames = Math.max(0, diagnostics.pendingDataFrames - 1);
         diagnostics.pendingDataBytes = Math.max(0, diagnostics.pendingDataBytes - bytes);
@@ -381,6 +416,7 @@ export class NetworkProxy extends EventEmitter {
     this.pipeTcp(flow, socket);
   }
   pipeTcp(flow, socket) {
+    flow.health = { socket, pendingBytes: 0, pendingFrames: 0, pendingAt: null };
     const diagnostics = this.diagnosticsEnabled ? (flow.diagnostics = { socket, id: ++this.diagnosticSequence, createdAt: performance.now(),
       sourceReadBytes: 0, lastReadAt: null, wsWriteCompletedBytes: 0, lastDoneAt: null,
       pendingDataFrames: 0, pendingDataBytes: 0, pendingDataAt: null, sourcePausedAt: null,
@@ -602,6 +638,8 @@ export class NetworkProxy extends EventEmitter {
   }
   async close() {
     if (this.closing) return this.closing;
+    this.bridge.channelRecovery?.close();
+    this.bridge.channelProbe?.close();
     this.closed = true; this.bridge.off?.('state', this.onPeerState);
     for (const flow of this.flows) flow.close();
     for (const socket of this.localSockets) socket.destroy();
