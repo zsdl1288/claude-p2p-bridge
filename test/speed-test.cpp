@@ -15,11 +15,11 @@ int main() {
         live["online"] = false; Require(DeviceLive(live) == L"—", "Offline metrics must not retain a stale rate or RTT");
         live = {{"online", true}, {"uploadBytesPerSecond", 12345}, {"downloadBytesPerSecond", nullptr}, {"latencyMs", nullptr}};
         Require(DeviceLive(live) == L"↑ 12.3 KB/s ↓ — · —" && DeviceLive(Json()) == L"—", "Missing or expired metrics must remain unknown");
-        Json report = {{"v", 1}, {"completed", true}, {"startedAtUtc", "2026-10-21T20:00:00.000Z"}, {"finishedAtUtc", "2026-10-21T20:00:12.000Z"},
-            {"targetRole", "host"}, {"maximumSeconds", 35}, {"maxBytesPerDirection", MaxBytes}, {"stopReason", nullptr},
+        Json report = {{"v", 1}, {"completed", true}, {"startedAtUtc", "2026-10-21T20:00:00.000Z"}, {"finishedAtUtc", "2026-10-21T20:00:42.000Z"},
+            {"targetRole", "host"}, {"maximumSeconds", 60}, {"maxBytesPerDirection", MaxBytes}, {"stopReason", nullptr},
             {"latency", {{"samples", Json::array({120.0, 124.0, 122.0, 126.0, 121.0})}, {"minMs", 1}, {"medianMs", 999}, {"maxMs", 9999}, {"failedSamples", 0}}},
-            {"download", {{"receivedBytes", 10000000}, {"durationMs", 5000.0}, {"bytesPerSecond", 2000000.0}, {"completion", "complete"}, {"limitReached", false}}},
-            {"upload", {{"receivedBytes", 2000000}, {"durationMs", 5000.0}, {"bytesPerSecond", 400000.0}, {"completion", "partial"}, {"limitReached", false}}},
+            {"download", {{"receivedBytes", 40000000}, {"durationMs", 20000.0}, {"bytesPerSecond", 2000000.0}, {"completion", "complete"}, {"limitReached", false}}},
+            {"upload", {{"receivedBytes", 8000000}, {"durationMs", 20000.0}, {"bytesPerSecond", 400000.0}, {"completion", "partial"}, {"limitReached", false}}},
             {"notes", Json::array({"injected-private-note"})}, {"targetId", "private-target"}, {"token", "private-token"}, {"address", "100.95.24.20"}, {"jobId", "private-job"}};
         Json state = {{"available", true}, {"connected", true}, {"reason", "ready"}, {"busy", false}, {"retryAfterMs", 0},
             {"targets", Json::array({{{"id", "current-pair"}, {"name", "my-B"}, {"address", "100.64.1.2"}, {"role", "host"}, {"supported", true}}})},
@@ -36,13 +36,30 @@ int main() {
         state["targets"][0]["supported"] = false; Require(!CanStart(state), "An old peer must request upgrade instead of starting a test");
         state["targets"][0]["supported"] = true; state["retryAfterMs"] = 10; Require(!CanStart(state), "A start during cooldown must be disabled");
         state["retryAfterMs"] = 0; state["job"]["state"] = "running"; state["busy"] = true;
-        state["job"]["progress"] = {{"phase", "download"}, {"elapsedMs", 2500}, {"durationMs", 5000}, {"bytes", 1000000}, {"maxBytes", MaxBytes}, {"bytesPerSecond", 400000}};
+        state["job"]["progress"] = {{"phase", "download"}, {"elapsedMs", 10000}, {"durationMs", 20000}, {"bytes", 1000000}, {"maxBytes", MaxBytes}, {"bytesPerSecond", 400000}};
         const auto progress = ViewProgress(state);
-        Require(!progress.marquee && progress.position == 500 && progress.text.find(L"A 下载 B → A") != std::wstring::npos, "Download progress and global A perspective must be explicit");
+        Require(!progress.marquee && progress.position == 250 && progress.text.find(L"A 下载 B → A") != std::wstring::npos, "Download progress and global A perspective must be explicit");
         Require(Rate(Speed(state, safe, "download")) == L"3.20 Mbps", "Live measured rate must override the preceding report");
         state["job"]["progress"] = {{"phase", "connecting"}}; Require(ViewProgress(state).marquee, "Progress without a denominator must remain indeterminate");
-        state["job"]["progress"] = {{"phase", "connecting"}, {"elapsedMs", 1000}, {"durationMs", 35000}}; Require(ViewProgress(state).marquee, "Connecting deadlines are not transfer progress");
-        state["job"]["progress"] = {{"phase", "latency"}, {"samplesDone", 3}}; Require(ViewProgress(state).position == 600, "RTT sample progress must use the fixed five-sample plan");
+        state["job"]["progress"] = {{"phase", "connecting"}, {"elapsedMs", 1000}, {"durationMs", MaximumMs}}; Require(ViewProgress(state).marquee, "Connecting deadlines are not transfer progress");
+        state["job"]["progress"] = {{"phase", "upload"}, {"elapsedMs", 20000}, {"durationMs", 20000}, {"waitingForReceiver", true}, {"confirmationRemainingMs", 3200}};
+        Require(ViewProgress(state).marquee && ViewProgress(state).text.find(L"等待接收端确认") != std::wstring::npos && ViewProgress(state).text.find(L"3.2") != std::wstring::npos, "Receiver confirmation must be clearly labelled and bounded instead of showing successful completion");
+        state["job"]["progress"]["waitingForReceiver"] = false;
+        Require(!ViewProgress(state).marquee && ViewProgress(state).position == 990 && ViewProgress(state).text.find(L"2/2") != std::wstring::npos, "A full sending interval cannot imply receiver-confirmed completion");
+        state["job"]["progress"] = {{"phase", "upload"}, {"latencyMs", 264.3}, {"samplesDone", 32}};
+        Require(Latency(state, safe).value == 264.3 && SamplesLabel(state, safe).find(L"32 个样本") != std::wstring::npos, "Loaded RTT must refresh during transfers and support more than five samples");
+        state["job"]["progress"] = {{"phase", "download"}, {"waitingForReceiver", true}};
+        Require(Speed(state, safe, "download").value == 2000000, "A receiver-confirmation update without a rate must retain the actual received measurement");
+        report["stopReason"] = "receiver-timeout";
+        Require(Details(state, Report(report)).find(L"等待接收端确认超时") != std::wstring::npos, "Receiver timeout needs a precise failure reason");
+        report["latency"]["samples"] = Json::array(); report["latency"]["failedSamples"] = 2;
+        Require(Report(report)["latency"].is_object() && Report(report)["latency"]["medianMs"].is_null(), "Missing loaded RTT must remain unknown instead of invalidating the bulk measurements");
+        report["latency"]["samples"] = std::vector<double>(64, 100.0); report["latency"]["failedSamples"] = 0;
+        Require(Report(report)["latency"]["samples"].size() == 64, "The continuous loaded-RTT plan permits sixty-four bounded samples");
+        report["latency"]["samples"].push_back(100.0);
+        Require(Report(report)["latency"].is_null(), "Oversized RTT histories must not pass report export validation");
+        report["latency"]["samples"] = Json::array({123.0});
+        Require(Details(state, Report(report)).find(L"20 秒") != std::wstring::npos && Details(state, Report(report)).find(L"512 MiB") != std::wstring::npos, "The native window must describe the new transfer interval and traffic cap");
         state["job"]["state"] = "cancelled"; Require(ViewProgress(state).position != 1000, "Cancellation cannot show successful completion");
         report["download"]["completion"] = "failed"; safe = Report(report); Require(!Speed(Json::object(), safe, "download").known, "A failed stage must not invent zero throughput");
         report["download"]["receivedBytes"] = MaxBytes + 1; Require(Report(report)["download"].is_null(), "Oversized transfer counters must not be exported");

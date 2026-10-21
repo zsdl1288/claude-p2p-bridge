@@ -125,7 +125,7 @@ export class Bridge extends EventEmitter {
   }
   async attach(role, pairing, { retryInitial = false } = {}) {
     const peer = this.peer = new BridgePeer({ role, pairing, retryInitial, allowLoopback: this.demo, networkAdapter: this.demo ? null : this.networkAdapter,
-      capabilities: { speedTest: 1 }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
+      capabilities: { speedTest: 2 }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
       networkUpgrade: (req, socket, head, current) => {
         if (current !== this.peer) { socket.destroy(); return true; }
         if (this.speedTransport.upgrade(req, socket, head, current)) return true;

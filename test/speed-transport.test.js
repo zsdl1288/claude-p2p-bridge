@@ -37,14 +37,14 @@ async function fixture(t, options = {}) {
   return { a, b, host, client, pairing, bArgs, aArgs, bConnection, aConnection, url, headers };
 }
 
-test('dedicated loopback measures receiver bytes in both fixed A directions and five RTTs', async (t) => {
+test('dedicated loopback measures receiver bytes and concurrent loaded RTTs without a separate latency phase', async (t) => {
   const f = await fixture(t), aProgress = [], bProgress = [];
   const host = f.b.host({ ...f.bArgs, onProgress: (p) => bProgress.push(p) });
   assert.equal(f.b.pending.size, 1, 'The host reservation exists before sending its control offer');
   const [b, a] = await Promise.all([host, f.a.client({ ...f.aArgs, onProgress: (p) => aProgress.push(p) })]);
   assert.deepEqual(a, b);
   assert.equal(a.completed, true, JSON.stringify(a));
-  assert.equal(a.latency.samples.length, 5); assert.equal(a.latency.failedSamples, 0);
+  assert.ok(a.latency.samples.length >= 1 && a.latency.samples.length <= 64); assert.equal(a.latency.failedSamples, 0);
   assert.ok(a.latency.samples.every((ms) => ms >= 0 && Number.isFinite(ms)));
   for (const direction of ['download', 'upload']) {
     assert.equal(a[direction].receivedBytes, 256 * 1024);
@@ -56,7 +56,72 @@ test('dedicated loopback measures receiver bytes in both fixed A directions and 
   assert.equal(f.a.sessions.size, 0); assert.equal(f.b.sessions.size, 0);
   assert.equal(f.host.peer.isConnected(f.bConnection), true);
   assert.equal(f.client.peer.isConnected(f.aConnection), true);
+  assert.ok(![...aProgress, ...bProgress].some((p) => p.phase === 'latency'));
   assert.ok(!/ticket|session|secret|127\.0\.0\.1/.test(JSON.stringify(a)));
+});
+
+test('a stalled write callback ends within the phase confirmation budget with actual partial receiver data', async (t) => {
+  const f = await fixture(t, { phaseMs: 100, maxBytes: 8 * 1024 * 1024, confirmationMs: 120, deadlineMs: 2500, progressMs: 10 });
+  const send = f.b.send.bind(f.b), started = performance.now(), progress = [];
+  f.b.send = (s, value, binary) => {
+    const written = send(s, value, binary);
+    return binary ? written.then(() => new Promise(() => {})) : written;
+  };
+  const [b, a] = await Promise.all([f.b.host({ ...f.bArgs, onProgress: (p) => progress.push(p) }), f.a.client(f.aArgs)]);
+  assert.equal(b.completed, false); assert.equal(b.stopReason, 'receiver-timeout');
+  assert.ok(performance.now() - started < 800, 'A stuck local write must not wait for the overall 60-second deadline');
+  assert.equal(a.completed, false); assert.equal(a.stopReason, 'receiver-timeout'); assert.ok(a.download.receivedBytes > 0);
+  assert.equal(a.download.completion, 'partial');
+  assert.ok(progress.some((p) => p.phase === 'download' && p.waitingForReceiver && p.confirmationRemainingMs <= 120));
+  assert.equal(f.host.peer.isConnected(f.bConnection), true); assert.equal(f.client.peer.isConnected(f.aConnection), true);
+});
+
+test('missing receiver acknowledgement is bounded independently of the overall deadline', async (t) => {
+  const f = await fixture(t, { confirmationMs: 100, deadlineMs: 2500 });
+  const sendJSON = f.a.sendJSON.bind(f.a), started = performance.now();
+  f.a.sendJSON = (s, value) => value.type === 'phase-result' ? Promise.resolve() : sendJSON(s, value);
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(b.completed, false); assert.equal(b.stopReason, 'receiver-timeout');
+  assert.ok(performance.now() - started < 700);
+  assert.equal(a.download.receivedBytes, 256 * 1024); assert.equal(a.download.completion, 'complete');
+  assert.equal(a.upload.receivedBytes, 0);
+});
+
+test('upload congestion cannot keep the measurement waiting after its confirmation budget', async (t) => {
+  const f = await fixture(t, { phaseMs: 100, maxBytes: 8 * 1024 * 1024, confirmationMs: 150, deadlineMs: 2500, progressMs: 10 });
+  const receiveProgress = f.b.receiveProgress.bind(f.b); let paused = false, resume;
+  f.b.receiveProgress = (s) => {
+    receiveProgress(s);
+    if (s.receive?.direction === 'upload' && s.receive.bytes && !paused) {
+      paused = true; s.ws.pause();
+      resume = setTimeout(() => s.ws.resume(), 1000);
+    }
+  };
+  t.after(() => clearTimeout(resume));
+  const started = performance.now();
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(a.completed, false); assert.equal(b.stopReason, 'receiver-timeout');
+  assert.equal(a.download.completion, 'complete'); assert.ok(b.upload.receivedBytes > 0);
+  assert.equal(b.upload.completion, 'partial');
+  assert.ok(performance.now() - started < 1000, 'A stalled upload ends without waiting for the group deadline');
+  assert.equal(f.host.peer.isConnected(f.bConnection), true); assert.equal(f.client.peer.isConnected(f.aConnection), true);
+});
+
+test('a receiver times out a peer that keeps replying to RTT but never sends upload data or phase-end', async (t) => {
+  const f = await fixture(t, { phaseMs: 100, confirmationMs: 150, deadlineMs: 2500, pingIntervalMs: 30 });
+  const sendPhase = f.a.sendPhase.bind(f.a), started = performance.now();
+  f.a.sendPhase = (s, direction) => {
+    if (direction !== 'upload') return sendPhase(s, direction);
+    s.sending = { direction, sentBytes: 0 };
+    return new Promise((_resolve, reject) => s.writes.add(reject));
+  };
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(b.completed, false); assert.equal(b.stopReason, 'receiver-timeout');
+  assert.equal(b.download.completion, 'complete'); assert.equal(b.upload.completion, 'failed');
+  assert.equal(b.upload.receivedBytes, 0); assert.equal(a.completed, false); assert.equal(a.stopReason, 'receiver-timeout');
+  assert.ok(b.latency.samples.length >= 2, 'RTT replies alone cannot keep an absent upload alive');
+  assert.ok(performance.now() - started < 800);
+  assert.equal(f.host.peer.isConnected(f.bConnection), true); assert.equal(f.client.peer.isConnected(f.aConnection), true);
 });
 
 test('elapsed phases stop before their byte cap and keep real receive counts', async (t) => {
@@ -67,6 +132,48 @@ test('elapsed phases stop before their byte cap and keep real receive counts', a
     assert.ok(a[dir].receivedBytes > 0); assert.ok(a[dir].receivedBytes < 64 * 1024 * 1024);
     assert.equal(a[dir].limitReached, false); assert.equal(a[dir].completion, 'complete');
   }
+});
+
+test('loaded RTT keeps sampling during payload and does not add a latency-only phase', async (t) => {
+  const f = await fixture(t, { phaseMs: 150, maxBytes: 256 * 1024 * 1024, pingIntervalMs: 30, pingMs: 100 }), progress = [];
+  const [b, a] = await Promise.all([f.b.host({ ...f.bArgs, onProgress: (p) => progress.push(p) }), f.a.client(f.aArgs)]);
+  assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
+  assert.ok(a.latency.samples.length >= 4 && a.latency.samples.length <= 64, JSON.stringify(a.latency));
+  assert.ok(progress.some((p) => p.phase === 'download' && p.latency?.samples.length >= 2));
+  assert.ok(progress.some((p) => p.phase === 'upload' && p.latency?.samples.length >= 3));
+  assert.ok(!progress.some((p) => p.phase === 'latency'));
+});
+
+test('concurrent RTT updates preserve receiver progress and the confirmation countdown without rewinding either direction', async (t) => {
+  const f = await fixture(t, { phaseMs: 180, maxBytes: 256 * 1024 * 1024, pingIntervalMs: 30, pingMs: 100, progressMs: 60 });
+  const aProgress = [], bProgress = [];
+  const [b, a] = await Promise.all([
+    f.b.host({ ...f.bArgs, onProgress: (p) => bProgress.push(p) }),
+    f.a.client({ ...f.aArgs, onProgress: (p) => aProgress.push(p) })
+  ]);
+  assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
+  for (const progress of [aProgress, bProgress]) for (const direction of ['download', 'upload']) {
+    const values = progress.filter((p) => p.phase === direction);
+    assert.ok(values.some((p) => p.samplesDone && p.bytes > 0), 'RTT updates continue alongside nonzero received bytes');
+    for (let i = 1; i < values.length; i++) {
+      assert.ok(values[i].bytes >= values[i - 1].bytes, `${direction} receiver bytes must not reset on a pong`);
+      assert.ok(values[i].elapsedMs >= values[i - 1].elapsedMs, `${direction} elapsed time must not reset on a pong`);
+    }
+    for (const value of values.filter((p) => p.waitingForReceiver)) {
+      assert.ok(value.elapsedMs >= f.a.phaseMs); assert.ok(value.confirmationRemainingMs >= 0 && value.confirmationRemainingMs <= 5000);
+    }
+  }
+});
+
+test('missing RTT replies do not prevent completed receiver-verified throughput results', async (t) => {
+  const f = await fixture(t, { phaseMs: 80, maxBytes: 256 * 1024 * 1024, pingIntervalMs: 20, pingMs: 20 });
+  const bind = f.b.bind.bind(f.b);
+  f.b.bind = (s, ws) => { bind(s, ws); ws.ping = (_data, _mask, callback) => callback?.(); };
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
+  assert.deepEqual(a.latency.samples, []); assert.ok(a.latency.failedSamples > 0);
+  assert.equal(a.latency.medianMs, null);
+  assert.equal(a.download.completion, 'complete'); assert.equal(a.upload.completion, 'complete');
 });
 
 test('receiver credits grow beyond a small bandwidth-delay window on an actual delayed data path', async (t) => {
@@ -96,8 +203,20 @@ test('receiver credits grow beyond a small bandwidth-delay window on an actual d
   assert.ok(a.latency.minMs >= 50, JSON.stringify(a.latency));
   assert.ok(largestUnreceived > 256 * 1024, 'Actual receiver feedback grows the initial credit window');
   assert.ok(largestUnreceived <= 4 * 1024 * 1024 + 64 * 1024, 'Unreceived application bytes remain bounded');
-  assert.equal(a.download.receivedBytes, 8 * 1024 * 1024);
-  assert.equal(a.upload.receivedBytes, 8 * 1024 * 1024);
+  assert.ok(a.download.receivedBytes >= 4 * 1024 * 1024 && a.download.receivedBytes <= 8 * 1024 * 1024);
+  assert.ok(a.upload.receivedBytes >= 4 * 1024 * 1024 && a.upload.receivedBytes <= 8 * 1024 * 1024);
+});
+
+test('the default 200-ms feedback cadence does not throttle a low-RTT path to a tiny initial credit window', async (t) => {
+  const f = await fixture(t, { phaseMs: 1000, maxBytes: 256 * 1024 * 1024, deadlineMs: 6000 });
+  assert.equal(f.a.progressMs, 200); assert.equal(f.b.progressMs, 200);
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
+  for (const direction of ['download', 'upload']) {
+    assert.ok(a[direction].receivedBytes > 4 * 1024 * 1024, `${direction} default-cadence receiver bytes: ${a[direction].receivedBytes}`);
+    assert.ok(a[direction].bytesPerSecond > 4 * 1024 * 1024, `${direction} default-cadence bytes/sec: ${a[direction].bytesPerSecond}`);
+  }
+  t.diagnostic(`Default feedback: download ${a.download.bytesPerSecond.toFixed(0)} B/s; upload ${a.upload.bytesPerSecond.toFixed(0)} B/s`);
 });
 
 test('a temporarily paused receiver cannot accumulate a full four-MiB initial send queue', async (t) => {

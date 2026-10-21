@@ -14,7 +14,7 @@ export class BridgePeer extends EventEmitter {
     Object.assign(this, { role, pairing, allowLoopback, heartbeatMs, retryMs, networkAdapter, retryInitial, maxClients });
     this.networkUpgrade = networkUpgrade;
     Object.assign(this, { channel, sharedListener, parentSession, authorize, metadata, info });
-    this.capabilities = channel === 'control' && capabilities?.speedTest === 1 ? { speedTest: 1 } : {};
+    this.capabilities = channel === 'control' && [1, 2].includes(capabilities?.speedTest) ? { speedTest: capabilities.speedTest } : {};
     this.route = `${channel === 'model' ? '/model' : '/bridge'}/${pairing.room}`;
     this.authLabel = channel === 'model' ? 'p2pcc-model-v1' : 'p2pcc-v2';
     this.state = { mode: 'tailscale', role, online: false, listening: false, connectedClients: 0, maxClients, transport: 'offline', endpoint: `${pairing.host}:${pairing.port}`, error: null };
@@ -183,7 +183,7 @@ export class BridgePeer extends EventEmitter {
           if (typeof msg.nonce !== 'string' || !/^[\w-]{32}$/.test(msg.nonce) || (connection.remoteNonce && connection.remoteNonce !== msg.nonce)) throw new Error('身份验证失败');
           if (this.authorize && !this.authorize(msg, connection)) throw new Error('控制连接身份无效');
           connection.parentSession = typeof msg.parentSession === 'string' ? msg.parentSession : null;
-          connection.capabilities = this.channel === 'control' && msg.capabilities?.speedTest === 1 ? { speedTest: 1 } : {};
+          connection.capabilities = this.channel === 'control' && [1, 2].includes(msg.capabilities?.speedTest) ? { speedTest: msg.capabilities.speedTest } : {};
           if (msg.device && typeof msg.device === 'object') connection.device = {
             name: typeof msg.device.name === 'string' ? msg.device.name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 80) : '',
             address: typeof msg.device.address === 'string' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(msg.device.address) ? msg.device.address : ''
@@ -276,7 +276,7 @@ export class BridgePeer extends EventEmitter {
   // write into a forced disconnect of ordinary proxy or model traffic.
   trySendSpeedMessage(body, connection = this.clientConnection) {
     const reasons = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy',
-      'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'user-cancelled', 'closed', 'transport-failed']);
+      'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'receiver-timeout', 'user-cancelled', 'closed', 'transport-failed']);
     if (this.channel !== 'control' || !this.isConnected(connection) || body?.v !== 1 ||
         typeof body.id !== 'string' || !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(body.id) ||
         !['speed-request', 'speed-offer', 'speed-reject', 'speed-cancel'].includes(body.type) || connection.ws.bufferedAmount >= 64 * 1024) return false;

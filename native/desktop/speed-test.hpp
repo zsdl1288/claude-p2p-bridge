@@ -59,7 +59,9 @@ public:
     void FinishCancel(const std::string& id, bool success) { std::lock_guard lock(mutex_); cancelling_.erase(id); if (success) jobs_.erase(id); }
     void Forget(const std::string& id) { std::lock_guard lock(mutex_); jobs_.erase(id); cancelling_.erase(id); }
 };
-constexpr uint64_t MaxBytes = 67108864;
+constexpr uint64_t MaxBytes = 268435456;
+constexpr uint64_t MaximumMs = 60000;
+constexpr uint64_t MaximumSamples = 64;
 class StatusEpoch {
     uint64_t revision_ = 0;
 public:
@@ -124,7 +126,7 @@ inline std::wstring DeviceLive(const Json& device) {
 inline std::wstring Reason(const Json& state) {
     const auto reason = Text(state, "reason");
     if (reason == "ready") return L"选择已连接设备后，点击“开始测速”。";
-    if (reason == "unsupported" || reason == "peer-unsupported") return L"双方均需升级至 1.1.9 才能进行通道测速。";
+    if (reason == "unsupported" || reason == "peer-unsupported") return L"双方均需升级至 1.2.0 才能进行通道测速。";
     if (reason == "model-busy") return L"模型任务正在执行或排队，请稍后测速。";
     if (reason == "recovery-busy") return L"Bridge 正在恢复通道，请稍后测速。";
     if (reason == "cooldown") return L"测速冷却中，每次开始至少间隔 15 秒。";
@@ -133,6 +135,7 @@ inline std::wstring Reason(const Json& state) {
     if (reason == "closed") return L"测速服务已关闭。";
     if (reason == "helper-unavailable") return L"已有组网组件尚未就绪；测速不会自动启动它。";
     if (reason == "transport-failed") return L"测速传输中断，保留已经完成的测量。";
+    if (reason == "receiver-timeout") return L"等待接收端确认超时，保留已收到的测速数据。";
     if (reason == "deadline") return L"已达到测速时限。";
     if (reason == "target-changed") return L"目标或配对连接已改变，测速已停止。";
     if (reason == "helper-changed") return L"Bridge 组网组件已改变，测速已停止。";
@@ -140,7 +143,7 @@ inline std::wstring Reason(const Json& state) {
     return L"正在读取当前配对通道…";
 }
 inline Json Transfer(const Json& input) {
-    if (!Integer(input, "receivedBytes", MaxBytes) || !Numeric(input, "durationMs", 35000).known ||
+    if (!Integer(input, "receivedBytes", MaxBytes) || !Numeric(input, "durationMs", MaximumMs).known ||
         !Numeric(input, "bytesPerSecond", static_cast<double>(MaxBytes) * 1000).known ||
         !input.contains("limitReached") || !input["limitReached"].is_boolean()) return Json();
     const auto completion = Text(input, "completion");
@@ -150,32 +153,32 @@ inline Json Transfer(const Json& input) {
 }
 inline Json Report(const Json& input) {
     if (!Integer(input, "v", 1) || input["v"] != 1 || !input.contains("completed") || !input["completed"].is_boolean() ||
-        !Integer(input, "maximumSeconds", 35) || input["maximumSeconds"] != 35 ||
+        !Integer(input, "maximumSeconds", 60) || input["maximumSeconds"] != 60 ||
         !Integer(input, "maxBytesPerDirection", MaxBytes) || input["maxBytesPerDirection"] != MaxBytes) return Json();
     const auto role = Text(input, "targetRole"); if (role != "host" && role != "client") return Json();
-    Json report = {{"v", 1}, {"completed", input["completed"]}, {"targetRole", role}, {"maximumSeconds", 35},
+    Json report = {{"v", 1}, {"completed", input["completed"]}, {"targetRole", role}, {"maximumSeconds", 60},
         {"maxBytesPerDirection", MaxBytes}, {"startedAtUtc", nullptr}, {"finishedAtUtc", nullptr}, {"stopReason", nullptr},
         {"latency", nullptr}, {"download", nullptr}, {"upload", nullptr}, {"notes", Json::array({
             "本测速只测 A 与 B 已配对的 Bridge 通道，不代表 B 的互联网出口或网站速度。",
             "下载指 B→A，上传指 A→B；两端均按 A 的方向显示。延迟是往返 RTT。",
             "Mbps 与 MB/s 均使用十进制，8 Mbps = 1 MB/s。未完成阶段不代表零速度。",
-            "每方向最多 5 秒或 64 MiB，总测速数据最多 128 MiB；双方均需 1.1.9。"
+            "每方向最多 20 秒或 256 MiB，总测速数据最多 512 MiB；双方均需 1.2.0。延迟在上传下载期间同步测量。"
         })}};
     for (const auto* key : {"startedAtUtc", "finishedAtUtc"}) {
         const auto stamp = Text(input, key, 40);
         if (stamp.size() >= 20 && stamp[10] == 'T' && stamp.back() == 'Z' && stamp.find_first_not_of("0123456789-:.TZ") == std::string::npos) report[key] = stamp;
     }
     const std::set<std::string> stops = {"busy", "unsupported", "model-busy", "cooldown", "network-stopped", "recovery-busy",
-        "control-unavailable", "target-changed", "helper-changed", "deadline", "user-cancelled", "closed", "transport-failed"};
+        "control-unavailable", "target-changed", "helper-changed", "deadline", "user-cancelled", "closed", "transport-failed", "receiver-timeout"};
     if (const auto stop = Text(input, "stopReason"); stops.contains(stop)) report["stopReason"] = stop;
     for (const auto* key : {"download", "upload"}) if (input.contains(key)) report[key] = Transfer(input[key]);
     if (input.contains("latency")) {
         const auto& latency = input["latency"];
-        if (latency.is_object() && latency.contains("samples") && latency["samples"].is_array() && latency["samples"].size() <= 5 &&
-            Integer(latency, "failedSamples", 5) && latency["samples"].size() + latency["failedSamples"].get<unsigned>() <= 5) {
+        if (latency.is_object() && latency.contains("samples") && latency["samples"].is_array() && latency["samples"].size() <= MaximumSamples &&
+            Integer(latency, "failedSamples", MaximumSamples) && latency["samples"].size() + latency["failedSamples"].get<unsigned>() <= MaximumSamples) {
             std::vector<double> samples;
             for (const auto& value : latency["samples"]) if (value.is_number()) {
-                const auto ms = value.get<double>(); if (std::isfinite(ms) && ms >= 0 && ms <= 35000) samples.push_back(ms);
+                const auto ms = value.get<double>(); if (std::isfinite(ms) && ms >= 0 && ms <= MaximumMs) samples.push_back(ms);
             }
             if (samples.size() == latency["samples"].size()) {
                 Json safe = {{"samples", samples}, {"minMs", nullptr}, {"medianMs", nullptr}, {"maxMs", nullptr}, {"failedSamples", latency["failedSamples"]}};
@@ -192,17 +195,28 @@ inline Json Report(const Json& input) {
 inline Number Speed(const Json& state, const Json& report, const char* direction) {
     const auto job = Job(state);
     const auto progress = job.is_object() && job.contains("progress") ? job["progress"] : Json();
-    if (Running(state) && Text(progress, "phase") == direction) return Numeric(progress, "bytesPerSecond", static_cast<double>(MaxBytes) * 1000);
+    if (Running(state) && Text(progress, "phase") == direction) {
+        const auto live = Numeric(progress, "bytesPerSecond", static_cast<double>(MaxBytes) * 1000); if (live.known) return live;
+    }
     if (report.is_object() && report.contains(direction) && Text(report[direction], "completion") != "failed")
         return Numeric(report[direction], "bytesPerSecond", static_cast<double>(MaxBytes) * 1000);
     return {};
 }
 inline Number Latency(const Json& state, const Json& report) {
-    if (report.is_object() && report.contains("latency")) {
-        const auto value = Numeric(report["latency"], "medianMs", 35000); if (value.known) return value;
-    }
     const auto job = Job(state);
-    return job.contains("progress") ? Numeric(job["progress"], "latencyMs", 35000) : Number{};
+    if (Running(state) && job.contains("progress")) {
+        const auto live = Numeric(job["progress"], "latencyMs", MaximumMs); if (live.known) return live;
+    }
+    if (report.is_object() && report.contains("latency")) return Numeric(report["latency"], "medianMs", MaximumMs);
+    return {};
+}
+inline std::wstring SamplesLabel(const Json& state, const Json& report) {
+    std::wstring label = L"传输中 RTT · 中位数";
+    const auto job = Job(state), progress = job.contains("progress") ? job["progress"] : Json();
+    if (Running(state) && Integer(progress, "samplesDone", MaximumSamples)) return label + L"\r\n" + std::to_wstring(progress["samplesDone"].get<unsigned>()) + L" 个样本";
+    if (report.is_object() && report.contains("latency") && report["latency"].is_object() && report["latency"].contains("samples") && report["latency"]["samples"].is_array())
+        label += L"\r\n" + std::to_wstring(report["latency"]["samples"].size()) + L" 个样本";
+    return label;
 }
 struct Progress { bool marquee = false; int position = 0; std::wstring text; };
 inline Progress ViewProgress(const Json& state) {
@@ -212,26 +226,35 @@ inline Progress ViewProgress(const Json& state) {
     if (status == "cancelled") return {false, 0, L"测速已取消，保留已完成的测量。"};
     if (status == "failed") return {false, 0, L"测速未完成，请查看下方说明。"};
     if (status != "running") return {false, 0, Reason(state)};
-    const auto label = phase == "latency" ? L"1/3 · 测量往返延迟" : phase == "download" ? L"2/3 · A 下载 B → A" : phase == "upload" ? L"3/3 · A 上传 A → B" : L"正在连接已配对通道";
+    const auto label = phase == "download" ? L"1/2 · A 下载 B → A" : phase == "upload" ? L"2/2 · A 上传 A → B" : L"正在连接已配对通道";
     Progress view{true, 0, label};
-    const auto elapsed = Numeric(progress, "elapsedMs", 35000), duration = Numeric(progress, "durationMs", 35000);
+    const auto elapsed = Numeric(progress, "elapsedMs", MaximumMs), duration = Numeric(progress, "durationMs", MaximumMs);
     const auto bytes = Numeric(progress, "bytes", MaxBytes), maximum = Numeric(progress, "maxBytes", MaxBytes);
+    const bool transfer = phase == "download" || phase == "upload";
+    const bool confirming = transfer && progress.contains("waitingForReceiver") && progress["waitingForReceiver"] == true;
     double fraction = -1;
-    if (phase == "latency" && Integer(progress, "samplesDone", 5)) fraction = progress["samplesDone"].get<double>() / 5;
-    if (phase == "download" || phase == "upload") {
+    if (transfer && !confirming) {
         if (elapsed.known && duration.known && duration.value > 0) fraction = elapsed.value / duration.value;
         if (bytes.known && maximum.known && maximum.value > 0) fraction = std::max(fraction, bytes.value / maximum.value);
     }
-    if (fraction >= 0) { view.marquee = false; view.position = static_cast<int>(std::clamp(fraction, 0.0, 1.0) * 1000); }
-    if (elapsed.known) {
-        std::wostringstream detail; detail << std::fixed << std::setprecision(1) << elapsed.value / 1000 << L" 秒";
-        if (bytes.known) detail << L" · " << std::setprecision(2) << bytes.value / 1000000 << L" MB";
+    // A receiver confirmation is still pending after sending has stopped;
+    // reserve 100% exclusively for a completed, confirmed whole test.
+    if (fraction >= 0) { view.marquee = false; view.position = (phase == "upload" ? 500 : 0) + static_cast<int>(std::clamp(fraction, 0.0, 0.98) * 500); }
+    if (confirming) {
+        view.text += L" · 正在等待接收端确认";
+        const auto remaining = Numeric(progress, "confirmationRemainingMs", 5000);
+        if (remaining.known) { std::wostringstream detail; detail << std::fixed << std::setprecision(1) << remaining.value / 1000; view.text += L"（最多 " + detail.str() + L" 秒）"; }
+    } else if (elapsed.known) {
+        std::wostringstream detail; detail << std::fixed << std::setprecision(1) << elapsed.value / 1000;
+        if (transfer && duration.known && duration.value > 0) detail << L" / " << duration.value / 1000;
+        detail << L" 秒";
+        if (bytes.known && transfer) detail << L" · 已接收 " << std::setprecision(2) << bytes.value / 1000000 << L" MB";
         view.text += L" · " + detail.str();
     }
     return view;
 }
 inline std::wstring Details(const Json& state, const Json& report) {
-    std::wstring text = L"只测 A ↔ B 的 Bridge 通道，不代表 B 的外网速度。\r\n每方向 5 秒或 64 MiB；最多 128 MiB。Mbps 与 MB/s 为十进制。双方均需 1.1.9。";
+    std::wstring text = L"只测 A ↔ B 的 Bridge 通道，不代表 B 的外网速度。\r\n每方向 20 秒或 256 MiB；最多 512 MiB。延迟与传输同时测量。Mbps 与 MB/s 为十进制。双方均需 1.2.0。";
     if (!report.is_object()) return text;
     if (report["startedAtUtc"].is_string()) text += L"\r\n开始 UTC：" + Wide(report["startedAtUtc"].get<std::string>());
     if (report["finishedAtUtc"].is_string()) text += L"\r\n结束 UTC：" + Wide(report["finishedAtUtc"].get<std::string>());

@@ -1,4 +1,4 @@
-Claude Bridge 1.1.9 — third-party notices
+Claude Bridge 1.2.0 — third-party notices
 
 The native C++ desktop is statically linked with MinGW-w64 and uses nlohmann/json. This application embeds Tailscale tsnet (BSD-3-Clause), Node.js, Go, ws, and their dependencies. Tailscale's hosted coordination service is operated by Tailscale; this application is independently developed and is not endorsed by Tailscale.
 

@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { randomId } from './crypto.js';
 
-const MAX_BYTES = 64 * 1024 * 1024, MAX_MS = 35000, COOLDOWN_MS = 15000;
+const MAX_BYTES = 256 * 1024 * 1024, MAX_MS = 60000, COOLDOWN_MS = 15000;
 const TYPES = new Set(['speed-request', 'speed-offer', 'speed-reject', 'speed-cancel']);
 const REASONS = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy', 'control-unavailable',
-  'target-changed', 'helper-changed', 'deadline', 'user-cancelled', 'closed', 'transport-failed']);
-const PHASES = new Set(['connecting', 'latency', 'download', 'upload', 'completed']);
+  'target-changed', 'helper-changed', 'deadline', 'receiver-timeout', 'user-cancelled', 'closed', 'transport-failed']);
+const PHASES = new Set(['connecting', 'download', 'upload', 'completed']);
 const MESSAGES = {
   ready: '可测量当前 A 与 B 之间的上传、下载吞吐和往返延迟。',
-  'not-connected': '请先连接配对设备。', unsupported: '当前对端不支持通道测速，请将两端升级至 1.1.9 或更新版本。',
+  'not-connected': '请先连接配对设备。', unsupported: '当前对端不支持新版测速，请将两端升级至 1.2.0 或更新版本。',
   'helper-unavailable': '现有组网通道尚未就绪；测速不会主动启动或登录组网组件。',
   'network-stopped': '私有网络已停止或正在切换，请连接后再测速。',
   'model-busy': '模型任务正在执行、排队或等待取消确认，请稍后再测速。',
@@ -18,8 +18,8 @@ const MESSAGES = {
 const NOTES = [
   '下载固定表示 B→A，上传固定表示 A→B；两端报告采用相同方向。',
   '本测试仅在当前桥接通道之间传送内存数据，不访问外部测速网站，不代表 B 的外网带宽。',
-  '每方向最多测试 5 秒、64 MiB；速率按接收端实际收到的有效载荷和耗时计算。',
-  '延迟为最多 5 次应用层往返测量，包含应用和通道处理时间，不是 ICMP 延迟。',
+  '每方向发送最多 20 秒、256 MiB；之后等待接收端确认最多 5 秒，整组最长 60 秒。速率按实际接收字节和耗时计算。',
+  '上传、下载期间持续采样负载 RTT，最多保留 64 次结果；包含排队与通道处理时间，不是空闲或 ICMP 延迟。',
   '部分或缺失测量不能视作零速率；测速不修改配对、Clash、TUN、系统代理或路由。',
 ];
 const uuid = (value) => typeof value === 'string' && /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(value);
@@ -29,11 +29,11 @@ const clone = (value) => value === null ? null : structuredClone(value);
 const fail = (message, status, code) => Object.assign(new Error(message), { status, code });
 
 function latency(value) {
-  if (!value || !Array.isArray(value.samples) || value.samples.length > 5 || !value.samples.every((sample) => finite(sample)) ||
-      !integer(value.failedSamples, 5) || value.samples.length + value.failedSamples > 5 || !value.samples.length) return null;
+  if (!value || !Array.isArray(value.samples) || value.samples.length > 64 || !value.samples.every((sample) => finite(sample)) ||
+      !integer(value.failedSamples, 64) || value.samples.length + value.failedSamples > 64) return null;
   const samples = [...value.samples], sorted = [...samples].sort((a, b) => a - b), middle = Math.floor(sorted.length / 2);
-  return { samples, minMs: sorted[0], medianMs: sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2,
-    maxMs: sorted.at(-1), failedSamples: value.failedSamples };
+  return { samples, minMs: sorted[0] ?? null, medianMs: sorted.length ? sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2 : null,
+    maxMs: sorted.at(-1) ?? null, failedSamples: value.failedSamples };
 }
 
 function transfer(value) {
@@ -78,7 +78,7 @@ export class ChannelSpeed {
       // forwarder to B; a B never dials this advertised A address.
       const address = peer.role === 'client' ? peer.pairing?.host : connection.device?.address;
       return { connection, info: { id: connection.id, name: name || (role === 'host' ? '当前配对服务端' : '已授权调用端'), role,
-        supported: connection.capabilities?.speedTest === 1,
+        supported: connection.capabilities?.speedTest === 2,
         ...(typeof address === 'string' && /^[\d.:a-fA-F]{1,80}$/.test(address) ? { address } : {}) } };
     });
   }
@@ -112,7 +112,7 @@ export class ChannelSpeed {
     if (this.seenIds.size > 64) this.seenIds.delete(this.seenIds.values().next().value);
     const peer = this.bridge.peer, adapter = this.bridge.networkAdapter;
     const report = { v: 1, completed: false, startedAtUtc: this.utcNow(), finishedAtUtc: null,
-      targetRole: peer.role === 'client' ? 'host' : 'client', maximumSeconds: 35, maxBytesPerDirection: MAX_BYTES,
+      targetRole: peer.role === 'client' ? 'host' : 'client', maximumSeconds: 60, maxBytesPerDirection: MAX_BYTES,
       stopReason: null, latency: null, download: null, upload: null, notes: [...NOTES] };
     const job = this.job = { id, state: 'running', progress: { phase: 'connecting', elapsedMs: 0 }, report };
     let resolveOperation;
@@ -132,7 +132,7 @@ export class ChannelSpeed {
     if (this.bridge.networkAdapter !== context.adapter || (context.adapter?.embedded && context.adapter.child !== context.child)) return 'helper-changed';
     if (!this.current(context.peer, context.connection) || context.connection.session !== context.session ||
         (context.peer.role === 'client' && context.peer.dialResource !== context.resource)) return 'target-changed';
-    if (context.connection.capabilities?.speedTest !== 1) return 'unsupported';
+    if (context.connection.capabilities?.speedTest !== 2) return 'unsupported';
     const reason = this.baseReason();
     return reason === 'ready' ? null : reason === 'helper-unavailable' ? 'helper-changed' : reason;
   }
@@ -175,13 +175,13 @@ export class ChannelSpeed {
       if (this.context?.job.id === message.id && this.context.connection === connection) return true;
       if (this.seenIds.has(message.id)) return true;
       const reason = this.status().reason;
-      if (connection.capabilities?.speedTest !== 1) { this.reject(message, connection, peer, 'unsupported'); return true; }
+      if (connection.capabilities?.speedTest !== 2) { this.reject(message, connection, peer, 'unsupported'); return true; }
       if (reason !== 'ready') { this.reject(message, connection, peer, reason === 'helper-unavailable' ? 'network-stopped' : REASONS.has(reason) ? reason : 'unsupported'); return true; }
       this.startHost(this.create(connection, message.id)); return true;
     }
     if (message.type === 'speed-offer') {
       if (peer.role !== 'client' || message.session !== connection.session || typeof message.ticket !== 'string' || !/^[\w-]{43}$/.test(message.ticket)) return true;
-      if (connection.capabilities?.speedTest !== 1) { this.reject(message, connection, peer, 'unsupported'); return true; }
+      if (connection.capabilities?.speedTest !== 2) { this.reject(message, connection, peer, 'unsupported'); return true; }
       const existing = this.context;
       if (existing?.job.id === message.id && existing.connection === connection && existing.session === connection.session) {
         if (!existing.operationStarted && !existing.stopReason) {
@@ -206,7 +206,9 @@ export class ChannelSpeed {
     for (const key of ['elapsedMs', 'durationMs', 'latencyMs']) if (finite(value[key])) progress[key] = value[key];
     for (const key of ['bytes', 'maxBytes']) if (integer(value[key], MAX_BYTES)) progress[key] = value[key];
     if (finite(value.bytesPerSecond, MAX_BYTES * 1000)) progress.bytesPerSecond = value.bytesPerSecond;
-    if (integer(value.samplesDone, 5)) progress.samplesDone = value.samplesDone;
+    if (integer(value.samplesDone, 64)) progress.samplesDone = value.samplesDone;
+    if (typeof value.waitingForReceiver === 'boolean') progress.waitingForReceiver = value.waitingForReceiver;
+    if (finite(value.confirmationRemainingMs, 5000)) progress.confirmationRemainingMs = value.confirmationRemainingMs;
     const measuredLatency = latency(value.latency), download = transfer(value.download), upload = transfer(value.upload);
     if (measuredLatency) context.job.report.latency = measuredLatency;
     if (download) context.job.report.download = download;
@@ -245,7 +247,7 @@ export class ChannelSpeed {
         if (upload) report.upload = upload;
         if (!context.stopReason && result.completed !== true) this.stop(context, REASONS.has(result.stopReason) ? result.stopReason : 'transport-failed');
       }
-      report.completed = !context.stopReason && result?.completed === true && report.latency !== null &&
+      report.completed = !context.stopReason && result?.completed === true &&
         report.download?.completion === 'complete' && report.upload?.completion === 'complete';
       if (!report.completed && !context.stopReason) this.stop(context, 'transport-failed');
     } catch { if (!context.stopReason) this.stop(context, this.changed(context) || 'transport-failed'); }

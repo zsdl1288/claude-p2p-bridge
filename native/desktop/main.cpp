@@ -1085,6 +1085,7 @@ class Application {
     }
     void UpdateSpeedTestState(const Json& response, bool authoritative = false) {
         if (!speedTestWindow_ || !response.is_object()) return;
+        const auto previousJobId = DesktopSpeedTest::Text(DesktopSpeedTest::Job(speedTestState_), "id");
         if (response.contains("targets")) speedTestState_ = response;
         else if (const auto job = DesktopSpeedTest::Job(response); !job.empty()) {
             speedTestState_["job"] = job; speedTestState_["busy"] = DesktopSpeedTest::Text(job, "state") == "running";
@@ -1101,7 +1102,7 @@ class Application {
                 const auto name = DesktopSpeedTest::Text(target, "name", 256), address = DesktopSpeedTest::Text(target, "address", 64);
                 const bool supported = target["supported"] == true;
                 const auto label = (DesktopSpeedTest::Text(target, "role") == "host" ? std::wstring(L"固定 B 服务端 · ") : L"A 调用端 · ") +
-                    Wide(name.empty() ? address : name + (address.empty() ? "" : " · " + address)) + (supported ? L"" : L"（需升级 1.1.9）");
+                    Wide(name.empty() ? address : name + (address.empty() ? "" : " · " + address)) + (supported ? L"" : L"（需升级 1.2.0）");
                 SendMessageW(speedTestTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
                 if (id == selectedId) selection = static_cast<int>(speedTestTargets_.size());
                 speedTestTargets_.push_back(id);
@@ -1111,6 +1112,7 @@ class Application {
             SendMessageW(speedTestTarget_, CB_SETCURSEL, selection, 0); lastSpeedTestTargets_ = serialized;
         }
         const auto job = DesktopSpeedTest::Job(speedTestState_);
+        if (DesktopSpeedTest::Text(job, "id") != previousJobId) speedTestReport_ = Json();
         // Reads started during a POST may describe the pre-start job. They
         // must not erase a newly registered late start's cancellation owner.
         if (authoritative) ownedSpeedTests_.ObserveOnly(DesktopSpeedTest::Text(job, "id"));
@@ -1134,7 +1136,7 @@ class Application {
             if (selected < 0 || static_cast<size_t>(selected) >= speedTestTargets_.size() || !speedTestSupported_[selected]) return;
             id = speedTestTargets_[selected];
             if (!DesktopSpeedTest::CanStartTarget(speedTestState_, id)) return;
-            speedTestReport_ = Json();
+            speedTestReport_ = Json(); speedTestState_.erase("job"); RenderSpeedTest();
         }
         if (id.empty()) return;
         if (speedTestThread_.joinable()) speedTestThread_.join();
@@ -1187,9 +1189,7 @@ class Application {
         Text(speedTestDownload_, DesktopSpeedTest::Rate(download)); Text(speedTestDownloadSecondary_, DesktopSpeedTest::Rate(download, false));
         Text(speedTestUpload_, DesktopSpeedTest::Rate(upload)); Text(speedTestUploadSecondary_, DesktopSpeedTest::Rate(upload, false));
         Text(speedTestLatency_, DesktopSpeedTest::Milliseconds(DesktopSpeedTest::Latency(speedTestState_, speedTestReport_)));
-        std::wstring samples = L"往返 RTT · 中位数";
-        if (speedTestReport_.is_object() && speedTestReport_["latency"].is_object()) samples += L" · " + std::to_wstring(speedTestReport_["latency"]["samples"].size()) + L" 个样本";
-        Text(speedTestSamples_, samples);
+        Text(speedTestSamples_, DesktopSpeedTest::SamplesLabel(speedTestState_, speedTestReport_));
         const auto progress = DesktopSpeedTest::ViewProgress(speedTestState_);
         auto style = GetWindowLongPtrW(speedTestProgress_, GWL_STYLE);
         if (progress.marquee) style |= PBS_MARQUEE; else style &= ~static_cast<LONG_PTR>(PBS_MARQUEE);
@@ -1201,7 +1201,7 @@ class Application {
         Text(speedTestPhase_, progress.text);
         const auto selected = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
         if (!DesktopSpeedTest::Running(speedTestState_) && selected >= 0 && static_cast<size_t>(selected) < speedTestSupported_.size() && !speedTestSupported_[selected])
-            Text(speedTestPhase_, L"所选设备需升级至 1.1.9；双方均升级后才能开始测速。");
+            Text(speedTestPhase_, L"所选设备需升级至 1.2.0；双方均升级后才能开始测速。");
         Text(speedTestOutput_, DesktopSpeedTest::Details(speedTestState_, speedTestReport_));
     }
     void ReadSpeedTestStatus() {
@@ -1271,7 +1271,7 @@ class Application {
             speedTestLatency_ = control(L"STATIC", L"—", SPEED_TEST_LATENCY, SS_NOPREFIX);
             speedTestDownloadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_DOWNLOAD_SECONDARY, SS_NOPREFIX);
             speedTestUploadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_UPLOAD_SECONDARY, SS_NOPREFIX);
-            speedTestSamples_ = control(L"STATIC", L"往返 RTT · 中位数", SPEED_TEST_SAMPLES, SS_NOPREFIX);
+            speedTestSamples_ = control(L"STATIC", L"传输中 RTT · 中位数", SPEED_TEST_SAMPLES, SS_NOPREFIX);
             speedTestLabels_[0] = control(L"STATIC", L"A 下载 · B → A", 0, SS_NOPREFIX);
             speedTestLabels_[1] = control(L"STATIC", L"A 上传 · A → B", 0, SS_NOPREFIX);
             speedTestLabels_[2] = control(L"STATIC", L"延迟 RTT", 0, SS_NOPREFIX);

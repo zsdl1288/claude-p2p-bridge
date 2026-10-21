@@ -183,8 +183,9 @@ def stop(base, token, process):
     process.wait(timeout=15)
 
 
-def wait_status(base, token, condition, description):
-    for _ in range(200):
+def wait_status(base, token, condition, description, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         status = request(base, "/api/status", token=token)
         if condition(status):
             return status
@@ -350,7 +351,7 @@ try:
     fixture_message(diagnostics_process, target, 0x014E, 0)  # CB_SETCURSEL
     fixture_message(diagnostics_process, speed_window, 0x0111, (1 << 16) | 261, target)  # CBN_SELCHANGE
     click_fixture(diagnostics_process, speed_window, 262)
-    wait_status(diagnostics_base, diagnostics_token, lambda state: state["proxy"]["speedTest"]["job"] is not None and state["proxy"]["speedTest"]["job"]["state"] == "completed", "native speed test did not finish")
+    wait_status(diagnostics_base, diagnostics_token, lambda state: state["proxy"]["speedTest"]["job"] is not None and state["proxy"]["speedTest"]["job"]["state"] == "completed", "native speed test did not finish", timeout=65)
     result = request(diagnostics_base, "/api/proxy/speed-test", token=diagnostics_token)["job"]["report"]
     assert result["completed"] and result["download"]["receivedBytes"] > 0 and result["upload"]["receivedBytes"] > 0
     wait_ui(diagnostics_process, lambda: "Mbps" in fixture_text(diagnostics_process, speed_window, 266), "native download metric")

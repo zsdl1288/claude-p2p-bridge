@@ -14,7 +14,7 @@ const metrics = () => ({ completed: true, stopReason: null,
 function fixture(role = 'client', mode = 'embedded') {
   let time = 0, timeout, monitor, clears = 0, intervalClears = 0;
   const sent = [], calls = [], child = { stdin: { writable: true } };
-  const connection = { id: `${role}-connection`, session: 'current-session', authenticated: true, capabilities: { speedTest: 1 },
+  const connection = { id: `${role}-connection`, session: 'current-session', authenticated: true, capabilities: { speedTest: 2 },
     device: { name: 'Private A', address: '100.95.24.20' } };
   const peer = { role, connections: new Set([connection]), clientConnection: role === 'client' ? connection : null,
     dialResource: role === 'client' ? { port: 12345 } : undefined, pairing: { host: '100.122.138.42' },
@@ -31,7 +31,7 @@ function fixture(role = 'client', mode = 'embedded') {
     close() { calls.push({ side: 'close' }); },
   };
   const controller = new ChannelSpeed({ bridge, transport, now: () => time, utcNow: () => new Date(Date.UTC(2026, 9, 22) + time).toISOString(),
-    setTimeoutFn(fn, ms) { assert.equal(ms, 35000); timeout = fn; return { unref() {} }; }, clearTimeoutFn() { clears++; },
+    setTimeoutFn(fn, ms) { assert.equal(ms, 60000); timeout = fn; return { unref() {} }; }, clearTimeoutFn() { clears++; },
     setIntervalFn(fn, ms) { assert.equal(ms, 250); monitor = fn; return { unref() {} }; }, clearIntervalFn() { intervalClears++; } });
   const offer = (id, changes = {}) => ({ type: 'speed-offer', v: 1, id, session: connection.session, ticket: randomId(32), ...changes });
   return { controller, bridge, transport, adapter, child, peer, connection, sent, calls, offer,
@@ -246,12 +246,48 @@ test('confirmed stage progress survives a later cancellation and a result missin
 });
 
 test('receiver byte/time limits are enforced, missing metrics remain null and arbitrary result fields never export', async () => {
-  const f = fixture(); f.transport.client = async () => ({ ...metrics(), download: { ...metrics().download, receivedBytes: 67108865 }, upload: null });
+  const f = fixture(); f.transport.client = async () => ({ ...metrics(), download: { ...metrics().download, receivedBytes: 268435457 }, upload: null });
   await startClient(f); const { report } = f.controller.status().job;
   assert.equal(report.completed, false); assert.equal(report.download, null); assert.equal(report.upload, null);
   assert.equal(report.stopReason, 'transport-failed');
   for (const secret of ['private-ticket', 'private-session', '203.0.113.10', 'private-node', 'Private A', '100.122.138.42', '100.95.24.20', f.connection.id, f.controller.status().job.id]) assert.equal(JSON.stringify(report).includes(secret), false, secret);
   const copy = f.controller.status().job; copy.report.notes.push('changed'); assert.equal(f.controller.status().job.report.notes.includes('changed'), false);
+});
+
+test('legacy five-second speed capability stays paired but cannot start the twenty-second protocol', () => {
+  const f = fixture(); f.connection.capabilities.speedTest = 1;
+  const state = f.controller.status();
+  assert.equal(state.connected, true); assert.equal(state.available, false); assert.equal(state.reason, 'unsupported');
+  assert.equal(state.targets[0].supported, false);
+  assert.throws(() => f.start(), (error) => error.code === 'speed-unsupported');
+  assert.equal(f.calls.length, 0); assert.equal(f.sent.length, 0); assert.equal(f.peer.isConnected(f.connection), true);
+});
+
+test('bulk measurements complete when concurrent RTT samples time out without inventing zero latency', async () => {
+  const f = fixture(); f.transport.client = async () => ({ ...metrics(), latency: { samples: [], failedSamples: 7 } });
+  await startClient(f);
+  const { report } = f.controller.status().job;
+  assert.equal(report.maximumSeconds, 60); assert.equal(report.maxBytesPerDirection, 268435456);
+  assert.equal(report.completed, true);
+  assert.deepEqual(report.latency, { samples: [], minMs: null, medianMs: null, maxMs: null, failedSamples: 7 });
+});
+
+test('waiting for receiver is bounded, reports a distinct reason and keeps partial measured bytes', async () => {
+  const f = fixture();
+  f.transport.client = async ({ onProgress }) => {
+    onProgress({ phase: 'upload', elapsedMs: 20000, durationMs: 20000, waitingForReceiver: true, confirmationRemainingMs: 4500,
+      latency: { samples: Array.from({ length: 60 }, (_, i) => i + 10), failedSamples: 4 }, samplesDone: 64,
+      upload: { ...metrics().upload, completion: 'partial' }, secret: 'private-extra' });
+    const progress = f.controller.status().job.progress;
+    assert.equal(progress.waitingForReceiver, true); assert.equal(progress.confirmationRemainingMs, 4500); assert.equal(progress.samplesDone, 64);
+    return { completed: false, stopReason: 'receiver-timeout' };
+  };
+  await startClient(f);
+  const state = f.controller.status();
+  assert.equal(state.busy, false); assert.equal(state.job.state, 'failed'); assert.equal(state.job.report.stopReason, 'receiver-timeout');
+  assert.equal(state.job.report.upload.completion, 'partial'); assert.equal(state.job.report.upload.receivedBytes, 1000000);
+  assert.equal(state.job.report.latency.samples.length, 60); assert.equal(state.job.report.latency.medianMs, 39.5);
+  assert.equal(JSON.stringify(state).includes('private-extra'), false);
 });
 
 test('unstarted phase sentinels remain null while a measured zero-byte phase retains its real duration', async () => {

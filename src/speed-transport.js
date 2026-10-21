@@ -3,10 +3,11 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { digest, equalSecret } from './crypto.js';
 import { rejectUpgrade } from './http-upgrade.js';
 
-const FRAME_BYTES = 64 * 1024, MAX_BYTES = 64 * 1024 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
+const FRAME_BYTES = 64 * 1024, MAX_BYTES = 256 * 1024 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
+const MAX_RTT_SAMPLES = 64;
 const UUID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 const STOP_REASONS = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy',
-  'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'user-cancelled', 'closed', 'transport-failed']);
+  'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'receiver-timeout', 'user-cancelled', 'closed', 'transport-failed']);
 const clone = (value) => structuredClone(value);
 const failure = (reason = 'transport-failed') => Object.assign(new Error('测速传输已停止'), { reason });
 const emptyPhase = () => ({ receivedBytes: 0, durationMs: 0, bytesPerSecond: 0, completion: 'failed', limitReached: false });
@@ -25,11 +26,12 @@ function latencyResult(samples, failedSamples) {
 // directions describe A: download is B -> A, upload is A -> B. Only synthetic
 // bytes cross this connection; no destination or file input is accepted.
 export class SpeedTransport {
-  constructor({ bridge, phaseMs = 5000, maxBytes = MAX_BYTES, deadlineMs = 35000, handshakeMs = 5000,
-    pingMs = 2500, progressMs = 200, now = () => performance.now() } = {}) {
-    if (!bridge || ![phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, progressMs].every((n) => Number.isSafeInteger(n) && n > 0) ||
-        phaseMs > 5000 || maxBytes > MAX_BYTES || deadlineMs > 35000 || handshakeMs > 5000 || pingMs > 2500) throw new Error('测速传输配置无效');
-    Object.assign(this, { bridge, phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, progressMs, now });
+  constructor({ bridge, phaseMs = 20000, maxBytes = MAX_BYTES, deadlineMs = 60000, handshakeMs = 5000,
+    pingMs = 2500, pingIntervalMs = 1000, confirmationMs = 5000, progressMs = 200, now = () => performance.now() } = {}) {
+    if (!bridge || ![phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, pingIntervalMs, confirmationMs, progressMs].every((n) => Number.isSafeInteger(n) && n > 0) ||
+        phaseMs > 20000 || maxBytes > MAX_BYTES || deadlineMs > 60000 || handshakeMs > 5000 || pingMs > 2500 ||
+        pingIntervalMs < 20 || confirmationMs > 5000) throw new Error('测速传输配置无效');
+    Object.assign(this, { bridge, phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, pingIntervalMs, confirmationMs, progressMs, now });
     this.sessions = new Set(); this.pending = new Map(); this.unverified = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false });
     this.wss.on('error', () => {});
@@ -57,10 +59,16 @@ export class SpeedTransport {
       s.error = failure(STOP_REASONS.has(reason) ? reason : 'transport-failed');
       s.rejectConnection(s.error);
       for (const waiter of s.waiters.splice(0)) waiter.reject(s.error);
-      s.pongWaiter?.finish(null);
+      this.stopLatency(s);
       for (const reject of [...s.writes]) reject(s.error);
       for (const waiter of [...s.credits]) waiter(s.error);
-      s.ws?.terminate();
+      if (s.error.reason === 'receiver-timeout' && s.ws?.readyState === WebSocket.OPEN) {
+        // A receiver normally has no large outgoing queue. Let the other end
+        // learn the fixed timeout reason, but never wait on a close handshake.
+        s.timeoutClosing = true;
+        s.terminateTimer = setTimeout(() => s.ws.terminate(), 100); s.terminateTimer.unref?.();
+        try { s.ws.close(4001, 'receiver-timeout'); } catch { s.ws.terminate(); }
+      } else s.ws?.terminate();
     };
     s.onAbort = () => s.fail(STOP_REASONS.has(signal?.reason) ? signal.reason : 'user-cancelled');
     this.sessions.add(s);
@@ -113,7 +121,14 @@ export class SpeedTransport {
   bind(s, ws) {
     s.ws = ws;
     ws.on('error', () => s.fail('transport-failed'));
-    ws.on('close', () => { if (!s.finished) s.fail('transport-failed'); });
+    ws.on('close', (code, reason) => {
+      clearTimeout(s.terminateTimer);
+      if (!s.finished) s.fail(code === 4001 && reason.toString() === 'receiver-timeout' ? 'receiver-timeout' : 'transport-failed');
+    });
+    ws.on('pong', (raw) => {
+      if (s.role !== 'host' || !this.valid(s) || s.error || !s.pongWaiter || raw.toString() !== s.pongWaiter.token) return;
+      s.pongWaiter.finish(this.now() - s.pongWaiter.at);
+    });
     ws.on('message', (raw, binary) => {
       try {
         if (!this.valid(s) || s.error) return s.fail('target-changed');
@@ -125,23 +140,23 @@ export class SpeedTransport {
         if (raw.length > 2048) throw failure();
         const msg = JSON.parse(raw.toString());
         if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.type !== 'string') throw failure();
-        if (msg.type === 'ping') {
-          if (s.role !== 'client' || !['connecting', 'latency'].includes(s.state) || msg.index !== s.nextPing || msg.index >= 5) throw failure();
-          s.nextPing++; s.state = 'latency';
-          this.sendJSON(s, { type: 'pong', index: msg.index }).catch(() => {});
-          this.progress(s, 'latency', { samplesDone: s.nextPing }); return;
-        }
-        if (msg.type === 'pong') {
-          if (s.role !== 'host' || s.state !== 'latency' || !Number.isInteger(msg.index) || msg.index < 0 || msg.index >= 5) throw failure();
-          if (s.pongWaiter?.index === msg.index) s.pongWaiter.finish(this.now() - s.pongWaiter.at);
+        if (msg.type === 'latency-update') {
+          if (s.role !== 'client') throw failure();
+          const latency = this.parseLatency(msg.latency);
+          if (latency.samples.length < s.metrics.latency.samples.length || latency.failedSamples < s.metrics.latency.failedSamples) throw failure();
+          s.metrics.latency = latency;
+          this.progress(s, s.state, { latencyMs: latency.medianMs, samplesDone: latency.samples.length + latency.failedSamples });
           return;
         }
         if (msg.type === 'progress') {
           if (!['download', 'upload'].includes(msg.direction) || msg.direction !== s.state ||
               (s.role === 'client' ? msg.direction !== 'upload' : msg.direction !== 'download')) throw failure();
           const partial = this.phaseResult(msg.metrics, false);
-          if (partial.receivedBytes < s.metrics[msg.direction].receivedBytes) throw failure();
+          const previous = s.metrics[msg.direction];
+          if (partial.receivedBytes < previous.receivedBytes || partial.durationMs < previous.durationMs) throw failure();
           if (!s.sending || s.sending.direction !== msg.direction || partial.receivedBytes > s.sending.sentBytes) throw failure();
+          const elapsed = partial.durationMs - previous.durationMs;
+          s.sending.recentBytesPerSecond = elapsed > 0 ? (partial.receivedBytes - previous.receivedBytes) * 1000 / elapsed : 0;
           s.metrics[msg.direction] = { ...partial, completion: partial.receivedBytes ? 'partial' : 'failed' };
           for (const waiter of [...s.credits]) waiter();
           this.progress(s, msg.direction, { bytes: partial.receivedBytes, elapsedMs: partial.durationMs,
@@ -150,7 +165,7 @@ export class SpeedTransport {
         if (msg.type === 'phase') {
           if (s.role !== 'client' || !['download', 'upload'].includes(msg.direction) ||
               msg.durationMs !== this.phaseMs || msg.maxBytes !== this.maxBytes ||
-              (msg.direction === 'download' ? s.state !== 'latency' : s.state !== 'download' || !s.received.download)) throw failure();
+              (msg.direction === 'download' ? s.state !== 'connecting' : s.state !== 'download' || !s.received.download)) throw failure();
           s.state = msg.direction;
           if (msg.direction === 'download') this.beginReceive(s, 'download');
         }
@@ -159,7 +174,7 @@ export class SpeedTransport {
               msg.sentBytes !== s.receive.bytes || typeof msg.limitReached !== 'boolean' || msg.limitReached !== (msg.sentBytes === this.maxBytes)) throw failure();
           this.endReceive(s, true, msg.limitReached);
         }
-        if (!['ready', 'latency-result', 'phase', 'phase-end', 'phase-result', 'result'].includes(msg.type)) throw failure();
+        if (!['ready', 'phase', 'phase-end', 'phase-result', 'result'].includes(msg.type)) throw failure();
         const waiter = s.waiters.shift();
         if (waiter) waiter.resolve(msg);
         else { if (s.queue.length >= 16) throw failure(); s.queue.push(msg); }
@@ -167,12 +182,24 @@ export class SpeedTransport {
     });
   }
   progress(s, phase, detail = {}) {
-    try { s.onProgress?.({ phase, elapsedMs: 0, durationMs: ['download', 'upload'].includes(phase) ? this.phaseMs : this.deadlineMs,
-      bytes: 0, maxBytes: ['download', 'upload'].includes(phase) ? this.maxBytes : 0,
-      ...(s.metrics.latency.samples.length + s.metrics.latency.failedSamples === 5 ? { latency: clone(s.metrics.latency) } : {}),
+    const transfer = ['download', 'upload'].includes(phase), previous = s.progressSnapshot?.phase === phase ? s.progressSnapshot : null;
+    const metrics = transfer ? s.receive?.direction === phase ? this.receiverResult(s) : s.metrics[phase] : null;
+    const progress = { phase, elapsedMs: metrics?.durationMs || 0, durationMs: transfer ? this.phaseMs : this.deadlineMs,
+      bytes: metrics?.receivedBytes || 0, ...(metrics ? { bytesPerSecond: metrics.bytesPerSecond } : {}), maxBytes: transfer ? this.maxBytes : 0,
+      waitingForReceiver: Boolean(s.confirmUntil),
+      ...(s.confirmUntil ? { confirmationRemainingMs: Math.max(0, s.confirmUntil - this.now()) } : {}),
+      ...(s.metrics.latency.samples.length + s.metrics.latency.failedSamples ? { latency: clone(s.metrics.latency) } : {}),
       ...(s.metrics.download.completion !== 'failed' ? { download: clone(s.metrics.download) } : {}),
       ...(s.metrics.upload.completion !== 'failed' ? { upload: clone(s.metrics.upload) } : {}),
-      ...detail }); } catch { /* UI cannot interrupt a measurement. */ }
+      ...detail };
+    if (transfer) {
+      // RTT updates carry no new throughput detail. Preserve the current
+      // receiver measurement and never rewind a phase or its confirmation bar.
+      progress.bytes = Math.max(progress.bytes, previous?.bytes || 0);
+      progress.elapsedMs = Math.max(progress.elapsedMs, previous?.elapsedMs || 0, progress.waitingForReceiver ? this.phaseMs : 0);
+    }
+    s.progressSnapshot = { phase, bytes: progress.bytes, elapsedMs: progress.elapsedMs };
+    try { s.onProgress?.(progress); } catch { /* UI cannot interrupt a measurement. */ }
   }
   check(s) { if (s.error) throw s.error; if (!this.valid(s)) throw failure('target-changed'); }
   send(s, value, binary) {
@@ -197,21 +224,74 @@ export class SpeedTransport {
     if (message.type !== type) throw failure();
     return message;
   }
-  ping(s, index) {
-    return new Promise((resolve) => {
-      const waiter = { index, at: this.now(), finish: (value) => {
-        clearTimeout(waiter.timer); if (s.pongWaiter === waiter) s.pongWaiter = null; resolve(value);
-      } };
-      s.pongWaiter = waiter;
-      waiter.timer = setTimeout(() => waiter.finish(null), this.pingMs);
-      this.sendJSON(s, { type: 'ping', index }).catch(() => waiter.finish(null));
-    });
+  parseLatency(value) {
+    if (!value || !Array.isArray(value.samples) || value.samples.length > MAX_RTT_SAMPLES ||
+        !value.samples.every((ms) => Number.isFinite(ms) && ms >= 0 && ms <= this.deadlineMs) ||
+        !Number.isSafeInteger(value.failedSamples) || value.failedSamples < 0 ||
+        value.samples.length + value.failedSamples > MAX_RTT_SAMPLES) throw failure();
+    return latencyResult(value.samples, value.failedSamples);
+  }
+  ping(s) {
+    if (s.pongWaiter || s.error || s.finished || !['download', 'upload'].includes(s.state) ||
+        s.metrics.latency.samples.length + s.metrics.latency.failedSamples >= MAX_RTT_SAMPLES) return;
+    const waiter = { token: `rtt:${s.nextPing++}`, at: this.now(), finish: (value) => {
+      if (s.pongWaiter !== waiter) return;
+      clearTimeout(waiter.timer); s.pongWaiter = null;
+      if (s.error || s.finished) return;
+      const latency = s.metrics.latency;
+      s.metrics.latency = latencyResult(value === null ? latency.samples : [...latency.samples, value], latency.failedSamples + (value === null ? 1 : 0));
+      this.progress(s, s.state, { latencyMs: s.metrics.latency.medianMs, samplesDone: s.nextPing });
+      this.sendJSON(s, { type: 'latency-update', latency: s.metrics.latency }).catch(() => {});
+    } };
+    s.pongWaiter = waiter;
+    waiter.timer = setTimeout(() => waiter.finish(null), this.pingMs); waiter.timer.unref?.();
+    try {
+      this.check(s);
+      // WebSocket control frames share the measured connection and run while
+      // payload flows. This is latency under load, with no separate warm-up.
+      s.ws.ping(waiter.token, false, (error) => { if (error) waiter.finish(null); });
+    } catch { waiter.finish(null); }
+  }
+  startLatency(s) {
+    if (s.latencyTimer) return;
+    s.latencyTimer = setInterval(() => this.ping(s), this.pingIntervalMs); s.latencyTimer.unref?.();
+    this.ping(s);
+  }
+  stopLatency(s) {
+    clearInterval(s.latencyTimer); s.latencyTimer = null;
+    if (s.pongWaiter) { clearTimeout(s.pongWaiter.timer); s.pongWaiter = null; }
+  }
+  async waitUntil(s, promise, until, reason) {
+    let timer;
+    try {
+      const expired = Symbol('expired');
+      const result = await Promise.race([promise, new Promise((resolve) => {
+        timer = setTimeout(() => resolve(expired), Math.max(0, until - this.now()));
+      })]);
+      this.check(s);
+      if (result !== expired) return result;
+      if (reason) throw failure(reason);
+      return false;
+    } finally { clearTimeout(timer); }
+  }
+  beginConfirmation(s, direction) {
+    s.confirmUntil = this.now() + this.confirmationMs;
+    this.progress(s, direction, { elapsedMs: this.phaseMs, waitingForReceiver: true, confirmationRemainingMs: this.confirmationMs });
+    return s.confirmUntil;
+  }
+  async confirmed(s, type) {
+    return this.waitUntil(s, this.next(s, type), s.confirmUntil, 'receiver-timeout');
   }
   beginReceive(s, direction) {
     if (s.receive) throw failure();
-    s.receive = { direction, bytes: 0, at: this.now(), lastProgress: -Infinity };
-    s.receive.timer = setInterval(() => this.receiveProgress(s), this.progressMs);
-    s.receive.timer.unref?.();
+    s.confirmUntil = null;
+    const receive = s.receive = { direction, bytes: 0, at: this.now(), lastProgress: -Infinity };
+    receive.timer = setInterval(() => this.receiveProgress(s), this.progressMs);
+    receive.timer.unref?.();
+    // The receiver also owns a phase deadline: a peer that keeps its socket
+    // alive but never sends phase-end must not hold the UI until the group cap.
+    receive.deadline = setTimeout(() => { if (s.receive === receive) s.fail('receiver-timeout'); }, this.phaseMs + this.confirmationMs);
+    receive.deadline.unref?.();
     this.progress(s, direction);
   }
   receiverResult(s, complete = false, limitReached = false) {
@@ -231,7 +311,7 @@ export class SpeedTransport {
   endReceive(s, complete, limitReached = false) {
     if (!s.receive) return;
     const { direction } = s.receive, metrics = this.receiverResult(s, complete, limitReached);
-    clearInterval(s.receive.timer);
+    clearInterval(s.receive.timer); clearTimeout(s.receive.deadline);
     s.metrics[direction] = metrics; s.received[direction] = metrics; s.receive = null;
     this.progress(s, direction, { bytes: metrics.receivedBytes, elapsedMs: metrics.durationMs, bytesPerSecond: metrics.bytesPerSecond });
     return metrics;
@@ -248,12 +328,20 @@ export class SpeedTransport {
   async sendPhase(s, direction) {
     const startedAt = this.now(), data = Buffer.alloc(FRAME_BYTES, 0xa5), pending = new Set();
     let sentBytes = 0;
+    s.confirmUntil = null;
     s.sending = { direction, sentBytes: 0 };
     this.progress(s, direction);
     while (this.now() - startedAt < this.phaseMs && sentBytes < this.maxBytes) {
       this.check(s);
-      const remote = s.metrics[direction], rtt = s.metrics.latency.medianMs || 250;
-      const credit = Math.min(MAX_BUFFER, Math.max(256 * 1024, remote.bytesPerSecond * Math.max(50, rtt) / 1000 * 2 + 256 * 1024));
+      const remote = s.metrics[direction], rtt = s.metrics.latency.minMs || 250;
+      // Queueing increases loaded RTT, so it must never enlarge its own send
+      // window. Recent receiver feedback shrinks credit after a path slowdown.
+      const rate = Math.min(remote.bytesPerSecond, s.sending.recentBytesPerSecond ?? remote.bytesPerSecond);
+      // Receipt is reported at progressMs intervals: a short RTT alone would
+      // cap local/nearby paths at one tiny credit window every 200 ms. Cover
+      // that feedback interval without adding it twice to long-RTT queues.
+      const feedbackMs = Math.max(Math.max(1, rtt) * 2, Math.max(1, rtt) + this.progressMs);
+      const credit = Math.min(MAX_BUFFER, Math.max(128 * 1024, rate * feedbackMs / 1000 + 128 * 1024));
       if (sentBytes - remote.receivedBytes >= credit) {
         await new Promise((resolve, reject) => {
           const finish = (error) => { clearTimeout(timer); s.credits.delete(finish); if (error) reject(error); else resolve(); };
@@ -266,7 +354,10 @@ export class SpeedTransport {
       // unbounded ws memory or treating local write callbacks as remote receipt.
       if (pending.size >= MAX_BUFFER / FRAME_BYTES || s.ws.bufferedAmount >= MAX_BUFFER) {
         if (!pending.size) throw failure();
-        await Promise.race(pending); continue;
+        // A local write callback is only queue backpressure. Never let it turn
+        // a 20-second sampling phase into an unbounded wait for the path.
+        if (await this.waitUntil(s, Promise.race(pending), startedAt + this.phaseMs) === false) break;
+        continue;
       }
       const length = Math.min(FRAME_BYTES, this.maxBytes - sentBytes);
       const write = this.send(s, data.subarray(0, length), true);
@@ -275,39 +366,37 @@ export class SpeedTransport {
       sentBytes += length;
       s.sending.sentBytes = sentBytes;
     }
-    await Promise.all(pending);
+    const confirmUntil = this.beginConfirmation(s, direction);
+    await this.waitUntil(s, Promise.all(pending), confirmUntil, 'receiver-timeout');
     this.check(s);
-    await this.sendJSON(s, { type: 'phase-end', direction, sentBytes, limitReached: sentBytes === this.maxBytes });
+    await this.waitUntil(s, this.sendJSON(s, { type: 'phase-end', direction, sentBytes, limitReached: sentBytes === this.maxBytes }), confirmUntil, 'receiver-timeout');
     return sentBytes;
   }
   async runHost(s) {
-    await s.connected; this.check(s);
-    await this.sendJSON(s, { type: 'ready' });
-    s.state = 'latency'; this.progress(s, 'latency');
-    const samples = []; let failedSamples = 0;
-    for (let index = 0; index < 5; index++) {
-      this.check(s);
-      const ms = await this.ping(s, index);
-      this.check(s);
-      if (ms === null) failedSamples++; else samples.push(ms);
-      this.progress(s, 'latency', { latencyMs: ms, samplesDone: index + 1 });
-    }
-    s.metrics.latency = latencyResult(samples, failedSamples);
-    await this.sendJSON(s, { type: 'latency-result', latency: s.metrics.latency });
+    await this.waitUntil(s, s.connected, s.startedAt + this.handshakeMs, 'receiver-timeout'); this.check(s);
+    await this.waitUntil(s, this.sendJSON(s, { type: 'ready' }), this.now() + this.handshakeMs, 'receiver-timeout');
     s.state = 'download';
-    await this.sendJSON(s, { type: 'phase', direction: 'download', durationMs: this.phaseMs, maxBytes: this.maxBytes });
+    await this.waitUntil(s, this.sendJSON(s, { type: 'phase', direction: 'download', durationMs: this.phaseMs, maxBytes: this.maxBytes }),
+      this.now() + this.confirmationMs, 'receiver-timeout');
+    this.startLatency(s);
     const sentBytes = await this.sendPhase(s, 'download');
-    const download = await this.next(s, 'phase-result');
+    const download = await this.confirmed(s, 'phase-result');
     if (download.direction !== 'download') throw failure();
     s.metrics.download = this.phaseResult(download.metrics);
     if (s.metrics.download.receivedBytes !== sentBytes) throw failure();
+    s.confirmUntil = null;
     s.state = 'upload'; this.beginReceive(s, 'upload');
-    await this.sendJSON(s, { type: 'phase', direction: 'upload', durationMs: this.phaseMs, maxBytes: this.maxBytes });
+    await this.waitUntil(s, this.sendJSON(s, { type: 'phase', direction: 'upload', durationMs: this.phaseMs, maxBytes: this.maxBytes }),
+      this.now() + this.confirmationMs, 'receiver-timeout');
+    this.ping(s);
     const upload = await this.next(s, 'phase-end');
     if (upload.direction !== 'upload' || !s.received.upload) throw failure();
-    await this.sendJSON(s, { type: 'phase-result', direction: 'upload', metrics: s.received.upload });
+    const confirmUntil = this.beginConfirmation(s, 'upload');
+    await this.waitUntil(s, this.sendJSON(s, { type: 'phase-result', direction: 'upload', metrics: s.received.upload }), confirmUntil, 'receiver-timeout');
+    this.stopLatency(s);
     s.metrics.completed = true;
-    await this.sendJSON(s, { type: 'result', metrics: s.metrics });
+    await this.waitUntil(s, this.sendJSON(s, { type: 'result', metrics: s.metrics }), confirmUntil, 'receiver-timeout');
+    s.confirmUntil = null;
   }
   async runClient(s) {
     this.check(s);
@@ -321,13 +410,7 @@ export class SpeedTransport {
     ws.once('open', () => {
       this.sendJSON(s, { v: 1, id: s.id, session: s.session, ticket: s.ticket }).then(() => { s.ticket = null; }, () => {});
     });
-    await this.next(s, 'ready');
-    const latency = (await this.next(s, 'latency-result')).latency;
-    if (!latency || !Array.isArray(latency.samples) || latency.samples.length > 5 ||
-        !latency.samples.every((ms) => Number.isFinite(ms) && ms >= 0 && ms <= this.deadlineMs) ||
-        !Number.isInteger(latency.failedSamples) || latency.failedSamples < 0 || latency.samples.length + latency.failedSamples !== 5) throw failure();
-    s.metrics.latency = latencyResult(latency.samples, latency.failedSamples);
-    this.progress(s, 'latency', { latencyMs: s.metrics.latency.medianMs, samplesDone: 5 });
+    await this.waitUntil(s, this.next(s, 'ready'), s.startedAt + this.handshakeMs, 'receiver-timeout');
     const download = await this.next(s, 'phase');
     if (download.direction !== 'download') throw failure();
     await this.next(s, 'phase-end');
@@ -336,13 +419,15 @@ export class SpeedTransport {
     const upload = await this.next(s, 'phase');
     if (upload.direction !== 'upload') throw failure();
     const uploadSentBytes = await this.sendPhase(s, 'upload');
-    const result = await this.next(s, 'phase-result');
+    const result = await this.confirmed(s, 'phase-result');
     if (result.direction !== 'upload') throw failure();
     s.metrics.upload = this.phaseResult(result.metrics);
     if (s.metrics.upload.receivedBytes !== uploadSentBytes) throw failure();
-    const final = (await this.next(s, 'result')).metrics;
+    const final = (await this.confirmed(s, 'result')).metrics;
     if (!final || final.completed !== true || final.stopReason !== null ||
         final.download?.receivedBytes !== s.received.download.receivedBytes || final.upload?.receivedBytes !== s.metrics.upload.receivedBytes) throw failure();
+    s.metrics.latency = this.parseLatency(final.latency);
+    s.confirmUntil = null;
     s.metrics.completed = true;
   }
   async run(s, execute) {
@@ -352,14 +437,18 @@ export class SpeedTransport {
       if (s.receive) this.endReceive(s, false);
       if (s.error) { s.metrics.completed = false; s.metrics.stopReason = s.error.reason; }
       s.finished = true;
+      s.confirmUntil = null;
+      this.stopLatency(s);
       clearTimeout(s.deadline); clearInterval(s.guard); s.signal?.removeEventListener('abort', s.onAbort);
       if (this.pending.get(s.id) === s) this.pending.delete(s.id);
       this.sessions.delete(s); s.ticket = null;
       if (s.ws) {
         if (s.metrics.completed) s.ws.close(1000);
-        else s.ws.terminate();
+        else if (!s.timeoutClosing) s.ws.terminate();
       }
-      this.progress(s, 'completed');
+      const phase = s.metrics.completed ? 'completed' : s.state, value = s.metrics[phase];
+      this.progress(s, phase, { waitingForReceiver: false, confirmationRemainingMs: 0,
+        ...(value ? { bytes: value.receivedBytes, elapsedMs: value.durationMs, bytesPerSecond: value.bytesPerSecond } : {}) });
     }
     return clone(s.metrics);
   }

@@ -79,10 +79,10 @@
   </main>
   <dialog id="speed-test-dialog" aria-labelledby="speed-test-heading">
     <div class="card-heading"><h2 id="speed-test-heading">网络测速</h2><button type="button" class="text-button" id="speed-test-close" aria-label="关闭测速窗口">关闭</button></div>
-    <p class="field-hint">测试当前 A ↔ B 配对通道。每方向最多 5 秒 / 64 MiB，会占用带宽。</p>
+    <p class="field-hint">测试当前 A ↔ B 配对通道。上传、下载各最多 20 秒 / 256 MiB；延迟在传输时同步测量，会占用带宽。</p>
     <label for="speed-test-target">当前配对设备</label><select id="speed-test-target" disabled></select>
     <div class="speed-metrics">
-      <div><span>延迟 RTT</span><strong id="speed-test-latency">—</strong><small>往返时间 · ms</small></div>
+      <div><span>传输中延迟 RTT</span><strong id="speed-test-latency">—</strong><small id="speed-test-latency-unit">ms · 上传、下载时同步测量</small></div>
       <div><span>A 下载 · B → A</span><strong id="speed-test-download">—</strong><small id="speed-test-download-unit">Mbps / MB/s</small></div>
       <div><span>A 上传 · A → B</span><strong id="speed-test-upload">—</strong><small id="speed-test-upload-unit">Mbps / MB/s</small></div>
     </div>

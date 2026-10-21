@@ -39,8 +39,14 @@ for (const initiator of ['host', 'client']) test(`a real ${initiator}-initiated 
   for (const endpoint of [host, client]) {
     const final = endpoint.channelSpeed.status().job;
     assert.equal(final.id, job.id); assert.equal(final.state, 'completed');
-    assert.equal(final.report.download.receivedBytes, 1048576); assert.equal(final.report.upload.receivedBytes, 1048576);
-    assert.equal(final.report.latency.samples.length, 5);
+    for (const direction of ['download', 'upload']) {
+      const result = final.report[direction];
+      assert.ok(result.receivedBytes > 0 && result.receivedBytes <= 1048576);
+      assert.equal(result.limitReached, result.receivedBytes === 1048576);
+      assert.equal(result.receivedBytes, host.channelSpeed.status().job.report[direction].receivedBytes);
+      assert.equal(result.receivedBytes, client.channelSpeed.status().job.report[direction].receivedBytes);
+    }
+    assert.ok(final.report.latency === null || final.report.latency.samples.length <= 64);
     assert.ok(final.report.download.bytesPerSecond > 0); assert.ok(final.report.upload.bytesPerSecond > 0);
   }
   assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model);
