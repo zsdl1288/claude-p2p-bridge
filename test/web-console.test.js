@@ -17,6 +17,9 @@ class Element {
   setAttribute(name, value) { this.attributes[name] = value; }
   removeAttribute(name) { delete this.attributes[name]; }
   focus() {}
+  addEventListener() {}
+  showModal() { this.open = true; }
+  close() { this.open = false; }
 }
 
 test('web console keeps identity, pairing, Claude and proxy flows separate', async () => {

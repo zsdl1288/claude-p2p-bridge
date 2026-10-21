@@ -205,7 +205,8 @@ export class PersistentBridge extends Bridge {
   }
   close() {
     this.closing = true; this.cancelRestore();
-    this.channelProbe.close();
+    this.channelSpeed.close();
+    this.speedTransport.close();
     this.channelRecovery.close();
     this.networkAdapter?.off?.('reset', this.onNetworkReset);
     return this.enqueue(() => super.disconnect());

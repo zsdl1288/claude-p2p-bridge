@@ -108,15 +108,19 @@ export class ClashProxy {
     const recoveryMessage = channelRecovery?.enabled ? recoveryLabels[channelRecovery.state] || '' : '';
     const subscriptionUrl = enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}/config.yaml` : '';
     return { enabled, sharing, online, state: phase, message, port: state.listenPort, channelRecovery, recoveryMessage,
+      speedTest: this.bridge.channelSpeed?.status(),
       connections: state.connections, uploadBytes: state.uploadBytes, downloadBytes: state.downloadBytes,
+      uploadBytesPerSecond: state.uploadBytesPerSecond, downloadBytesPerSecond: state.downloadBytesPerSecond,
+      latencyMs: state.latencyMs, rateWindowMs: state.rateWindowMs,
       connectionLimit: state.connectionLimit, sessionConnectionLimit: state.sessionConnectionLimit, lastError: state.lastError || null,
       subscriptionUrl,
-      clients: state.clients || [], devices: this.devices(state.clients || []) };
+      clients: state.clients || [], devices: this.devices(state.clients || [], state) };
   }
-  devices(clients) {
+  devices(clients, state = {}) {
     const network = this.bridge.networkStatus?.();
     const devices = network?.devices || [];
-    const own = devices.filter((device) => device.self);
+    const rates = { uploadBytesPerSecond: state.uploadBytesPerSecond ?? null, downloadBytesPerSecond: state.downloadBytesPerSecond ?? null, rateWindowMs: state.rateWindowMs };
+    const own = devices.filter((device) => device.self).map((device) => ({ ...device, ...rates, latencyMs: null }));
     if (this.role() === 'host') return [...own, ...clients.map((client) => ({ ...client, self: false, role: 'client', path: 'paired' }))];
     let address = this.bridge.networkIdentity().serverAddress;
     if (!address && this.bridge.saved?.role === 'client') {
@@ -126,7 +130,7 @@ export class ClashProxy {
     if (!remote.length && address) {
         remote.push({ name: '已配对的服务端', address, self: false, role: 'host', online: this.bridge.peer?.state.online === true, path: 'paired' });
     }
-    return [...own, ...remote.map((device) => ({ ...device, online: this.bridge.peer?.state.online === true }))];
+    return [...own, ...remote.map((device) => ({ ...device, ...rates, latencyMs: state.latencyMs ?? null, online: this.bridge.peer?.state.online === true }))];
   }
   resetAuthorization() {
     return this.enqueue(async () => {

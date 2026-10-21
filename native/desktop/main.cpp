@@ -5,7 +5,7 @@
 #include "profile-lock.hpp"
 #include "model-api.hpp"
 #include "network-diagnostics.hpp"
-#include "channel-probe.hpp"
+#include "speed-test.hpp"
 #include "options.hpp"
 #include "role-ui.hpp"
 #include "theme.hpp"
@@ -24,6 +24,7 @@
 
 namespace {
 constexpr UINT_PTR DIAGNOSTICS_TIMER = 1;
+constexpr UINT_PTR SPEED_TEST_TIMER = 2;
 #if BRIDGE_DIAGNOSTICS_BUILD
 constexpr wchar_t APP_TITLE[] = L"Claude Bridge · 本地诊断版";
 #else
@@ -52,22 +53,29 @@ class Application {
     uint64_t viewEpoch_ = 0, lastStatusRevision_ = 0;
     std::atomic<bool> stopping_{false}, ready_{false};
     std::mutex engineMutex_; KernelHandle process_, job_, wake_;
-    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_, channelProbeThread_, probeCancelThread_;
-    std::mutex probeCancelMutex_;
-    std::condition_variable probeCancelWake_;
-    std::string pendingProbeCancel_;
-    bool probeCancelStopping_ = false;
+    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_, speedTestThread_, speedStatusThread_, speedCancelThread_;
+    std::mutex speedCancelMutex_;
+    std::condition_variable speedCancelWake_;
+    std::string pendingSpeedCancel_;
+    bool speedCancelStopping_ = false;
     HWND diagnosticsWindow_ = nullptr, diagnosticsOutput_ = nullptr, diagnosticsRefresh_ = nullptr, diagnosticsClose_ = nullptr;
     HFONT diagnosticsFont_ = nullptr;
     bool diagnosticsBusy_ = false, diagnosticsReadPending_ = false;
     uint64_t diagnosticsEpoch_ = 0;
-    HWND channelProbeTarget_ = nullptr, channelProbeStart_ = nullptr, channelProbeCancel_ = nullptr, channelProbeExport_ = nullptr, channelProbeOutput_ = nullptr;
-    Json channelProbeState_ = Json::object(), channelProbeReport_;
-    std::vector<std::string> channelProbeTargets_;
-    std::string lastChannelProbeTargets_, channelProbeScope_;
-    bool channelProbeCommandBusy_ = false;
-    uint64_t channelProbeView_ = 0;
-    DesktopChannelProbe::OwnedJobs ownedChannelProbes_;
+    HWND speedTestWindow_ = nullptr, speedTestTarget_ = nullptr, speedTestStart_ = nullptr, speedTestCancel_ = nullptr, speedTestExport_ = nullptr, speedTestOutput_ = nullptr, speedTestClose_ = nullptr;
+    HWND speedTestDownload_ = nullptr, speedTestDownloadSecondary_ = nullptr, speedTestUpload_ = nullptr, speedTestUploadSecondary_ = nullptr;
+    HWND speedTestLatency_ = nullptr, speedTestSamples_ = nullptr, speedTestProgress_ = nullptr, speedTestPhase_ = nullptr, speedTestLabels_[3]{};
+    HFONT speedTestFont_ = nullptr, speedTestValueFont_ = nullptr;
+    bool speedStatusBusy_ = false;
+    ULONGLONG speedLastPoll_ = 0;
+    Json speedTestState_ = Json::object(), speedTestReport_;
+    std::vector<std::string> speedTestTargets_;
+    std::vector<bool> speedTestSupported_;
+    std::string lastSpeedTestTargets_, speedTestScope_;
+    bool speedTestCommandBusy_ = false;
+    uint64_t speedTestView_ = 0;
+    DesktopSpeedTest::StatusEpoch speedStatusEpoch_;
+    DesktopSpeedTest::OwnedJobs ownedSpeedTests_;
     std::string token_, authUrl_, requestId_, invitation_, lastDevices_, lastProxyDevices_, lastConfig_, lastModels_, observedRole_, testScope_;
     std::vector<std::wstring> modelIds_;
     std::wstring selectedModel_;
@@ -247,7 +255,14 @@ class Application {
         if (defer) EndDeferWindowPos(defer);
         PositionStatus();
         if (peerList_) ListView_SetColumnWidth(peerList_, 0, S(210 + extraW));
-        if (proxyPeerList_) ListView_SetColumnWidth(proxyPeerList_, 0, S(230 + extraW));
+        if (proxyPeerList_) {
+            RECT client; GetClientRect(proxyPeerList_, &client);
+            const int available = std::max(0, static_cast<int>(client.right) - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi_) - S(4));
+            const int fixed[] = {S(106), S(100), S(104), S(250)};
+            const int total = fixed[0] + fixed[1] + fixed[2] + fixed[3];
+            ListView_SetColumnWidth(proxyPeerList_, 0, std::max(S(90), available - total));
+            for (int i = 0; i < 4; ++i) ListView_SetColumnWidth(proxyPeerList_, i + 1, fixed[i]);
+        }
         InvalidateRect(window_, nullptr, TRUE);
     }
     void Visibility() {
@@ -348,20 +363,21 @@ class Application {
         Label(L"本次会话记录", 228, 132, 500, 24, 2, 0, 1);
         Button(L"打开数据目录", OPEN_DATA, 840, 128, 152, 32, 2, 0, true);
         activity_ = Edit(L"等待设备连接，记录会显示在这里。", 0, 228, 180, 764, 484, 2, 0, true, true, true, true);
-        Label(L"调用端 · 本地代理节点", 228, 132, 540, 24, 3, 1, 1);
-        Label(L"服务端 · 网络共享", 228, 132, 540, 24, 3, 2, 1);
-        Button(L"网络诊断", NETWORK_DIAGNOSTICS, 840, 128, 152, 30, 3, 0, true);
+        Label(L"调用端 · 本地代理节点", 228, 132, 390, 24, 3, 1, 1);
+        Label(L"服务端 · 网络共享", 228, 132, 390, 24, 3, 2, 1);
+        Button(L"网络测速", NETWORK_SPEED_TEST, 716, 128, 132, 30, 3, 0, true);
+        Button(L"网络诊断", NETWORK_DIAGNOSTICS, 860, 128, 132, 30, 3, 0, true);
         proxyMessage_ = Label(L"正在读取代理状态…", 228, 172, 764, 44, 3, 0, 0); widgets_.back().stretch = true;
         proxyDetails_ = Label(L"", 228, 224, 440, 42, 3, 0, 3, true); widgets_.back().stretch = true;
         Button(L"启用本地 Clash 节点", PROXY_ENABLE, 690, 224, 302, 36, 3, 1, true);
         Button(L"开启本机网络共享", PROXY_SHARING, 690, 224, 302, 36, 3, 2, true);
         Label(L"设备与代理连接", 228, 312, 700, 24, 3, 0, 1);
-        Label(L"查看已配对设备的在线状态、活跃连接和累计流量。", 228, 344, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
+        Label(L"速率为当前代理流量；延迟为 A ↔ B 往返时间。", 228, 344, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
         proxyPeerList_ = Add(WC_LISTVIEWW, L"", 0, 228, 380, 764, 184, 3, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true, true);
         ListView_SetExtendedListViewStyle(proxyPeerList_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        const wchar_t* proxyColumns[] = {L"设备 / 身份", L"虚拟 IP", L"代理状态", L"连接 / 已传输"};
-        const int proxyWidths[] = {230, 132, 160, 238};
-        for (int i = 0; i < 4; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(proxyColumns[i]); column.cx = S(proxyWidths[i]); ListView_InsertColumn(proxyPeerList_, i, &column); }
+        const wchar_t* proxyColumns[] = {L"设备 / 身份", L"虚拟 IP", L"代理状态", L"连接 / 已传输", L"实时速率 / 延迟"};
+        const int proxyWidths[] = {160, 106, 100, 104, 250};
+        for (int i = 0; i < 5; ++i) { LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH; column.pszText = const_cast<LPWSTR>(proxyColumns[i]); column.cx = S(proxyWidths[i]); ListView_InsertColumn(proxyPeerList_, i, &column); }
         Label(L"Clash 配置订阅", 228, 612, 580, 24, 3, 1, 1); widgets_.back().bottom = true;
         Edit(L"启用本地节点后生成", PROXY_SUBSCRIPTION, 228, 646, 556, 34, 3, 1, false, true, true); widgets_.back().bottom = true;
         Button(L"复制订阅地址", COPY_SUBSCRIPTION, 800, 646, 192, 34, 3, 1, true); widgets_.back().bottom = true;
@@ -460,8 +476,13 @@ class Application {
         }
         if (diagnosticsWindow_) {
             DesktopTheme::TitleBar(diagnosticsWindow_, dark_, colors_);
-            for (auto child : {diagnosticsOutput_, channelProbeOutput_, channelProbeTarget_}) SetWindowTheme(child, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             RedrawWindow(diagnosticsWindow_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+        }
+        if (speedTestWindow_) {
+            DesktopTheme::TitleBar(speedTestWindow_, dark_, colors_);
+            for (auto child : {speedTestOutput_, speedTestTarget_}) SetWindowTheme(child, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            RedrawWindow(speedTestWindow_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
         RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
     }
@@ -519,7 +540,7 @@ class Application {
         HBRUSH brush = CreateSolidBrush(fill); auto oldPen = SelectObject(draw->hDC, pen); auto oldBrush = SelectObject(draw->hDC, brush);
         RoundRect(draw->hDC, draw->rcItem.left, draw->rcItem.top, draw->rcItem.right, draw->rcItem.bottom, S(14), S(14));
         SetBkMode(draw->hDC, TRANSPARENT); SetTextColor(draw->hDC, disabled && side ? colors_.disabledInk : ink);
-        auto oldFont = SelectObject(draw->hDC, GetParent(draw->hwndItem) == diagnosticsWindow_ ? diagnosticsFont_ : selected ? fonts_[1] : fonts_[0]);
+        auto oldFont = SelectObject(draw->hDC, GetParent(draw->hwndItem) == diagnosticsWindow_ ? diagnosticsFont_ : GetParent(draw->hwndItem) == speedTestWindow_ ? speedTestFont_ : selected ? fonts_[1] : fonts_[0]);
         auto text = ControlText(draw->hwndItem); RECT rect = draw->rcItem;
         if (side) {
             const wchar_t* glyph = id == NAV_CONNECTION ? L"\xE968" : id == NAV_API ? L"\xE943" : id == NAV_LOGS ? L"\xE81C" : id == NAV_PROXY ? L"\xE774" : id == NAV_SETTINGS ? L"\xE713" : dark_ ? L"\xE706" : L"\xE708";
@@ -702,6 +723,7 @@ class Application {
         EnableWindow(Item(NAV_API), ready_ && (Capability("model") || ModelApi().value("listening", false)));
         EnableWindow(Item(NAV_PROXY), ready_ && Capability("proxy"));
         EnableWindow(Item(NETWORK_DIAGNOSTICS), ready_ && !stopping_);
+        EnableWindow(Item(NETWORK_SPEED_TEST), ready_ && statusAvailable_ && !stopping_ && Object(proxy_, "speedTest").value("connected", false));
         EnableWindow(Item(COPY_INVITE), enabled && !invitation_.empty());
         EnableWindow(Item(COPY_TOKEN), ready_ && Capability("model"));
         EnableWindow(Item(COPY_EXAMPLE), ready_ && Capability("model") && ModelsReady());
@@ -769,6 +791,7 @@ class Application {
                 if (bytes < 1024) usage << bytes << L" 字节";
                 else usage << std::fixed << std::setprecision(1) << (static_cast<double>(bytes) / (bytes < 1024 * 1024 ? 1024.0 : 1024.0 * 1024.0)) << (bytes < 1024 * 1024 ? L" KiB" : L" MiB");
                 auto text = usage.str(); ListView_SetItemText(list, row, 3, text.data());
+                auto live = DesktopSpeedTest::DeviceLive(device); ListView_SetItemText(list, row, 4, live.data());
             }
             ++row;
         }
@@ -821,8 +844,8 @@ class Application {
         statusAvailable_ = true;
         status_ = status;
         const auto probeScope = status.value("instanceId", "") + "|" + Role();
-        if (!channelProbeScope_.empty() && channelProbeScope_ != probeScope && diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
-        channelProbeScope_ = probeScope;
+        if (!speedTestScope_.empty() && speedTestScope_ != probeScope && speedTestWindow_) DestroyWindow(speedTestWindow_);
+        speedTestScope_ = probeScope;
         const auto identity = Identity();
         const auto role = Role();
         bool online = status.value("online", false);
@@ -928,13 +951,23 @@ class Application {
         });
     }
     void OnReply(const Reply& reply) {
-        if (reply.kind == "channel-probe-command" || reply.kind == "channel-probe-error") {
-            channelProbeCommandBusy_ = false;
-            if (channelProbeThread_.joinable()) channelProbeThread_.join();
-            if (!diagnosticsWindow_ || !ownedChannelProbes_.Current(reply.viewEpoch)) return;
-            if (reply.kind == "channel-probe-command") UpdateChannelProbeState(reply.data);
-            else Text(channelProbeOutput_, L"探测请求未完成，请稍后刷新状态；不会自动重试。\r\n" + Wide(reply.text));
-            UpdateChannelProbeControls(); ReadNetworkDiagnostics(true); return;
+        if (reply.kind == "speed-test-command" || reply.kind == "speed-test-error") {
+            speedTestCommandBusy_ = false;
+            speedStatusEpoch_.Settled();
+            if (speedTestThread_.joinable()) speedTestThread_.join();
+            if (!speedTestWindow_ || !ownedSpeedTests_.Current(reply.viewEpoch)) return;
+            if (reply.kind == "speed-test-command") UpdateSpeedTestState(reply.data);
+            else Text(speedTestPhase_, L"测速请求未完成，请稍后刷新状态；不会自动重试。\r\n" + Wide(reply.text));
+            UpdateSpeedTestControls(); ReadSpeedTestStatus(); return;
+        }
+        if (reply.kind == "speed-test-status" || reply.kind == "speed-test-status-error") {
+            speedStatusBusy_ = false;
+            if (speedStatusThread_.joinable()) speedStatusThread_.join();
+            if (!speedTestWindow_ || !ownedSpeedTests_.Current(reply.viewEpoch)) return;
+            if (!speedStatusEpoch_.Accept(reply.data.value("mutation", uint64_t{0}))) { ReadSpeedTestStatus(); return; }
+            if (reply.kind == "speed-test-status") UpdateSpeedTestState(reply.data["status"], reply.data.value("authoritative", false));
+            else { speedTestState_["available"] = false; Text(speedTestPhase_, L"暂时无法读取测速状态，请稍后重试。"); }
+            UpdateSpeedTestControls(); return;
         }
         if (reply.kind == "diagnostics" || reply.kind == "diagnostics-error") {
             diagnosticsBusy_ = false;
@@ -942,21 +975,14 @@ class Application {
             if (!diagnosticsWindow_) return;
             if (diagnosticsReadPending_) { diagnosticsReadPending_ = false; ReadNetworkDiagnostics(); return; }
             if (reply.viewEpoch != diagnosticsEpoch_) return;
-            if (reply.data.contains("probe")) UpdateChannelProbeState(reply.data["probe"], reply.data.value("probeAuthoritative", false));
-            if (reply.data.contains("probeError")) {
-                channelProbeState_["available"] = false;
-                if (!DesktopChannelProbe::Running(channelProbeState_)) Text(channelProbeOutput_, L"读取探测状态失败，请稍后重试。\r\n" + Wide(reply.data["probeError"].get<std::string>()));
-            }
-            if (reply.data.contains("passive") || reply.kind == "diagnostics-error") {
-                const auto diagnostics = reply.kind == "diagnostics" ? reply.data["passive"] : Json{{"available", false}, {"message", "读取失败：" + reply.text}};
-                DWORD selectionStart = 0, selectionEnd = 0;
-                SendMessageW(diagnosticsOutput_, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
-                const auto firstLine = SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0);
-                Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format(diagnostics));
-                SendMessageW(diagnosticsOutput_, EM_SETSEL, selectionStart, selectionEnd);
-                SendMessageW(diagnosticsOutput_, EM_LINESCROLL, 0, firstLine - SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0));
-            }
-            UpdateChannelProbeControls();
+            const auto diagnostics = reply.kind == "diagnostics" ? reply.data : Json{{"available", false}, {"message", "读取失败：" + reply.text}};
+            DWORD selectionStart = 0, selectionEnd = 0;
+            SendMessageW(diagnosticsOutput_, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart), reinterpret_cast<LPARAM>(&selectionEnd));
+            const auto firstLine = SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0);
+            Text(diagnosticsOutput_, DesktopNetworkDiagnostics::Format(diagnostics));
+            SendMessageW(diagnosticsOutput_, EM_SETSEL, selectionStart, selectionEnd);
+            SendMessageW(diagnosticsOutput_, EM_LINESCROLL, 0, firstLine - SendMessageW(diagnosticsOutput_, EM_GETFIRSTVISIBLELINE, 0, 0));
+            EnableWindow(diagnosticsRefresh_, ready_ && !stopping_);
             return;
         }
         if (reply.kind == "ready") { Text(API_TOKEN, Wide(token_)); SetStatus(L"服务已就绪 · 正在读取身份", DesktopConnectionStatus::Tone::Waiting); UpdateButtons(); return; }
@@ -1009,134 +1035,140 @@ class Application {
         }
         dialog->Release();
     }
-    void CancelOwnedChannelProbe(const std::string& id) {
-        if (!ownedChannelProbes_.ClaimCancel(id)) return;
+    void CancelOwnedSpeedTest(const std::string& id) {
+        if (!ownedSpeedTests_.ClaimCancel(id)) return;
         bool success = false;
         try {
             Json body = {{"jobId", id}};
-            LocalRequest request(ControlPort(), token_, L"/api/network/diagnostics/channel-probe/cancel", &body, 2000);
+            LocalRequest request(ControlPort(), token_, L"/api/proxy/speed-test/cancel", &body, 2000);
             if (request.status != 404) request.ReadJson();
             success = true; // A missing old ID cannot still own a running job.
         }
         catch (...) { /* The backend deadline remains bounded if a local cancel cannot be delivered. */ }
-        ownedChannelProbes_.FinishCancel(id, success);
+        ownedSpeedTests_.FinishCancel(id, success);
     }
-    void RetireChannelProbeView() {
-        const auto owned = ownedChannelProbes_.Retire();
-        channelProbeView_ = 0;
+    void RetireSpeedTestView() {
+        const auto owned = ownedSpeedTests_.Retire();
+        speedTestView_ = 0;
         if (owned.empty()) return;
         {
-            std::lock_guard lock(probeCancelMutex_);
+            std::lock_guard lock(speedCancelMutex_);
             // Backend single-flight permits only the newest owned job to be
             // live. One pending slot plus one worker bounds both IDs/handles.
-            pendingProbeCancel_ = owned.back();
-            if (!probeCancelThread_.joinable()) probeCancelThread_ = std::thread([this] {
+            pendingSpeedCancel_ = owned.back();
+            if (!speedCancelThread_.joinable()) speedCancelThread_ = std::thread([this] {
                 for (;;) {
                     std::string id;
                     {
-                        std::unique_lock lock(probeCancelMutex_);
-                        probeCancelWake_.wait(lock, [this] { return probeCancelStopping_ || !pendingProbeCancel_.empty(); });
-                        if (probeCancelStopping_) return;
-                        id = std::move(pendingProbeCancel_); pendingProbeCancel_.clear();
+                        std::unique_lock lock(speedCancelMutex_);
+                        speedCancelWake_.wait(lock, [this] { return speedCancelStopping_ || !pendingSpeedCancel_.empty(); });
+                        if (speedCancelStopping_) return;
+                        id = std::move(pendingSpeedCancel_); pendingSpeedCancel_.clear();
                     }
-                    CancelOwnedChannelProbe(id);
+                    CancelOwnedSpeedTest(id);
                 }
             });
         }
-        probeCancelWake_.notify_one();
+        speedCancelWake_.notify_one();
     }
-    void UpdateChannelProbeControls() {
-        if (!diagnosticsWindow_) return;
-        const bool active = DesktopChannelProbe::Running(channelProbeState_);
-        const bool enabled = ready_ && !stopping_ && !channelProbeCommandBusy_;
-        EnableWindow(channelProbeTarget_, enabled && !active && !channelProbeTargets_.empty());
-        EnableWindow(channelProbeStart_, enabled && !diagnosticsBusy_ && DesktopChannelProbe::CanStart(channelProbeState_));
-        EnableWindow(channelProbeCancel_, enabled && active && !DesktopChannelProbe::Text(DesktopChannelProbe::Job(channelProbeState_), "id").empty());
-        EnableWindow(channelProbeExport_, !stopping_ && !active && channelProbeReport_.is_object());
-        EnableWindow(diagnosticsRefresh_, ready_ && !stopping_ && !active && !channelProbeCommandBusy_ && !diagnosticsBusy_);
+    void UpdateSpeedTestControls() {
+        if (!speedTestWindow_) return;
+        const bool active = DesktopSpeedTest::Running(speedTestState_);
+        const bool enabled = ready_ && !stopping_ && !speedTestCommandBusy_;
+        const auto selected = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
+        const bool supported = selected >= 0 && static_cast<size_t>(selected) < speedTestSupported_.size() && speedTestSupported_[selected];
+        EnableWindow(speedTestTarget_, enabled && Role() == "host" && !active && !speedTestTargets_.empty());
+        const auto selectedId = supported ? speedTestTargets_[selected] : std::string{};
+        EnableWindow(speedTestStart_, enabled && !speedStatusBusy_ && DesktopSpeedTest::CanStartTarget(speedTestState_, selectedId));
+        EnableWindow(speedTestCancel_, enabled && active && !DesktopSpeedTest::Text(DesktopSpeedTest::Job(speedTestState_), "id").empty());
+        EnableWindow(speedTestExport_, !stopping_ && !active && speedTestReport_.is_object());
     }
-    void UpdateChannelProbeState(const Json& response, bool authoritative = false) {
-        if (!diagnosticsWindow_ || !response.is_object()) return;
-        if (response.contains("targets")) channelProbeState_ = response;
-        else if (const auto job = DesktopChannelProbe::Job(response); !job.empty()) {
-            channelProbeState_["job"] = job; channelProbeState_["busy"] = DesktopChannelProbe::Text(job, "state") == "running";
+    void UpdateSpeedTestState(const Json& response, bool authoritative = false) {
+        if (!speedTestWindow_ || !response.is_object()) return;
+        if (response.contains("targets")) speedTestState_ = response;
+        else if (const auto job = DesktopSpeedTest::Job(response); !job.empty()) {
+            speedTestState_["job"] = job; speedTestState_["busy"] = DesktopSpeedTest::Text(job, "state") == "running";
         }
-        const auto targets = DesktopChannelProbe::Targets(channelProbeState_);
+        const auto targets = DesktopSpeedTest::Targets(speedTestState_);
         const auto serialized = Json(targets).dump();
-        if (serialized != lastChannelProbeTargets_) {
-            const auto previous = SendMessageW(channelProbeTarget_, CB_GETCURSEL, 0, 0);
-            const auto selectedId = previous >= 0 && static_cast<size_t>(previous) < channelProbeTargets_.size() ? channelProbeTargets_[previous] : std::string{};
-            SendMessageW(channelProbeTarget_, CB_RESETCONTENT, 0, 0); channelProbeTargets_.clear();
-            size_t selection = 0;
+        if (serialized != lastSpeedTestTargets_) {
+            const auto previous = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
+            const auto selectedId = previous >= 0 && static_cast<size_t>(previous) < speedTestTargets_.size() ? speedTestTargets_[previous] : std::string{};
+            SendMessageW(speedTestTarget_, CB_RESETCONTENT, 0, 0); speedTestTargets_.clear(); speedTestSupported_.clear();
+            int selection = Role() == "host" ? -1 : 0;
             for (const auto& target : targets) {
-                const auto id = DesktopChannelProbe::Text(target, "id");
-                const auto name = DesktopChannelProbe::Text(target, "name", 256), address = DesktopChannelProbe::Text(target, "address", 64);
-                const auto label = (DesktopChannelProbe::Text(target, "role") == "host" ? std::wstring(L"B 服务端 · ") : L"A 调用端 · ") +
-                    Wide(name.empty() ? address : name + (address.empty() ? "" : " · " + address));
-                SendMessageW(channelProbeTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
-                if (id == selectedId) selection = channelProbeTargets_.size();
-                channelProbeTargets_.push_back(id);
+                const auto id = DesktopSpeedTest::Text(target, "id");
+                const auto name = DesktopSpeedTest::Text(target, "name", 256), address = DesktopSpeedTest::Text(target, "address", 64);
+                const bool supported = target["supported"] == true;
+                const auto label = (DesktopSpeedTest::Text(target, "role") == "host" ? std::wstring(L"固定 B 服务端 · ") : L"A 调用端 · ") +
+                    Wide(name.empty() ? address : name + (address.empty() ? "" : " · " + address)) + (supported ? L"" : L"（需升级 1.1.9）");
+                SendMessageW(speedTestTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                if (id == selectedId) selection = static_cast<int>(speedTestTargets_.size());
+                speedTestTargets_.push_back(id);
+                speedTestSupported_.push_back(supported);
             }
-            if (targets.empty()) SendMessageW(channelProbeTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"当前没有可探测的配对通道"));
-            SendMessageW(channelProbeTarget_, CB_SETCURSEL, selection, 0); lastChannelProbeTargets_ = serialized;
+            if (targets.empty()) { SendMessageW(speedTestTarget_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"没有当前已连接的配对设备")); selection = 0; }
+            SendMessageW(speedTestTarget_, CB_SETCURSEL, selection, 0); lastSpeedTestTargets_ = serialized;
         }
-        const auto job = DesktopChannelProbe::Job(channelProbeState_);
+        const auto job = DesktopSpeedTest::Job(speedTestState_);
         // Reads started during a POST may describe the pre-start job. They
         // must not erase a newly registered late start's cancellation owner.
-        if (authoritative) ownedChannelProbes_.ObserveOnly(DesktopChannelProbe::Text(job, "id"));
+        if (authoritative) ownedSpeedTests_.ObserveOnly(DesktopSpeedTest::Text(job, "id"));
         if (job.contains("report")) {
-            const auto report = DesktopChannelProbe::Report(job["report"]);
-            if (report.is_object()) channelProbeReport_ = report;
+            const auto report = DesktopSpeedTest::Report(job["report"]);
+            if (report.is_object()) speedTestReport_ = report;
         }
-        if (!job.empty() && !DesktopChannelProbe::Running(channelProbeState_)) ownedChannelProbes_.Forget(DesktopChannelProbe::Text(job, "id"));
-        Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_));
-        UpdateChannelProbeControls();
+        if (!job.empty() && !DesktopSpeedTest::Running(speedTestState_)) ownedSpeedTests_.Forget(DesktopSpeedTest::Text(job, "id"));
+        RenderSpeedTest();
+        UpdateSpeedTestControls();
     }
-    void ChannelProbeCommand(bool cancel) {
-        if (!diagnosticsWindow_ || !ready_ || stopping_ || channelProbeCommandBusy_) return;
+    void SpeedTestCommand(bool cancel) {
+        if (!speedTestWindow_ || !ready_ || stopping_ || speedTestCommandBusy_) return;
         std::string id;
         if (cancel) {
-            if (!DesktopChannelProbe::Running(channelProbeState_)) return;
-            id = DesktopChannelProbe::Text(DesktopChannelProbe::Job(channelProbeState_), "id");
+            if (!DesktopSpeedTest::Running(speedTestState_)) return;
+            id = DesktopSpeedTest::Text(DesktopSpeedTest::Job(speedTestState_), "id");
         } else {
-            if (diagnosticsBusy_ || !DesktopChannelProbe::CanStart(channelProbeState_)) return;
-            const auto selected = SendMessageW(channelProbeTarget_, CB_GETCURSEL, 0, 0);
-            if (selected < 0 || static_cast<size_t>(selected) >= channelProbeTargets_.size()) return;
-            id = channelProbeTargets_[selected]; channelProbeReport_ = Json();
+            if (speedStatusBusy_ || !DesktopSpeedTest::CanStart(speedTestState_)) return;
+            const auto selected = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
+            if (selected < 0 || static_cast<size_t>(selected) >= speedTestTargets_.size() || !speedTestSupported_[selected]) return;
+            id = speedTestTargets_[selected];
+            if (!DesktopSpeedTest::CanStartTarget(speedTestState_, id)) return;
+            speedTestReport_ = Json();
         }
         if (id.empty()) return;
-        if (channelProbeThread_.joinable()) channelProbeThread_.join();
-        channelProbeCommandBusy_ = true; UpdateChannelProbeControls();
-        Text(channelProbeOutput_, cancel ? L"正在取消本次探测…" : L"正在提交当前配对通道探测…\r\n发送少量探测包，可能更新 Bridge 路径；不是带宽测速。");
-        const auto epoch = channelProbeView_;
+        if (speedTestThread_.joinable()) speedTestThread_.join();
+        speedTestCommandBusy_ = true; speedStatusEpoch_.Started(); UpdateSpeedTestControls();
+        Text(speedTestPhase_, cancel ? L"正在取消本次测速…" : L"正在提交 A ↔ B 通道测速…");
+        const auto epoch = speedTestView_;
         try {
-            channelProbeThread_ = std::thread([this, cancel, id, epoch] {
+            speedTestThread_ = std::thread([this, cancel, id, epoch] {
                 try {
                     Json body = {{cancel ? "jobId" : "targetId", id}};
-                    const auto route = cancel ? L"/api/network/diagnostics/channel-probe/cancel" : L"/api/network/diagnostics/channel-probe";
+                    const auto route = cancel ? L"/api/proxy/speed-test/cancel" : L"/api/proxy/speed-test";
                     const auto response = Api(ControlPort(), token_, route, &body, 3000);
-                    const auto createdId = cancel ? std::string{} : DesktopChannelProbe::Text(DesktopChannelProbe::Job(response), "id");
-                    if (!createdId.empty() && ownedChannelProbes_.Register(createdId, epoch)) CancelOwnedChannelProbe(createdId);
-                    if (cancel) ownedChannelProbes_.Forget(id);
-                    Post({"channel-probe-command", response, {}, {}, epoch});
-                } catch (const std::exception& error) { Post({"channel-probe-error", {}, error.what(), {}, epoch}); }
+                    const auto createdId = cancel ? std::string{} : DesktopSpeedTest::Text(DesktopSpeedTest::Job(response), "id");
+                    if (!createdId.empty() && ownedSpeedTests_.Register(createdId, epoch)) CancelOwnedSpeedTest(createdId);
+                    if (cancel) ownedSpeedTests_.Forget(id);
+                    Post({"speed-test-command", response, {}, {}, epoch});
+                } catch (const std::exception& error) { Post({"speed-test-error", {}, error.what(), {}, epoch}); }
             });
-        } catch (...) { channelProbeCommandBusy_ = false; UpdateChannelProbeControls(); throw; }
+        } catch (...) { speedTestCommandBusy_ = false; UpdateSpeedTestControls(); throw; }
     }
-    void ExportChannelProbeReport() {
-        if (!diagnosticsWindow_ || !channelProbeReport_.is_object() || DesktopChannelProbe::Running(channelProbeState_)) return;
-        const auto payload = channelProbeReport_.dump(2) + "\n";
+    void ExportSpeedTestReport() {
+        if (!speedTestWindow_ || !speedTestReport_.is_object() || DesktopSpeedTest::Running(speedTestState_)) return;
+        const auto payload = speedTestReport_.dump(2) + "\n";
         IFileSaveDialog* raw = nullptr;
         if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&raw)))) throw std::runtime_error("无法创建报告保存窗口");
         std::unique_ptr<IFileSaveDialog, void(*)(IFileSaveDialog*)> dialog(raw, [](IFileSaveDialog* item) { item->Release(); });
-        const COMDLG_FILTERSPEC types[] = {{L"JSON 探测报告", L"*.json"}};
-        dialog->SetFileTypes(1, types); dialog->SetDefaultExtension(L"json"); dialog->SetTitle(L"导出通道探测报告");
+        const COMDLG_FILTERSPEC types[] = {{L"JSON 测速报告", L"*.json"}};
+        dialog->SetFileTypes(1, types); dialog->SetDefaultExtension(L"json"); dialog->SetTitle(L"导出通道测速报告");
         FILEOPENDIALOGOPTIONS options = 0;
         if (SUCCEEDED(dialog->GetOptions(&options))) dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_NOREADONLYRETURN);
         SYSTEMTIME utc{}; GetSystemTime(&utc); wchar_t filename[96];
-        swprintf_s(filename, 96, L"Bridge-channel-probe-%04u%02u%02u-%02u%02u%02u.json", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+        swprintf_s(filename, 96, L"Bridge-speed-test-%04u%02u%02u-%02u%02u%02u.json", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
         dialog->SetFileName(filename);
-        const auto shown = dialog->Show(diagnosticsWindow_);
+        const auto shown = dialog->Show(speedTestWindow_);
         if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return;
         if (FAILED(shown)) throw std::runtime_error("无法选择报告保存位置");
         IShellItem* item = nullptr; if (FAILED(dialog->GetResult(&item))) throw std::runtime_error("无法读取报告保存位置");
@@ -1146,14 +1178,189 @@ class Application {
         // Freeze the whitelisted report before writing; no status or target metadata.
         std::ofstream file(target, std::ios::binary | std::ios::trunc);
         if (!file || !file.write(payload.data(), static_cast<std::streamsize>(payload.size())) || !file.flush()) throw std::runtime_error("报告保存失败");
-        Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_) + L"\r\n\r\nJSON 探测报告已导出。");
+        Text(speedTestOutput_, DesktopSpeedTest::Details(speedTestState_, speedTestReport_) + L"\r\n\r\nJSON 测速报告已导出。");
+    }
+    void RenderSpeedTest() {
+        if (!speedTestWindow_) return;
+        const auto download = DesktopSpeedTest::Speed(speedTestState_, speedTestReport_, "download");
+        const auto upload = DesktopSpeedTest::Speed(speedTestState_, speedTestReport_, "upload");
+        Text(speedTestDownload_, DesktopSpeedTest::Rate(download)); Text(speedTestDownloadSecondary_, DesktopSpeedTest::Rate(download, false));
+        Text(speedTestUpload_, DesktopSpeedTest::Rate(upload)); Text(speedTestUploadSecondary_, DesktopSpeedTest::Rate(upload, false));
+        Text(speedTestLatency_, DesktopSpeedTest::Milliseconds(DesktopSpeedTest::Latency(speedTestState_, speedTestReport_)));
+        std::wstring samples = L"往返 RTT · 中位数";
+        if (speedTestReport_.is_object() && speedTestReport_["latency"].is_object()) samples += L" · " + std::to_wstring(speedTestReport_["latency"]["samples"].size()) + L" 个样本";
+        Text(speedTestSamples_, samples);
+        const auto progress = DesktopSpeedTest::ViewProgress(speedTestState_);
+        auto style = GetWindowLongPtrW(speedTestProgress_, GWL_STYLE);
+        if (progress.marquee) style |= PBS_MARQUEE; else style &= ~static_cast<LONG_PTR>(PBS_MARQUEE);
+        if (style != GetWindowLongPtrW(speedTestProgress_, GWL_STYLE)) {
+            SetWindowLongPtrW(speedTestProgress_, GWL_STYLE, style);
+            SendMessageW(speedTestProgress_, PBM_SETMARQUEE, progress.marquee ? TRUE : FALSE, 50);
+        }
+        if (!progress.marquee) SendMessageW(speedTestProgress_, PBM_SETPOS, progress.position, 0);
+        Text(speedTestPhase_, progress.text);
+        const auto selected = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
+        if (!DesktopSpeedTest::Running(speedTestState_) && selected >= 0 && static_cast<size_t>(selected) < speedTestSupported_.size() && !speedTestSupported_[selected])
+            Text(speedTestPhase_, L"所选设备需升级至 1.1.9；双方均升级后才能开始测速。");
+        Text(speedTestOutput_, DesktopSpeedTest::Details(speedTestState_, speedTestReport_));
+    }
+    void ReadSpeedTestStatus() {
+        if (!speedTestWindow_ || !ready_ || stopping_ || speedStatusBusy_) return;
+        if (speedStatusThread_.joinable()) speedStatusThread_.join();
+        speedStatusBusy_ = true; speedLastPoll_ = GetTickCount64(); UpdateSpeedTestControls();
+        const auto epoch = speedTestView_, mutation = speedStatusEpoch_.Capture(); const bool authoritative = !speedTestCommandBusy_;
+        try {
+            speedStatusThread_ = std::thread([this, epoch, mutation, authoritative] {
+                try { Post({"speed-test-status", {{"status", Api(ControlPort(), token_, L"/api/proxy/speed-test", nullptr, 3000)}, {"authoritative", authoritative}, {"mutation", mutation}}, {}, {}, epoch}); }
+                catch (const std::exception& error) { Post({"speed-test-status-error", {{"mutation", mutation}}, error.what(), {}, epoch}); }
+            });
+        } catch (...) { speedStatusBusy_ = false; UpdateSpeedTestControls(); throw; }
+    }
+    void SpeedTestFont() {
+        const auto dpi = GetDpiForWindow(speedTestWindow_);
+        auto create = [dpi](int size, int weight) { return CreateFontW(-MulDiv(size, dpi, 96), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI"); };
+        const auto font = create(14, FW_NORMAL), valueFont = create(22, FW_SEMIBOLD);
+        if (!font || !valueFont) { if (font) DeleteObject(font); if (valueFont) DeleteObject(valueFont); throw std::runtime_error("无法创建测速窗口字体"); }
+        for (auto child : {speedTestTarget_, speedTestStart_, speedTestCancel_, speedTestExport_, speedTestClose_, speedTestOutput_,
+                speedTestDownloadSecondary_, speedTestUploadSecondary_, speedTestSamples_, speedTestPhase_, speedTestLabels_[0], speedTestLabels_[1], speedTestLabels_[2]})
+            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        for (auto child : {speedTestDownload_, speedTestUpload_, speedTestLatency_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(valueFont), TRUE);
+        if (speedTestFont_) DeleteObject(speedTestFont_);
+        if (speedTestValueFont_) DeleteObject(speedTestValueFont_);
+        speedTestFont_ = font; speedTestValueFont_ = valueFont;
+    }
+    void LayoutSpeedTest() {
+        if (!speedTestWindow_) return;
+        RECT rect; GetClientRect(speedTestWindow_, &rect); const auto dpi = GetDpiForWindow(speedTestWindow_);
+        auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+        const int margin = scale(18), gap = scale(12), width = std::max(0, static_cast<int>(rect.right) - margin * 2), buttonH = scale(34);
+        MoveWindow(speedTestTarget_, margin, margin, width, scale(220), TRUE);
+        const int column = std::max(0, (width - gap * 2) / 3);
+        const HWND values[] = {speedTestDownload_, speedTestUpload_, speedTestLatency_}, secondary[] = {speedTestDownloadSecondary_, speedTestUploadSecondary_, speedTestSamples_};
+        for (int i = 0; i < 3; ++i) {
+            const int x = margin + i * (column + gap);
+            MoveWindow(speedTestLabels_[i], x, scale(76), column, scale(22), TRUE);
+            MoveWindow(values[i], x, scale(108), column, scale(40), TRUE);
+            MoveWindow(secondary[i], x, scale(154), column, scale(42), TRUE);
+        }
+        MoveWindow(speedTestProgress_, margin, scale(208), width, scale(14), TRUE);
+        MoveWindow(speedTestPhase_, margin, scale(236), width, scale(48), TRUE);
+        const int footer = rect.bottom - margin - buttonH, detailsTop = scale(296);
+        MoveWindow(speedTestOutput_, margin, detailsTop, width, std::max(scale(40), footer - detailsTop - gap), TRUE);
+        const int buttonW = (width - gap * 3) / 4;
+        const HWND buttons[] = {speedTestStart_, speedTestCancel_, speedTestExport_, speedTestClose_};
+        for (int i = 0; i < 4; ++i) MoveWindow(buttons[i], margin + i * (buttonW + gap), footer, buttonW, buttonH, TRUE);
+    }
+    LRESULT HandleSpeedTest(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_CREATE: {
+            auto control = [this, window](const wchar_t* type, const wchar_t* text, int id, DWORD style) {
+                const auto child = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+                if (!child) throw std::runtime_error("无法创建测速窗口控件");
+                SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(this)); DesktopTheme::NativeControls(child, dark_); return child;
+            };
+            speedTestTarget_ = control(L"COMBOBOX", L"", SPEED_TEST_TARGET, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST);
+            SendMessageW(speedTestTarget_, CB_SETCUEBANNER, 0, reinterpret_cast<LPARAM>(L"请选择要测速的在线 A 调用端"));
+            speedTestStart_ = control(L"BUTTON", L"开始测速", SPEED_TEST_START, WS_TABSTOP | BS_OWNERDRAW);
+            speedTestCancel_ = control(L"BUTTON", L"取消测速", SPEED_TEST_CANCEL, WS_TABSTOP | BS_OWNERDRAW);
+            speedTestExport_ = control(L"BUTTON", L"导出 JSON", SPEED_TEST_EXPORT, WS_TABSTOP | BS_OWNERDRAW);
+            speedTestClose_ = control(L"BUTTON", L"关闭", SPEED_TEST_CLOSE, WS_TABSTOP | BS_OWNERDRAW);
+            speedTestDownload_ = control(L"STATIC", L"—", SPEED_TEST_DOWNLOAD, SS_NOPREFIX);
+            speedTestUpload_ = control(L"STATIC", L"—", SPEED_TEST_UPLOAD, SS_NOPREFIX);
+            speedTestLatency_ = control(L"STATIC", L"—", SPEED_TEST_LATENCY, SS_NOPREFIX);
+            speedTestDownloadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_DOWNLOAD_SECONDARY, SS_NOPREFIX);
+            speedTestUploadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_UPLOAD_SECONDARY, SS_NOPREFIX);
+            speedTestSamples_ = control(L"STATIC", L"往返 RTT · 中位数", SPEED_TEST_SAMPLES, SS_NOPREFIX);
+            speedTestLabels_[0] = control(L"STATIC", L"A 下载 · B → A", 0, SS_NOPREFIX);
+            speedTestLabels_[1] = control(L"STATIC", L"A 上传 · A → B", 0, SS_NOPREFIX);
+            speedTestLabels_[2] = control(L"STATIC", L"延迟 RTT", 0, SS_NOPREFIX);
+            speedTestProgress_ = control(PROGRESS_CLASSW, L"", SPEED_TEST_PROGRESS, PBS_SMOOTH);
+            SendMessageW(speedTestProgress_, PBM_SETRANGE32, 0, 1000);
+            speedTestPhase_ = control(L"STATIC", L"正在读取已配对连接…", SPEED_TEST_PHASE, SS_NOPREFIX);
+            speedTestOutput_ = control(L"EDIT", L"", SPEED_TEST_DETAILS, WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL);
+            SendMessageW(speedTestOutput_, EM_SETLIMITTEXT, 256 * 1024, 0);
+            DesktopTheme::TitleBar(window, dark_, colors_);
+            speedTestView_ = ownedSpeedTests_.BeginView(); speedTestState_ = Json::object(); speedTestReport_ = Json();
+            speedTestTargets_.clear(); speedTestSupported_.clear(); lastSpeedTestTargets_.clear(); speedLastPoll_ = 0;
+            SpeedTestFont(); LayoutSpeedTest(); RenderSpeedTest(); UpdateSpeedTestControls(); return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == SPEED_TEST_TARGET && HIWORD(wParam) == CBN_SELCHANGE) { RenderSpeedTest(); UpdateSpeedTestControls(); }
+            else if (LOWORD(wParam) == SPEED_TEST_START && HIWORD(wParam) == BN_CLICKED) SpeedTestCommand(false);
+            else if (LOWORD(wParam) == SPEED_TEST_CANCEL && HIWORD(wParam) == BN_CLICKED) SpeedTestCommand(true);
+            else if (LOWORD(wParam) == SPEED_TEST_EXPORT && HIWORD(wParam) == BN_CLICKED) ExportSpeedTestReport();
+            else if (LOWORD(wParam) == SPEED_TEST_CLOSE || LOWORD(wParam) == IDCANCEL) DestroyWindow(window);
+            return 0;
+        case WM_TIMER:
+            if (wParam == SPEED_TEST_TIMER && GetTickCount64() - speedLastPoll_ >= (DesktopSpeedTest::Running(speedTestState_) ? 500 : 1500)) ReadSpeedTestStatus();
+            return 0;
+        case WM_CLOSE: DestroyWindow(window); return 0;
+        case WM_SIZE: LayoutSpeedTest(); return 0;
+        case WM_DPICHANGED: {
+            const auto rect = reinterpret_cast<RECT*>(lParam);
+            SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            SpeedTestFont(); LayoutSpeedTest(); return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            const auto dpi = GetDpiForWindow(window); RECT rect{0, 0, MulDiv(620, dpi, 96), MulDiv(440, dpi, 96)};
+            AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, dpi);
+            reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
+        }
+        case WM_DRAWITEM: DrawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)); return TRUE;
+        case WM_ERASEBKGND: { RECT rect; GetClientRect(window, &rect); FillRect(reinterpret_cast<HDC>(wParam), &rect, surface_); return 1; }
+        case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
+            const bool input = reinterpret_cast<HWND>(lParam) == speedTestOutput_ || message == WM_CTLCOLORLISTBOX;
+            SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), input ? colors_.input : colors_.surface);
+            return reinterpret_cast<LRESULT>(input ? input_ : surface_);
+        }
+        case WM_DESTROY:
+            KillTimer(window, SPEED_TEST_TIMER); RetireSpeedTestView(); speedTestWindow_ = nullptr;
+            speedTestTarget_ = speedTestStart_ = speedTestCancel_ = speedTestExport_ = speedTestOutput_ = speedTestClose_ = nullptr;
+            speedTestDownload_ = speedTestDownloadSecondary_ = speedTestUpload_ = speedTestUploadSecondary_ = nullptr;
+            speedTestLatency_ = speedTestSamples_ = speedTestProgress_ = speedTestPhase_ = nullptr;
+            for (auto& label : speedTestLabels_) label = nullptr;
+            speedTestState_ = Json::object(); speedTestReport_ = Json(); speedTestTargets_.clear(); speedTestSupported_.clear(); lastSpeedTestTargets_.clear();
+            if (speedTestFont_) { DeleteObject(speedTestFont_); speedTestFont_ = nullptr; }
+            if (speedTestValueFont_) { DeleteObject(speedTestValueFont_); speedTestValueFont_ = nullptr; }
+            return 0;
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+    static LRESULT CALLBACK SpeedTestWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        auto self = reinterpret_cast<Application*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) { self = static_cast<Application*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams); self->speedTestWindow_ = window; SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self)); }
+        if (!self) return DefWindowProcW(window, message, wParam, lParam);
+        try { return self->HandleSpeedTest(window, message, wParam, lParam); }
+        catch (const std::exception& error) { if (self->speedTestPhase_) self->Text(self->speedTestPhase_, L"测速暂不可用：" + Wide(error.what())); return message == WM_CREATE ? -1 : 0; }
+    }
+    void OpenSpeedTest() {
+        if (!ready_ || stopping_ || !Object(proxy_, "speedTest").value("connected", false)) return;
+        if (speedTestWindow_) { ShowWindow(speedTestWindow_, SW_RESTORE); SetForegroundWindow(speedTestWindow_); return; }
+        const auto name = className_ + L".SpeedTest";
+        WNDCLASSEXW type{}; type.cbSize = sizeof(type);
+        if (!GetClassInfoExW(instance_, name.c_str(), &type)) {
+            type.hInstance = instance_; type.lpfnWndProc = SpeedTestWindowProc; type.lpszClassName = name.c_str(); type.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            type.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101)); type.hIconSm = type.hIcon;
+            if (!RegisterClassExW(&type)) throw std::runtime_error("无法注册测速窗口");
+        }
+        RECT owner; GetWindowRect(window_, &owner); RECT rect{0, 0, S(680), S(500)};
+        const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
+        AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, extra, dpi_);
+        MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
+        const int width = std::min(rect.right - rect.left, monitor.rcWork.right - monitor.rcWork.left), height = std::min(rect.bottom - rect.top, monitor.rcWork.bottom - monitor.rcWork.top);
+        const int x = std::clamp(owner.left + (owner.right - owner.left - width) / 2, monitor.rcWork.left, monitor.rcWork.right - width);
+        const int y = std::clamp(owner.top + (owner.bottom - owner.top - height) / 2, monitor.rcWork.top, monitor.rcWork.bottom - height);
+        if (!CreateWindowExW(extra, name.c_str(), L"网络测速 · A ↔ B", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, width, height, window_, nullptr, instance_, this)) throw std::runtime_error("无法创建测速窗口");
+        if (!SetTimer(speedTestWindow_, SPEED_TEST_TIMER, 500, nullptr)) { DestroyWindow(speedTestWindow_); throw std::runtime_error("无法启动测速状态刷新"); }
+        ShowWindow(speedTestWindow_, SW_SHOWNORMAL); ReadSpeedTestStatus();
     }
     void DiagnosticsFont() {
         const auto dpi = GetDpiForWindow(diagnosticsWindow_);
         auto font = CreateFontW(-MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
         if (!font) throw std::runtime_error(WindowsError("创建诊断窗口字体"));
-        for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_, channelProbeTarget_, channelProbeStart_, channelProbeCancel_, channelProbeExport_, channelProbeOutput_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         if (diagnosticsFont_) DeleteObject(diagnosticsFont_);
         diagnosticsFont_ = font;
     }
@@ -1162,20 +1369,10 @@ class Application {
         RECT rect; GetClientRect(diagnosticsWindow_, &rect);
         const auto dpi = GetDpiForWindow(diagnosticsWindow_);
         auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
-        const int margin = scale(18), buttonW = scale(104), buttonH = scale(32), gap = scale(10);
+        const int margin = scale(18), buttonW = scale(104), buttonH = scale(32), gap = scale(12);
         const int footer = rect.bottom - margin - buttonH;
-        const int width = std::max(0, static_cast<int>(rect.right) - margin * 2);
-        const int passiveHeight = std::max(scale(80), (footer - margin - gap * 3 - buttonH) * 45 / 100);
-        const int targetTop = margin + passiveHeight + gap;
-        const int reportTop = targetTop + buttonH + gap;
-        MoveWindow(diagnosticsOutput_, margin, margin, width, passiveHeight, TRUE);
-        MoveWindow(channelProbeTarget_, margin, targetTop, width, scale(220), TRUE);
-        MoveWindow(channelProbeOutput_, margin, reportTop, width, std::max(scale(50), footer - reportTop - gap), TRUE);
-        MoveWindow(diagnosticsRefresh_, margin, footer, buttonW, buttonH, TRUE);
-        const int runWidth = std::max(scale(120), width - buttonW * 4 - gap * 4);
-        MoveWindow(channelProbeStart_, margin + buttonW + gap, footer, runWidth, buttonH, TRUE);
-        MoveWindow(channelProbeCancel_, margin + buttonW + runWidth + gap * 2, footer, buttonW, buttonH, TRUE);
-        MoveWindow(channelProbeExport_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW * 2 - gap), footer, buttonW, buttonH, TRUE);
+        MoveWindow(diagnosticsOutput_, margin, margin, std::max(0, static_cast<int>(rect.right) - margin * 2), std::max(0, footer - margin - gap), TRUE);
+        MoveWindow(diagnosticsRefresh_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW * 2 - gap), footer, buttonW, buttonH, TRUE);
         MoveWindow(diagnosticsClose_, std::max(margin, static_cast<int>(rect.right) - margin - buttonW), footer, buttonW, buttonH, TRUE);
     }
     void ReadNetworkDiagnostics(bool automatic = false) {
@@ -1194,20 +1391,11 @@ class Application {
         if (diagnosticsThread_.joinable()) diagnosticsThread_.join();
         const auto epoch = ++diagnosticsEpoch_;
         diagnosticsBusy_ = true; EnableWindow(diagnosticsRefresh_, FALSE);
-        UpdateChannelProbeControls();
-        if (!automatic && !DesktopChannelProbe::Running(channelProbeState_)) Text(diagnosticsOutput_, L"正在读取本机节点网络诊断…\r\n窗口打开期间每 2 秒自动刷新；手动探测运行期间暂停被动采样。\r\n\r\n本机节点启动以来累计，包含模型和代理；重传不等于公网丢包率。");
-        const bool readPassive = !DesktopChannelProbe::Running(channelProbeState_) && !channelProbeCommandBusy_;
-        const bool observeCurrentJob = !channelProbeCommandBusy_;
+        if (!automatic) Text(diagnosticsOutput_, L"正在读取本机节点网络诊断…\r\n窗口打开期间每 2 秒自动刷新，仅读取已有计数，不发起测速。\r\n\r\n本机节点启动以来累计，包含模型和代理；重传不等于公网丢包率。");
         try {
-            diagnosticsThread_ = std::thread([this, epoch, readPassive, observeCurrentJob] {
-                Json result = {{"probeAuthoritative", observeCurrentJob}};
-                try { result["probe"] = Api(ControlPort(), token_, L"/api/network/diagnostics/channel-probe", nullptr, 3000); }
-                catch (const std::exception& error) { result["probeError"] = error.what(); }
-                if (readPassive && (!result.contains("probe") || !DesktopChannelProbe::Running(result["probe"]))) {
-                    try { result["passive"] = Api(ControlPort(), token_, L"/api/network/diagnostics", nullptr, 5000); }
-                    catch (const std::exception& error) { result["passive"] = {{"available", false}, {"message", "读取失败：" + std::string(error.what())}}; }
-                }
-                Post({"diagnostics", result, {}, {}, epoch});
+            diagnosticsThread_ = std::thread([this, epoch] {
+                try { Post({"diagnostics", Api(ControlPort(), token_, L"/api/network/diagnostics", nullptr, 5000), {}, {}, epoch}); }
+                catch (const std::exception& error) { Post({"diagnostics-error", {}, error.what(), {}, epoch}); }
             });
         } catch (const std::exception& error) {
             diagnosticsBusy_ = false; EnableWindow(diagnosticsRefresh_, TRUE);
@@ -1219,39 +1407,22 @@ class Application {
         case WM_CREATE: {
             diagnosticsOutput_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_OUTPUT), instance_, nullptr);
-            diagnosticsRefresh_ = CreateWindowExW(0, L"BUTTON", L"刷新统计", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            diagnosticsRefresh_ = CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_REFRESH), instance_, nullptr);
             diagnosticsClose_ = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, window, reinterpret_cast<HMENU>(DIAGNOSTICS_CLOSE), instance_, nullptr);
-            channelProbeTarget_ = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_TARGET), instance_, nullptr);
-            channelProbeStart_ = CreateWindowExW(0, L"BUTTON", L"探测配对通道", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_START), instance_, nullptr);
-            channelProbeCancel_ = CreateWindowExW(0, L"BUTTON", L"取消探测", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_CANCEL), instance_, nullptr);
-            channelProbeExport_ = CreateWindowExW(0, L"BUTTON", L"导出 JSON", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_EXPORT), instance_, nullptr);
-            channelProbeOutput_ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-                0, 0, 0, 0, window, reinterpret_cast<HMENU>(CHANNEL_PROBE_OUTPUT), instance_, nullptr);
-            if (!diagnosticsOutput_ || !diagnosticsRefresh_ || !diagnosticsClose_ || !channelProbeTarget_ || !channelProbeStart_ || !channelProbeCancel_ || !channelProbeExport_ || !channelProbeOutput_) throw std::runtime_error(WindowsError("创建诊断窗口控件"));
-            for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_, channelProbeTarget_, channelProbeStart_, channelProbeCancel_, channelProbeExport_, channelProbeOutput_}) {
+            if (!diagnosticsOutput_ || !diagnosticsRefresh_ || !diagnosticsClose_) throw std::runtime_error(WindowsError("创建诊断窗口控件"));
+            for (auto child : {diagnosticsOutput_, diagnosticsRefresh_, diagnosticsClose_}) {
                 SetWindowSubclass(child, ControlProc, 1, reinterpret_cast<DWORD_PTR>(this));
                 DesktopTheme::NativeControls(child, dark_);
             }
             DesktopTheme::TitleBar(window, dark_, colors_);
             SetWindowTheme(diagnosticsOutput_, dark_ ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             SendMessageW(diagnosticsOutput_, EM_SETLIMITTEXT, 2 * 1024 * 1024, 0);
-            SendMessageW(channelProbeOutput_, EM_SETLIMITTEXT, 256 * 1024, 0);
-            channelProbeView_ = ownedChannelProbes_.BeginView();
-            channelProbeState_ = Json::object(); channelProbeReport_ = Json(); channelProbeTargets_.clear(); lastChannelProbeTargets_.clear();
-            Text(channelProbeOutput_, DesktopChannelProbe::Format(channelProbeState_, channelProbeReport_));
-            DiagnosticsFont(); LayoutDiagnostics(); UpdateChannelProbeControls(); return 0;
+            DiagnosticsFont(); LayoutDiagnostics(); return 0;
         }
         case WM_COMMAND:
             if (LOWORD(wParam) == DIAGNOSTICS_REFRESH && HIWORD(wParam) == BN_CLICKED) ReadNetworkDiagnostics();
-            else if (LOWORD(wParam) == CHANNEL_PROBE_START && HIWORD(wParam) == BN_CLICKED) ChannelProbeCommand(false);
-            else if (LOWORD(wParam) == CHANNEL_PROBE_CANCEL && HIWORD(wParam) == BN_CLICKED) ChannelProbeCommand(true);
-            else if (LOWORD(wParam) == CHANNEL_PROBE_EXPORT && HIWORD(wParam) == BN_CLICKED) ExportChannelProbeReport();
             else if (LOWORD(wParam) == DIAGNOSTICS_CLOSE || LOWORD(wParam) == IDCANCEL) DestroyWindow(window);
             return 0;
         case WM_CLOSE: DestroyWindow(window); return 0;
@@ -1266,7 +1437,7 @@ class Application {
         }
         case WM_GETMINMAXINFO: {
             const auto dpi = GetDpiForWindow(window);
-            RECT rect{0, 0, MulDiv(680, dpi, 96), MulDiv(500, dpi, 96)};
+            RECT rect{0, 0, MulDiv(580, dpi, 96), MulDiv(350, dpi, 96)};
             AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, dpi);
             reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
         }
@@ -1277,16 +1448,10 @@ class Application {
         case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT:
             SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
             return reinterpret_cast<LRESULT>(input_);
-        case WM_CTLCOLORLISTBOX:
-            SetTextColor(reinterpret_cast<HDC>(wParam), colors_.ink); SetBkColor(reinterpret_cast<HDC>(wParam), colors_.input);
-            return reinterpret_cast<LRESULT>(input_);
         case WM_DESTROY:
             KillTimer(window, DIAGNOSTICS_TIMER);
             ++diagnosticsEpoch_; diagnosticsReadPending_ = false;
-            RetireChannelProbeView();
             diagnosticsWindow_ = diagnosticsOutput_ = diagnosticsRefresh_ = diagnosticsClose_ = nullptr;
-            channelProbeTarget_ = channelProbeStart_ = channelProbeCancel_ = channelProbeExport_ = channelProbeOutput_ = nullptr;
-            channelProbeState_ = Json::object(); channelProbeReport_ = Json(); channelProbeTargets_.clear(); lastChannelProbeTargets_.clear();
             if (diagnosticsFont_) { DeleteObject(diagnosticsFont_); diagnosticsFont_ = nullptr; }
             return 0;
         }
@@ -1316,11 +1481,10 @@ class Application {
             if (!RegisterClassExW(&type)) throw std::runtime_error(WindowsError("注册诊断窗口"));
         }
         RECT owner; GetWindowRect(window_, &owner);
-        RECT rect{0, 0, S(840), S(680)}; const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
+        RECT rect{0, 0, S(840), S(640)}; const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
         AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, extra, dpi_);
+        const int width = rect.right - rect.left, height = rect.bottom - rect.top;
         MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
-        const int width = std::min(rect.right - rect.left, monitor.rcWork.right - monitor.rcWork.left);
-        const int height = std::min(rect.bottom - rect.top, monitor.rcWork.bottom - monitor.rcWork.top);
         const int x = std::max(monitor.rcWork.left, owner.left + (owner.right - owner.left - width) / 2);
         const int y = std::max(monitor.rcWork.top, owner.top + (owner.bottom - owner.top - height) / 2);
         if (!CreateWindowExW(extra, name.c_str(), L"网络诊断 · 本机节点", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, width, height, window_, nullptr, instance_, this))
@@ -1349,6 +1513,7 @@ class Application {
             case NETWORK_DISCONNECT: Action(L"/api/network/disconnect", Json::object(), "network-disconnect"); break;
             case NETWORK_REFRESH: Action(L"/api/tailscale", Json::object(), "refresh"); break;
             case NETWORK_DIAGNOSTICS: OpenNetworkDiagnostics(); break;
+            case NETWORK_SPEED_TEST: OpenSpeedTest(); break;
             case NETWORK_LOGIN: if (!authUrl_.empty() && SafeLoginUrl(authUrl_)) OpenLink(window_, Wide(authUrl_)); break;
             case PAIR_JOIN:
                 if (IsWindowEnabled(Item(PAIR_JOIN))) {
@@ -1401,6 +1566,7 @@ class Application {
     void Stop() {
         if (stopping_.exchange(true)) return;
         if (diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
+        if (speedTestWindow_) DestroyWindow(speedTestWindow_);
         SaveSettings(); SetEvent(wake_.value);
         {
             std::lock_guard lock(engineMutex_);
@@ -1411,12 +1577,12 @@ class Application {
             DrainOwnedJob(job_.value, process_.value);
             job_.reset();
         }
-        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &channelProbeThread_}) if (thread->joinable()) thread->join();
+        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &speedTestThread_, &speedStatusThread_}) if (thread->joinable()) thread->join();
         {
-            std::lock_guard lock(probeCancelMutex_); probeCancelStopping_ = true; pendingProbeCancel_.clear();
+            std::lock_guard lock(speedCancelMutex_); speedCancelStopping_ = true; pendingSpeedCancel_.clear();
         }
-        probeCancelWake_.notify_one();
-        if (probeCancelThread_.joinable()) probeCancelThread_.join();
+        speedCancelWake_.notify_one();
+        if (speedCancelThread_.joinable()) speedCancelThread_.join();
         if (trayAdded_) { NOTIFYICONDATAW icon{}; icon.cbSize = sizeof(icon); icon.hWnd = window_; icon.uID = 1; Shell_NotifyIconW(NIM_DELETE, &icon); trayAdded_ = false; }
         MSG message; while (PeekMessageW(&message, window_, MSG_REPLY, MSG_REPLY, PM_REMOVE)) delete reinterpret_cast<Reply*>(message.lParam);
     }
@@ -1493,7 +1659,7 @@ public:
         fs::create_directories(options_.directory);
         DataDirectoryLock profile(options_.directory);
         if (!profile.Acquired()) throw std::runtime_error("此数据目录仍被其他客户端或后台进程使用，请先正常退出占用程序，再启动本客户端。");
-        INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
+        INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS}; InitCommonControlsEx(&controls);
         WNDCLASSEXW type{}; type.cbSize = sizeof(type); type.hInstance = instance_; type.lpfnWndProc = WindowProc;
         type.lpszClassName = className_.c_str(); type.hCursor = LoadCursorW(nullptr, IDC_ARROW); type.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101)); type.hIconSm = type.hIcon;
         if (!RegisterClassExW(&type)) throw std::runtime_error(WindowsError("注册窗口"));
@@ -1510,6 +1676,7 @@ public:
         MSG message;
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
             if (diagnosticsWindow_ && IsDialogMessageW(diagnosticsWindow_, &message)) continue;
+            if (speedTestWindow_ && IsDialogMessageW(speedTestWindow_, &message)) continue;
             if (!IsDialogMessageW(window_, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
         }
         return 0;

@@ -8,12 +8,13 @@ import { rejectUpgrade } from './http-upgrade.js';
 // B owns a private listener with one independently authenticated channel per A.
 // Connections never share nonces, sequence counters, replay windows or replies.
 export class BridgePeer extends EventEmitter {
-  constructor({ role, pairing, allowLoopback = false, heartbeatMs = 10000, retryMs = 1000, networkAdapter = null, retryInitial = false, maxClients = 16, networkUpgrade = null, channel = 'control', sharedListener = null, parentSession = null, authorize = null, metadata = null, info = null }) {
+  constructor({ role, pairing, allowLoopback = false, heartbeatMs = 10000, retryMs = 1000, networkAdapter = null, retryInitial = false, maxClients = 16, networkUpgrade = null, channel = 'control', sharedListener = null, parentSession = null, authorize = null, metadata = null, info = null, capabilities = {} }) {
     super();
     validatePeerAddress(pairing.host, { allowLoopback });
     Object.assign(this, { role, pairing, allowLoopback, heartbeatMs, retryMs, networkAdapter, retryInitial, maxClients });
     this.networkUpgrade = networkUpgrade;
     Object.assign(this, { channel, sharedListener, parentSession, authorize, metadata, info });
+    this.capabilities = channel === 'control' && capabilities?.speedTest === 1 ? { speedTest: 1 } : {};
     this.route = `${channel === 'model' ? '/model' : '/bridge'}/${pairing.room}`;
     this.authLabel = channel === 'model' ? 'p2pcc-model-v1' : 'p2pcc-v2';
     this.state = { mode: 'tailscale', role, online: false, listening: false, connectedClients: 0, maxClients, transport: 'offline', endpoint: `${pairing.host}:${pairing.port}`, error: null };
@@ -131,10 +132,12 @@ export class BridgePeer extends EventEmitter {
     });
   }
   bindSocket(ws, resolve, reject, resource) {
-    const connection = { id: randomId(12), ws, crypto: new SecureChannel(this.pairing.secret, this.pairing.room, this.role), localNonce: randomId(), remoteNonce: null, session: null, sendSequence: 0, receiveSequence: 0, authenticated: false };
+    const connection = { id: randomId(12), ws, crypto: new SecureChannel(this.pairing.secret, this.pairing.room, this.role), localNonce: randomId(), remoteNonce: null, session: null, sendSequence: 0, receiveSequence: 0, authenticated: false,
+      latencyMs: null, latencyAt: null };
     this.connections.add(connection);
     if (this.role === 'client') this.clientConnection = connection;
     let alive = true;
+    let latencyProbe = null;
     let lastError;
     const reportError = (message) => { if (this.role === 'client' || !this.state.online) this.update({ error: message }); };
     const fail = (message) => { lastError = message; reportError(message); ws.terminate(); };
@@ -142,10 +145,22 @@ export class BridgePeer extends EventEmitter {
     const heartbeat = setInterval(() => {
       if (!alive) return fail('连接心跳超时');
       alive = false;
-      if (ws.readyState === WebSocket.OPEN) ws.ping();
+      if (ws.readyState === WebSocket.OPEN) {
+        if (this.channel === 'control') {
+          latencyProbe = { token: randomId(12), at: performance.now() };
+          ws.ping(latencyProbe.token);
+        } else ws.ping();
+      }
     }, this.heartbeatMs);
     heartbeat.unref();
-    ws.on('pong', () => { alive = true; });
+    ws.on('pong', (payload) => {
+      alive = true;
+      if (!latencyProbe || !Buffer.isBuffer(payload) || !equalSecret(payload.toString(), latencyProbe.token)) return;
+      const probe = latencyProbe; latencyProbe = null;
+      if (!this.isConnected(connection)) return;
+      const now = performance.now();
+      connection.latencyMs = Math.max(0, now - probe.at); connection.latencyAt = now;
+    });
     ws.on('error', (error) => {
       if (this.state.pairingRejected || lastError) return;
       lastError = `连接 B 端失败：${error.message}。请确认两端 Tailscale 已连接、B 正在提供服务，且 TCP ${this.pairing.port} 未被防火墙阻止`; reportError(lastError);
@@ -168,6 +183,7 @@ export class BridgePeer extends EventEmitter {
           if (typeof msg.nonce !== 'string' || !/^[\w-]{32}$/.test(msg.nonce) || (connection.remoteNonce && connection.remoteNonce !== msg.nonce)) throw new Error('身份验证失败');
           if (this.authorize && !this.authorize(msg, connection)) throw new Error('控制连接身份无效');
           connection.parentSession = typeof msg.parentSession === 'string' ? msg.parentSession : null;
+          connection.capabilities = this.channel === 'control' && msg.capabilities?.speedTest === 1 ? { speedTest: 1 } : {};
           if (msg.device && typeof msg.device === 'object') connection.device = {
             name: typeof msg.device.name === 'string' ? msg.device.name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 80) : '',
             address: typeof msg.device.address === 'string' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(msg.device.address) ? msg.device.address : ''
@@ -201,6 +217,7 @@ export class BridgePeer extends EventEmitter {
       }
       clearTimeout(deadline);
       clearInterval(heartbeat);
+      latencyProbe = null; connection.latencyMs = null; connection.latencyAt = null;
       if (!connection.authenticated) reject?.(new Error(lastError || 'B 端拒绝连接，请检查配对码是否有效或是否已达到 16 台 A 端的连接上限'));
       if (!this.connections.delete(connection)) return;
       const wasOnline = connection.authenticated;
@@ -214,6 +231,7 @@ export class BridgePeer extends EventEmitter {
     });
     const hello = () => { try { this.write({ kind: 'hello', nonce: connection.localNonce,
       ...(this.parentSession ? { parentSession: typeof this.parentSession === 'function' ? this.parentSession() : this.parentSession } : {}),
+      ...(Object.keys(this.capabilities).length ? { capabilities: this.capabilities } : {}),
       ...(this.metadata ? { device: typeof this.metadata === 'function' ? this.metadata() : this.metadata } : {}) }, connection); } catch (error) { fail(error.message); } };
     if (ws.readyState === WebSocket.OPEN) hello(); else ws.once('open', hello);
   }
@@ -245,6 +263,28 @@ export class BridgePeer extends EventEmitter {
   trySendHealthHint(body, connection) {
     if (this.channel !== 'control' || this.role !== 'host' || !this.isConnected(connection) ||
         body?.type !== 'proxy-health' || body.v !== 1 || connection.ws.bufferedAmount >= 64 * 1024) return false;
+    try {
+      if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;
+      const sequence = connection.sendSequence + 1;
+      const packet = JSON.stringify(connection.crypto.seal({ kind: 'message', session: connection.session, sequence, body }));
+      connection.ws.send(packet, () => {});
+      connection.sendSequence = sequence;
+      return true;
+    } catch { return false; }
+  }
+  // Speed negotiation is optional and must not turn a busy or failing control
+  // write into a forced disconnect of ordinary proxy or model traffic.
+  trySendSpeedMessage(body, connection = this.clientConnection) {
+    const reasons = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy',
+      'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'user-cancelled', 'closed', 'transport-failed']);
+    if (this.channel !== 'control' || !this.isConnected(connection) || body?.v !== 1 ||
+        typeof body.id !== 'string' || !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(body.id) ||
+        !['speed-request', 'speed-offer', 'speed-reject', 'speed-cancel'].includes(body.type) || connection.ws.bufferedAmount >= 64 * 1024) return false;
+    const allowed = body.type === 'speed-offer' ? ['type', 'v', 'id', 'session', 'ticket']
+      : ['speed-reject', 'speed-cancel'].includes(body.type) ? ['type', 'v', 'id', 'reason'] : ['type', 'v', 'id'];
+    if (Object.keys(body).length !== allowed.length || Object.keys(body).some((key) => !allowed.includes(key)) ||
+        (body.type === 'speed-offer' && (!equalSecret(body.session, connection.session) || typeof body.ticket !== 'string' || !/^[\w-]{43}$/.test(body.ticket))) ||
+        (['speed-reject', 'speed-cancel'].includes(body.type) && !reasons.has(body.reason))) return false;
     try {
       if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;
       const sequence = connection.sendSequence + 1;

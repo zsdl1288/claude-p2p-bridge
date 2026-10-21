@@ -84,14 +84,16 @@ test('task and model endpoints cannot silently exchange execution modes', async 
   assert.equal(dispatched.length, 0);
 });
 
-test('manual channel probes are authenticated management jobs and cannot accept arbitrary addresses', async (t) => {
+test('channel speed tests are authenticated management jobs and cannot accept arbitrary addresses', async (t) => {
   let reads = 0, starts = 0, cancels = 0;
   const job = { id, state: 'running', report: { v: 1, results: [] } };
   const status = { available: true, busy: false, retryAfterMs: 0, targets: [{ id: 'current-control', role: 'host', address: '100.100.100.100' }], job: null };
-  const channelProbe = { status() { reads++; return status; }, start(body) { starts++; assert.deepEqual(body, { targetId: 'current-control' }); return job; },
+  const channelSpeed = { status() { reads++; return status; }, start(body) { starts++; assert.deepEqual(body, { targetId: 'current-control' }); return job; },
     cancel(jobId) { assert.equal(jobId, id); cancels++; } };
-  const { url, modelUrl } = await fixture(t, { channelProbe }, { modelApi: true });
-  const route = '/api/network/diagnostics/channel-probe';
+  const { url, modelUrl } = await fixture(t, { channelSpeed }, { modelApi: true });
+  const route = '/api/proxy/speed-test';
+  assert.equal((await fetch(`${url}/api/network/diagnostics/channel-probe`, { headers })).status, 404);
+  assert.equal((await fetch(`${url}/channel-probe.js`, { headers })).status, 404);
   for (const [method, suffix, body] of [['GET', '', undefined], ['POST', '', '{"targetId":"current-control"}'], ['POST', '/cancel', JSON.stringify({ jobId: id })]]) {
     const options = { method, ...(body ? { body } : {}) };
     assert.equal((await fetch(`${url}${route}${suffix}`, options)).status, 401);
@@ -110,7 +112,7 @@ test('manual channel probes are authenticated management jobs and cannot accept 
   assert.equal((await fetch(`${url}${route}/cancel`, { method: 'POST', headers, body: JSON.stringify({ jobId: id }) })).status, 200);
   assert.equal(cancels, 1);
   assert.equal((await fetch(`${url}${route}`, { method: 'PUT', headers })).status, 405);
-  const module = await fetch(`${url}/channel-probe.js`); assert.equal(module.status, 200); assert.match(module.headers.get('content-type'), /javascript/);
+  const module = await fetch(`${url}/speed-test.js`); assert.equal(module.status, 200); assert.match(module.headers.get('content-type'), /javascript/);
 });
 
 test('task responses handle synchronous completion without missing headers, IDs or cleanup', async (t) => {

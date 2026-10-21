@@ -41,6 +41,25 @@ async function temporaryDirectory(t) {
   t.after(() => rm(directory, { recursive: true, force: true })); return directory;
 }
 
+test('proxy management projects per-device live rates and current heartbeat RTT to both lists', async (t) => {
+  const { host, client, a, b } = await paired(t);
+  const bControl = [...host.peer.connections].find((connection) => host.peer.isConnected(connection));
+  host.networkProxy.trafficRates.record(bControl, 4000, true);
+  host.networkProxy.trafficRates.record(bControl, 8000, false);
+  bControl.latencyMs = 128.5; bControl.latencyAt = performance.now();
+  const bStatus = await (await b.request('/api/proxy')).json();
+  const aRow = bStatus.devices.find((device) => !device.self && device.role === 'client');
+  assert.equal(aRow.uploadBytesPerSecond, 2000); assert.equal(aRow.downloadBytesPerSecond, 4000); assert.equal(aRow.latencyMs, 128.5);
+  const self = bStatus.devices.find((device) => device.self);
+  assert.equal(self.uploadBytesPerSecond, 2000); assert.equal(self.latencyMs, null);
+  client.networkProxy.trafficRates.record(client.peer.clientConnection, 6000, false);
+  client.peer.clientConnection.latencyMs = 130; client.peer.clientConnection.latencyAt = performance.now();
+  const aStatus = await (await a.request('/api/proxy')).json();
+  const bRow = aStatus.devices.find((device) => !device.self && device.role === 'host');
+  assert.equal(bRow.downloadBytesPerSecond, 3000); assert.equal(bRow.latencyMs, 130); assert.equal(aStatus.rateWindowMs, 2000);
+  assert.equal(aStatus.devices.find((device) => device.self).latencyMs, null);
+});
+
 test('generated complete Clash profile routes Internet and DNS through B without a direct fallback', () => {
   const config = clashProfile({ port: 12345, username: 'user', password: 'secret' });
   assert.equal(config.tun.enable, true); assert.equal(config.tun['strict-route'], true);

@@ -44,7 +44,7 @@ export class ChannelRecovery {
   log(message) { try { this.bridge.log?.(message); } catch { /* Observability must not control recovery. */ } }
   allowed(role = this.bridge.peer?.role) {
     const b = this.bridge, adapter = b.networkAdapter, peer = b.peer;
-    if (this.closed || this.stopped || b.channelProbeActive || b.demo || b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging ||
+    if (this.closed || this.stopped || b.channelSpeedActive || b.channelProbeActive || b.demo || b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging ||
         b.intentOnline === false || b.pairingInvalid || !adapter?.embedded || adapter.closed || adapter.wantRunning !== true ||
         !adapter.child || !adapter.child.stdin?.writable || !adapter.initialized?.has(adapter.child) ||
         typeof adapter.diagnostics !== 'function' || !peer || peer.role !== role || !peer.state?.online) return false;

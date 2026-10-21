@@ -151,6 +151,7 @@ test('model execution, queueing, cancellation waiting and user stop states erase
   for (const mutate of [(f) => f.bridge.pending.set('cancel-wait', {}), (f) => f.bridge.active.set('job', {}), (f) => f.bridge.queue.push({}),
     (f) => { f.bridge.paused = true; }, (f) => { f.bridge.stopRequested = true; }, (f) => { f.bridge.closing = true; },
     (f) => { f.bridge.channelProbeActive = true; },
+    (f) => { f.bridge.channelSpeedActive = true; },
     (f) => { f.bridge.applicationClosing = true; }, (f) => { f.bridge.identityChanging = true; }, (f) => { f.bridge.intentOnline = false; },
     (f) => { f.bridge.pairingInvalid = true; }, (f) => { f.proxy.enabled = false; }, (f) => { f.bridge.remoteSharing = false; }]) {
     const f = fixture(); f.entry.blockedFlows = 0; await f.tick(); f.controller.onHint(f.hint(), f.connection);

@@ -58,18 +58,10 @@
           <label for="proxy-subscription">完整配置订阅 <span>仅供本机使用，请妥善保管</span></label><div class="proxy-subscription-row"><input id="proxy-subscription" readonly spellcheck="false" placeholder="启用本地节点后生成"><button type="button" class="secondary" id="copy-subscription" disabled>复制订阅地址</button></div>
           <p class="field-hint">配置将互联网流量固定经 B。B 掉线后入口保持运行并拒绝请求，B 恢复后自动重连。导入完整配置可同时设置节点和 DNS。</p>
         </div><p class="field-hint" id="proxy-detail"></p>
-        <div class="diagnostics-entry"><button type="button" class="secondary" id="network-diagnostics-open" aria-expanded="false" aria-controls="network-diagnostics-panel" disabled>网络诊断</button><span class="subtle">读取本机节点累计统计</span></div>
+        <div class="diagnostics-entry"><button type="button" class="secondary" id="speed-test-open" aria-haspopup="dialog" disabled>网络测速</button><button type="button" class="secondary" id="network-diagnostics-open" aria-expanded="false" aria-controls="network-diagnostics-panel" disabled>网络诊断</button><span class="subtle">读取本机节点累计统计</span></div>
         <section id="network-diagnostics-panel" class="network-diagnostics" aria-label="本机网络诊断" hidden>
           <div class="card-heading"><h3>本机网络诊断</h3><div><button type="button" class="secondary" id="network-diagnostics-refresh">刷新</button><button type="button" class="text-button" id="network-diagnostics-close">收起</button></div></div>
           <p id="network-diagnostics-status" class="field-hint" role="status" aria-live="polite">尚未读取。</p>
-          <div class="channel-probe-panel">
-            <h3>手动通道探测</h3>
-            <p class="field-hint">发送少量探测包，可能更新 Bridge 路径；不是带宽测速。探测期间暂停本面板的被动采样，最多 35 秒。</p>
-            <label for="channel-probe-target">当前配对设备</label><select id="channel-probe-target" disabled></select>
-            <div class="form-actions"><button type="button" class="secondary" id="channel-probe-start" disabled>开始探测</button><button type="button" class="secondary" id="channel-probe-cancel" disabled>取消探测</button><button type="button" class="secondary" id="channel-probe-export" disabled>导出报告</button></div>
-            <p id="channel-probe-status" class="field-hint" role="status" aria-live="polite">等待当前配对设备及网络组件就绪。</p>
-            <pre id="channel-probe-result" class="test-output">尚未探测。</pre>
-          </div>
           <p class="field-hint">统计范围是本机内置节点，包含模型和代理流量。计数器自该节点启动以来累计；“当前已建立连接”是当前值。TCP 重传不能当作公网丢包率。面板打开期间每 2 秒更新，关闭即停止；也可手动刷新，缺失项显示 —。</p>
           <p class="subtle">采样时间：<time id="network-diagnostics-time">—</time></p>
           <dl id="network-diagnostics-tcp" class="diagnostics-counters"></dl>
@@ -84,5 +76,19 @@
       <section class="card"><div class="card-heading"><div><h2>后台运行</h2></div></div><p class="card-intro">关闭浏览器页面后，本地服务继续运行。桌面版的“收起到托盘”和“Windows 登录后自动在后台运行”位于主窗口左下角的“设置”。</p><a class="secondary" href="/licenses" target="_blank" rel="noreferrer">开源许可</a></section>
     </section>
     <footer>BRIDGE / 私有设备之间的一座桥 <span>Tailscale · 模型服务 · 网络共享</span></footer>
-  </main><div id="toast" class="toast" role="status" hidden></div>
+  </main>
+  <dialog id="speed-test-dialog" aria-labelledby="speed-test-heading">
+    <div class="card-heading"><h2 id="speed-test-heading">网络测速</h2><button type="button" class="text-button" id="speed-test-close" aria-label="关闭测速窗口">关闭</button></div>
+    <p class="field-hint">测试当前 A ↔ B 配对通道。每方向最多 5 秒 / 64 MiB，会占用带宽。</p>
+    <label for="speed-test-target">当前配对设备</label><select id="speed-test-target" disabled></select>
+    <div class="speed-metrics">
+      <div><span>延迟 RTT</span><strong id="speed-test-latency">—</strong><small>往返时间 · ms</small></div>
+      <div><span>A 下载 · B → A</span><strong id="speed-test-download">—</strong><small id="speed-test-download-unit">Mbps / MB/s</small></div>
+      <div><span>A 上传 · A → B</span><strong id="speed-test-upload">—</strong><small id="speed-test-upload-unit">Mbps / MB/s</small></div>
+    </div>
+    <progress id="speed-test-progress" max="1" value="0" aria-label="当前测速阶段进度"></progress>
+    <p id="speed-test-status" class="field-hint" role="status" aria-live="polite">连接配对设备后可开始测速。</p>
+    <div class="form-actions"><button type="button" class="primary" id="speed-test-start" disabled>开始测速</button><button type="button" class="secondary" id="speed-test-cancel" disabled>取消测速</button><button type="button" class="secondary" id="speed-test-export" disabled>导出报告</button></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
 </body></html>

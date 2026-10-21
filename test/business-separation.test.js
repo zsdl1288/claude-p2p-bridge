@@ -14,8 +14,9 @@ async function until(check) {
   while (!check()) { if (Date.now() > deadline) throw new Error('Timed out'); await delay(10); }
 }
 async function setup(t, configured = true) {
-  const host = new Bridge({ demo: true, proxyOptions: { allowPrivateTargets: true } });
-  const client = new Bridge({ demo: true, cancelTimeoutMs: 40, responseTimeoutMs: 40 });
+  const speedOptions = { phaseMs: 120, maxBytes: 1048576, pingMs: 100, handshakeMs: 1000, deadlineMs: 3000 };
+  const host = new Bridge({ demo: true, speedOptions, proxyOptions: { allowPrivateTargets: true } });
+  const client = new Bridge({ demo: true, speedOptions, cancelTimeoutMs: 40, responseTimeoutMs: 40 });
   t.after(async () => { await client.disconnect(); await host.disconnect(); await client.networkProxy.close(); await host.networkProxy.close(); });
   const state = await host.host({ bridgePort: 0, ...(configured ? { workspace: process.cwd() } : {}) });
   await client.join({ invitation: state.invitation });
@@ -25,6 +26,44 @@ async function setup(t, configured = true) {
   await until(() => client.remoteSharing === true);
   return { host, client, invitation: state.invitation };
 }
+
+for (const initiator of ['host', 'client']) test(`a real ${initiator}-initiated speed test preserves established proxy and model sessions`, { timeout: 10000 }, async (t) => {
+  const { host, client, invitation } = await setup(t);
+  const echo = await flow(t, client); await echo('before-speed');
+  const control = client.peer.session, model = client.modelPeer.session;
+  const tester = initiator === 'host' ? host : client;
+  assert.equal(tester.channelSpeed.status().available, true);
+  const job = tester.channelSpeed.start({ targetId: tester.channelSpeed.status().targets[0].id });
+  await until(() => !tester.channelSpeed.status().busy);
+  await until(() => !host.channelSpeed.status().busy && !client.channelSpeed.status().busy);
+  for (const endpoint of [host, client]) {
+    const final = endpoint.channelSpeed.status().job;
+    assert.equal(final.id, job.id); assert.equal(final.state, 'completed');
+    assert.equal(final.report.download.receivedBytes, 1048576); assert.equal(final.report.upload.receivedBytes, 1048576);
+    assert.equal(final.report.latency.samples.length, 5);
+    assert.ok(final.report.download.bytesPerSecond > 0); assert.ok(final.report.upload.bytesPerSecond > 0);
+  }
+  assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model);
+  assert.equal(host.invitation, invitation);
+  await echo('after-speed');
+});
+
+test('cancelling an A speed test releases only its speed connection and preserves the pairing', { timeout: 10000 }, async (t) => {
+  const { host, client, invitation } = await setup(t);
+  const echo = await flow(t, client); await echo('before-cancel');
+  const control = client.peer.session, model = client.modelPeer.session;
+  const accepted = new Promise((resolve) => {
+    const changed = () => { if (host.channelSpeed.status().busy) { host.off('state', changed); resolve(); } };
+    host.on('state', changed);
+  });
+  const job = client.channelSpeed.start({ targetId: client.channelSpeed.status().targets[0].id });
+  await accepted;
+  client.channelSpeed.cancel(job.id);
+  await until(() => !client.channelSpeed.status().busy && !host.channelSpeed.status().busy);
+  assert.equal(client.channelSpeed.status().job.state, 'cancelled');
+  assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model); assert.equal(host.invitation, invitation);
+  await echo('after-cancel');
+});
 async function flow(t, client) {
   const sockets = new Set();
   const echo = net.createServer((socket) => { sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket)); socket.pipe(socket); });

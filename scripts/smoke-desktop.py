@@ -302,7 +302,7 @@ try:
     diagnostics_base, diagnostics_token = start("diagnostics-ui", demo=True, desktop_mode=True)
     diagnostics_process = processes[-1]
     connect_identity(diagnostics_base, diagnostics_token, "host")
-    request(diagnostics_base, "/api/host", {"tailscaleIp": "127.0.0.1", "bridgePort": 0}, diagnostics_token)
+    diagnostics_host = request(diagnostics_base, "/api/host", {"tailscaleIp": "127.0.0.1", "bridgePort": 0}, diagnostics_token)
     main_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, desktop_class), "namespaced desktop window")
     user32.ShowWindow(owned_fixture_window(diagnostics_process, main_window), 4)  # SW_SHOWNOACTIVATE
     wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 103)), "proxy page authorization")
@@ -331,6 +331,34 @@ try:
     time.sleep(0.2)
     assert diagnostics_process.poll() is None and not fixture_window(diagnostics_process, diagnostics_class), "A late diagnostic reply revived its window or crashed the fixture"
     click_fixture(diagnostics_process, main_window, 240)
+    # Only this namespaced test desktop is operated; the user's real B is not
+    # activated or stopped. The dedicated speed window must require a peer,
+    # explicit B target selection and an explicit start.
+    assert not user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 260))
+    speed_base, speed_token = start("speed-caller", demo=True)
+    speed_process = processes[-1]
+    connect_identity(speed_base, speed_token, "client")
+    request(speed_base, "/api/join", {"invitation": diagnostics_host["invitation"]}, speed_token)
+    wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 260)), "speed entry after pairing")
+    click_fixture(diagnostics_process, main_window, 260)
+    speed_class = desktop_class + ".SpeedTest"
+    speed_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, speed_class), "independent speed window")
+    wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, speed_window, 261)), "speed target readiness")
+    assert request(diagnostics_base, "/api/proxy/speed-test", token=diagnostics_token)["job"] is None, "Opening started traffic"
+    assert not user32.IsWindowEnabled(fixture_control(diagnostics_process, speed_window, 262)), "B must choose a target first"
+    target = fixture_control(diagnostics_process, speed_window, 261)
+    fixture_message(diagnostics_process, target, 0x014E, 0)  # CB_SETCURSEL
+    fixture_message(diagnostics_process, speed_window, 0x0111, (1 << 16) | 261, target)  # CBN_SELCHANGE
+    click_fixture(diagnostics_process, speed_window, 262)
+    wait_status(diagnostics_base, diagnostics_token, lambda state: state["proxy"]["speedTest"]["job"] is not None and state["proxy"]["speedTest"]["job"]["state"] == "completed", "native speed test did not finish")
+    result = request(diagnostics_base, "/api/proxy/speed-test", token=diagnostics_token)["job"]["report"]
+    assert result["completed"] and result["download"]["receivedBytes"] > 0 and result["upload"]["receivedBytes"] > 0
+    wait_ui(diagnostics_process, lambda: "Mbps" in fixture_text(diagnostics_process, speed_window, 266), "native download metric")
+    wait_ui(diagnostics_process, lambda: "ms" in fixture_text(diagnostics_process, speed_window, 270), "native RTT metric")
+    click_fixture(diagnostics_process, speed_window, 265)
+    assert not user32.IsWindow(speed_window)
+    stop(speed_base, speed_token, speed_process)
+    print("PASS: isolated speed window is connection gated, requires B target selection, measures both real directions and RTT, and closes independently.", flush=True)
     stop(diagnostics_base, diagnostics_token, diagnostics_process)
     assert diagnostics_process.returncode == 0, "Exiting with a diagnostics window failed"
     print("PASS: namespaced desktop diagnostics shows unavailable counters, updates capture time automatically, supports manual refresh, stays closed across its refresh interval and exits cleanly.", flush=True)

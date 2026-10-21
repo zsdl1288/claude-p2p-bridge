@@ -1,6 +1,7 @@
 import { pages, uiState, allowedPage, deviceIdentity, deviceConnection } from './ui-state.js';
 import { networkDiagnosticsView } from './network-diagnostics.js';
-import { createChannelProbeView } from './channel-probe.js';
+import { createSpeedTestView } from './speed-test.js';
+import { proxyRealtimeText } from './proxy-metrics.js';
 
 const $ = (id) => document.getElementById(id);
 let token, apiBase, currentStatus, lastConfig, lastInvitation, selectedPeer, toastTimer, lastError, lastModels, selectedModelId = '';
@@ -10,7 +11,7 @@ let diagnosticsOpen = false, diagnosticsRequest = null, diagnosticsTimer = null;
 const retiredInstances = new Set();
 const roleName = (role) => role === 'host' ? 'B · 服务端' : role === 'client' ? 'A · 调用端' : '尚未选择身份';
 const state = () => uiState(currentStatus, actionBusy || proxyBusy || !localAvailable);
-const channelProbeView = createChannelProbeView({ api, $, available: () => localAvailable && state().proxy, toast });
+const speedTestView = createSpeedTestView({ api, $, available: () => localAvailable && state().proxy, toast });
 
 function toast(message, error = false) {
   $('toast').textContent = message; $('toast').className = `toast${error ? ' error' : ''}`; $('toast').hidden = false;
@@ -33,7 +34,7 @@ function navigate(next, updateHash = true) {
   const access = state();
   const previousPage = page;
   page = allowedPage(next, { ...access, model: access.model || currentStatus?.modelApi?.listening === true });
-  if (previousPage === 'proxy' && page !== 'proxy') retireNetworkDiagnostics();
+  if (previousPage === 'proxy' && page !== 'proxy') { retireNetworkDiagnostics(); speedTestView.close(); }
   for (const [key, content] of Object.entries(pages)) {
     $(key).hidden = page !== key;
     for (const button of document.querySelectorAll(`[data-page="${key}"]`)) {
@@ -46,7 +47,7 @@ function navigate(next, updateHash = true) {
 }
 for (const button of document.querySelectorAll('[data-page]')) button.onclick = () => { if (!button.disabled) navigate(button.dataset.page); };
 window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
-window.addEventListener('pagehide', () => channelProbeView.close());
+window.addEventListener('pagehide', () => speedTestView.close());
 
 async function action(route, body, message) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -92,7 +93,7 @@ $('refresh-network').onclick = async () => {
 };
 $('quit-client').onclick = async () => { try { await api('/api/shutdown', {}); toast('客户端已退出，可关闭此页面'); } catch (error) { toast(error.message, true); } };
 
-function renderDevices(container, devices, { selectable = false, empty = '暂无设备' } = {}) {
+function renderDevices(container, devices, { selectable = false, realtime = false, empty = '暂无设备' } = {}) {
   container.replaceChildren();
   if (!devices.length) { const hint = document.createElement('p'); hint.className = 'empty'; hint.textContent = empty; container.append(hint); }
   const ordered = devices.slice().sort((a, b) => Number(Boolean(b.self)) - Number(Boolean(a.self)));
@@ -103,6 +104,7 @@ function renderDevices(container, devices, { selectable = false, empty = '暂无
     const address = document.createElement('code'); address.textContent = device.address || '尚未分配地址';
     const connection = document.createElement('span'); connection.textContent = deviceConnection(device);
     row.append(name, address, connection);
+    if (realtime) { const speed = document.createElement('small'); speed.textContent = proxyRealtimeText(device); row.append(speed); }
     if (selectable && !device.self) {
       const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary'; button.textContent = selectedPeer === device.address ? '已选择' : '选择为 B'; button.disabled = !state().canPair || !device.address;
       button.onclick = () => { selectedPeer = device.address; $('selected-peer').textContent = `已选择 ${device.name || device.address} · ${device.address}，请粘贴该设备的 B 配对码。`; renderNetwork(currentStatus.network); $('invitation').focus(); };
@@ -279,7 +281,7 @@ function renderProxy(proxy = {}, ui = state()) {
   $('proxy-enable').textContent = proxy.enabled ? '关闭本地 Clash 节点' : '启用本地 Clash 节点';
   $('proxy-enable').disabled = actionBusy || proxyBusy || !localAvailable || !ui.proxy || ui.role !== 'client';
   $('proxy-subscription').value = proxy.subscriptionUrl || ''; $('copy-subscription').disabled = actionBusy || proxyBusy || !localAvailable || !proxy.subscriptionUrl;
-  renderDevices($('proxy-device-list'), proxy.devices || [], { empty: '等待本机与已配对 B 的连接状态。' });
+  renderDevices($('proxy-device-list'), proxy.devices || [], { realtime: true, empty: '等待本机与已配对 B 的连接状态。' });
   $('proxy-clients').replaceChildren();
   const clients = proxy.clients || [];
   if (!clients.length) { const hint = document.createElement('p'); hint.className = 'empty'; hint.textContent = '尚无已配对的 A 连接。私网在线设备不等同于共享使用者。'; $('proxy-clients').append(hint); }
@@ -288,7 +290,7 @@ function renderProxy(proxy = {}, ui = state()) {
     const name = document.createElement('strong'); name.textContent = client.name || client.address || '已配对调用端';
     const address = document.createElement('code'); address.textContent = client.address || client.id || '';
     const use = document.createElement('span'); use.textContent = !client.online ? '离线' : client.usingProxy ? `正在使用共享 · ${client.connections || 0} 个连接` : '已配对在线 · 未使用共享';
-    const traffic = document.createElement('small'); traffic.textContent = `上传 ${formatBytes(client.uploadBytes)} · 下载 ${formatBytes(client.downloadBytes)}`;
+    const traffic = document.createElement('small'); traffic.textContent = `${proxyRealtimeText(client)}｜累计上传 ${formatBytes(client.uploadBytes)} · 下载 ${formatBytes(client.downloadBytes)}`;
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
   const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : proxy.connectionLimit === 0 ? '（不设数量上限）' : ''}`;
@@ -314,7 +316,7 @@ function renderDiagnosticsControls() {
   $('network-diagnostics-panel').hidden = !diagnosticsOpen;
   $('network-diagnostics-open').setAttribute('aria-expanded', String(diagnosticsOpen));
   $('network-diagnostics-open').disabled = !localAvailable || !state().proxy;
-  $('network-diagnostics-refresh').disabled = Boolean(diagnosticsRequest) || channelProbeView.busy() || !localAvailable || !state().proxy;
+  $('network-diagnostics-refresh').disabled = Boolean(diagnosticsRequest) || speedTestView.busy() || !localAvailable || !state().proxy;
 }
 function renderDiagnostics(snapshot) {
   const view = networkDiagnosticsView(snapshot);
@@ -343,7 +345,6 @@ function renderDiagnostics(snapshot) {
   }
 }
 function retireNetworkDiagnostics() {
-  channelProbeView.close();
   diagnosticsOpen = false;
   if (diagnosticsTimer !== null) clearInterval(diagnosticsTimer);
   diagnosticsTimer = null;
@@ -351,7 +352,7 @@ function retireNetworkDiagnostics() {
   renderDiagnostics(null); renderDiagnosticsControls();
 }
 async function refreshNetworkDiagnostics() {
-  if (!diagnosticsOpen || diagnosticsRequest || channelProbeView.busy() || !localAvailable || !state().proxy) return;
+  if (!diagnosticsOpen || diagnosticsRequest || speedTestView.busy() || !localAvailable || !state().proxy) return;
   const controller = diagnosticsRequest = new AbortController();
   $('network-diagnostics-status').textContent = '正在更新本机网络诊断…'; renderDiagnosticsControls();
   try {
@@ -366,10 +367,9 @@ async function refreshNetworkDiagnostics() {
 $('network-diagnostics-open').onclick = () => {
   if ($('network-diagnostics-open').disabled || diagnosticsOpen) return;
   diagnosticsOpen = true;
-  void channelProbeView.open();
   renderDiagnostics({ available: false, message: '正在读取本机网络诊断…' });
   const timer = diagnosticsTimer = setInterval(() => {
-    if (diagnosticsTimer === timer) { void channelProbeView.refresh(); return refreshNetworkDiagnostics(); }
+    if (diagnosticsTimer === timer) return refreshNetworkDiagnostics();
   }, 2000);
   return refreshNetworkDiagnostics();
 };
@@ -385,15 +385,15 @@ function render(status) {
     retiredInstances.add(previousInstance);
     if (retiredInstances.size > 8) retiredInstances.delete(retiredInstances.values().next().value);
     ++mutation;
-    retireModelTest(); retireNetworkDiagnostics(); $('probe-result').textContent = '';
+    retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); $('probe-result').textContent = '';
   }
   const previousRole = currentStatus?.identity?.role || currentStatus?.role;
   const previousConnection = currentStatus?.controlConnectionId;
   const wasListening = currentStatus?.modelApi?.listening === true;
   currentStatus = status;
   const ui = state();
-  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); retireNetworkDiagnostics(); $('probe-result').textContent = ''; navigate('connection'); }
-  if (!ui.proxy) retireNetworkDiagnostics();
+  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); $('probe-result').textContent = ''; navigate('connection'); }
+  if (!ui.proxy) { retireNetworkDiagnostics(); speedTestView.close(); }
   else renderDiagnosticsControls();
   for (const key of ['api', 'proxy']) { const button = document.querySelector(`[data-page="${key}"]`); button.disabled = key === 'api' ? !ui.model && status.modelApi?.listening !== true : !ui.proxy; button.title = button.disabled ? '完成设备配对后可用' : ''; }
   if (!ui.model || ui.role !== 'client' || previousConnection !== status.controlConnectionId) retireModelTest();
@@ -403,6 +403,7 @@ function render(status) {
   $('top-dot').classList.toggle('online', Boolean(status.online));
   $('top-status').textContent = !localAvailable ? '本地服务不可用' : status.online ? `${roleName(ui.role)} · ${ui.role === 'host' ? `${status.connectedClients || 0} 个 A 已连接` : 'B 已连接'}` : status.pairing?.message || status.identity?.message || '设备尚未配对';
   $('mode').textContent = status.demo ? 'DEMO / 本机模拟' : 'TAILSCALE MODE'; $('mode').classList.toggle('demo', status.demo);
+  $('speed-test-open').disabled = !localAvailable || !ui.proxy || status.proxy?.speedTest?.connected !== true;
   renderNetwork(status.network); renderIdentity(status, ui); renderModel(status, ui); renderProxy(status.proxy, ui); navigate(page);
   $('logs').replaceChildren();
   for (const log of status.logs || []) { const row = document.createElement('div'); row.className = 'log'; const time = document.createElement('time'); time.textContent = new Date(log.time).toLocaleTimeString('zh-CN', { hour12: false }); const message = document.createElement('span'); message.textContent = log.message; row.append(time, message); $('logs').append(row); }

@@ -5,6 +5,7 @@ import { lookup } from 'node:dns/promises';
 import WebSocket, { WebSocketServer } from 'ws';
 import { digest, equalSecret, randomId } from './crypto.js';
 import { rejectUpgrade } from './http-upgrade.js';
+import { TrafficRates, RATE_WINDOW_MS } from './traffic-rates.js';
 
 const DATA = 1, FIN = 2, DATAGRAM = 3;
 const MAX_FRAME = 128 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
@@ -98,7 +99,8 @@ function udpKey(host, port) { return `${net.isIP(host) === 6 ? ipv6Bytes(host).t
 export class NetworkProxy extends EventEmitter {
   constructor({ bridge, listenPort = 0, username = randomId(12), password = randomId(24), allowPrivateTargets = false,
     maxConnections = 0, maxPerSession = 0, maxUdpTargets = 128, bytesPerSecond = 32 * 1024 * 1024,
-    handshakeMs = 10000, heartbeatMs = 10000, backpressureMs = 120000, udpIdleMs = 60000, resolve = lookup, diagnosticsEnabled = false } = {}) {
+    handshakeMs = 10000, heartbeatMs = 10000, backpressureMs = 120000, udpIdleMs = 60000, resolve = lookup, diagnosticsEnabled = false,
+    now = () => performance.now() } = {}) {
     super();
     if (!bridge) throw new Error('缺少桥接实例');
     if (!Number.isInteger(listenPort) || listenPort < 0 || listenPort > 65535) throw new Error('代理端口无效');
@@ -107,6 +109,7 @@ export class NetworkProxy extends EventEmitter {
     Object.assign(this, { bridge, listenPort, username, password, allowPrivateTargets, maxConnections, maxPerSession, maxUdpTargets, bytesPerSecond, handshakeMs, heartbeatMs, backpressureMs, udpIdleMs, resolve });
     this.enabled = false; this.sharing = false; this.flows = new Set(); this.localSockets = new Set();
     this.sessionBuckets = new WeakMap();
+    this.trafficRates = new TrafficRates({ now });
     this.uploadBytes = 0; this.downloadBytes = 0; this.error = null; this.lastError = null;
     this.diagnosticsEnabled = diagnosticsEnabled === true;
     this.diagnosticSequence = 0; this.diagnosticClosed = [];
@@ -135,18 +138,34 @@ export class NetworkProxy extends EventEmitter {
   status() {
     const peer = this.bridge.peer;
     const available = Boolean(peer?.role === 'client' && peer.state.online && this.bridge.remoteSharing !== false);
-    const clients = peer?.role === 'host' ? [...peer.connections].filter((connection) => peer.isConnected(connection)).map((connection) => {
+    const connected = (connection) => typeof peer?.isConnected === 'function' && peer.isConnected(connection);
+    const currentConnections = peer?.role === 'host' ? [...peer.connections].filter(connected)
+      : peer?.role === 'client' && connected(peer.clientConnection) ? [peer.clientConnection] : [];
+    const rates = this.trafficRates.sample(currentConnections);
+    const latency = (connection) => {
+      const age = rates.at - connection.latencyAt;
+      const lifetime = Math.max(3 * (Number.isFinite(peer.heartbeatMs) && peer.heartbeatMs > 0 ? peer.heartbeatMs : 10000), 30000);
+      return rates.at !== null && typeof connection.latencyMs === 'number' && Number.isFinite(connection.latencyMs) && connection.latencyMs >= 0 &&
+        typeof connection.latencyAt === 'number' && Number.isFinite(connection.latencyAt) && age >= 0 && age <= lifetime ? connection.latencyMs : null;
+    };
+    const clients = peer?.role === 'host' ? currentConnections.map((connection) => {
       const connections = [...this.flows].filter((flow) => !flow.dead && flow.connection === connection).length;
       return { id: connection.id, name: connection.device?.name || '调用端', address: connection.device?.address || '',
         role: 'client', online: true, paired: true, usingProxy: connections > 0, connections,
-        uploadBytes: connection.proxyUploadBytes || 0, downloadBytes: connection.proxyDownloadBytes || 0 };
+        uploadBytes: connection.proxyUploadBytes || 0, downloadBytes: connection.proxyDownloadBytes || 0,
+        ...rates.values.get(connection), latencyMs: latency(connection) };
     }) : [];
+    const totals = currentConnections.length ? currentConnections.reduce((sum, connection) => {
+      const rate = rates.values.get(connection);
+      sum.uploadBytesPerSecond += rate.uploadBytesPerSecond; sum.downloadBytesPerSecond += rate.downloadBytesPerSecond; return sum;
+    }, { uploadBytesPerSecond: 0, downloadBytesPerSecond: 0 }) : { uploadBytesPerSecond: null, downloadBytesPerSecond: null };
     return { enabled: this.enabled, sharing: this.sharing, listening: Boolean(this.server?.listening), listenPort: this.port || this.listenPort,
       username: this.username, password: this.password, online: available,
       blocked: Boolean(this.enabled && !available), connections: this.flows.size,
       connectionLimit: peer?.role === 'client' ? connectionLimit(this.maxConnections, this.maxPerSession) : this.maxConnections,
       sessionConnectionLimit: this.maxPerSession, lastError: this.lastError,
-      uploadBytes: this.uploadBytes, downloadBytes: this.downloadBytes, clients, error: this.error };
+      uploadBytes: this.uploadBytes, downloadBytes: this.downloadBytes, ...totals, rateWindowMs: RATE_WINDOW_MS,
+      latencyMs: peer?.role === 'client' && currentConnections.length ? latency(currentConnections[0]) : null, clients, error: this.error };
   }
   // Only explicitly enabled TCP flows are observed. Never serialize status(),
   // flow, socket, errors or payloads: all of those can contain private details.
@@ -325,6 +344,7 @@ export class NetworkProxy extends EventEmitter {
     if (flow.bucketBytes > this.bytesPerSecond || bucket.bytes > this.bytesPerSecond || flow.ws.bufferedAmount > MAX_BUFFER) { flow.close(); return false; }
     if (outgoing) this.uploadBytes += bytes; else this.downloadBytes += bytes;
     if (flow.connection) {
+      this.trafficRates.record(flow.connection, bytes, outgoing);
       const key = outgoing ? 'proxyUploadBytes' : 'proxyDownloadBytes';
       flow.connection[key] = (flow.connection[key] || 0) + bytes;
     }
@@ -639,7 +659,8 @@ export class NetworkProxy extends EventEmitter {
   async close() {
     if (this.closing) return this.closing;
     this.bridge.channelRecovery?.close();
-    this.bridge.channelProbe?.close();
+    this.bridge.channelSpeed?.close();
+    this.bridge.speedTransport?.close();
     this.closed = true; this.bridge.off?.('state', this.onPeerState);
     for (const flow of this.flows) flow.close();
     for (const socket of this.localSockets) socket.destroy();
