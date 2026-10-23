@@ -58,7 +58,7 @@ export class ChannelSpeed {
     if (this.closed) return 'closed';
     if (b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging || b.intentOnline === false || b.pairingInvalid) return 'network-stopped';
     if (b.pending?.size || b.active?.size || b.queue?.length) return 'model-busy';
-    if (b.channelRecovery?.refreshing === true) return 'recovery-busy';
+    if (b.channelRefreshActive || b.channelRecovery?.refreshing === true) return 'recovery-busy';
     if (adapter?.embedded && (adapter.closed || adapter.wantRunning !== true || !adapter.child?.stdin?.writable || !adapter.initialized?.has(adapter.child))) return 'helper-unavailable';
     return 'ready';
   }

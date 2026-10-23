@@ -132,6 +132,18 @@ def request(base, route, body=None, token=None):
         return json.load(response)
 
 
+
+def lifecycle_rows(name, component="desktop"):
+    folder = directory / name / "diagnostics/lifecycle"
+    return [json.loads(line) for suffix in (".2", ".1", "")
+            if (file := folder / (component + ".jsonl" + suffix)).exists()
+            for line in file.read_text(encoding="utf-8").splitlines() if line]
+
+
+def lifecycle_state(name):
+    return json.loads((directory / name / "diagnostics/lifecycle/desktop-state.json").read_text(encoding="utf-8"))
+
+
 def start(name, demo=False, port=None, poll_interval=0.1, wait_identity=True, desktop_mode=False):
     if port is None:
         port = available_port_pair()
@@ -274,7 +286,11 @@ try:
                                   env=env, timeout=15)
     assert failed_start.returncode == 1, "Late UI creation failure was not reported"
     assert failed_ini.read_bytes() == saved_ini, "Failed desktop startup overwrote settings before loading them"
-    assert list(failed_profile.iterdir()) == [failed_ini], "Failed UI initialization started the background engine"
+    assert {item.name for item in failed_profile.iterdir()} == {"desktop.ini", "diagnostics"}, "Failed UI initialization started the background engine"
+    failed_lifecycle = failed_profile / "diagnostics/lifecycle"
+    failed_state = json.loads((failed_lifecycle / "desktop-state.json").read_text(encoding="utf-8"))
+    assert failed_state["completed"] and failed_state["reason"] == "startup-failure" and failed_state["exitCode"] == 1, failed_state
+    assert not (failed_lifecycle / "engine.jsonl").exists(), "Failed UI startup launched an engine"
     print("PASS: a late native UI creation failure preserves existing desktop settings and starts no engine.", flush=True)
     desktop = build_fixture(name=desktop_namespace, output_directory=directory / "desktop-fixture")
     legacy_engine = directory / "embedded/engine" / version / "bridge-engine.exe"
@@ -297,7 +313,12 @@ try:
     assert request(base, "/api/bootstrap")["token"] == token
     assert not (directory / "duplicate").exists(), "Second launch wrote a profile before taking the user-wide single-instance lock"
     request(base, "/api/shutdown", {}, token)
-    processes[-1].wait(timeout=15)
+    assert processes[-1].wait(timeout=15) == 0
+    assert lifecycle_state("embedded")["completed"] and lifecycle_state("embedded")["reason"] == "engine-exited"
+    assert any(row["event"] == "shutdown-requested" and row.get("reason") == "api-shutdown"
+               for row in lifecycle_rows("embedded", "runtime")), "API exit source was not persisted"
+    session_ids = {row["sessionId"] for component in ("desktop", "engine", "runtime") for row in lifecycle_rows("embedded", component)}
+    assert len(session_ids) == 1, "Desktop, engine and runtime did not share their launch session"
     # Only the namespaced desktop/PID launched here is controlled. Demo mode
     # unlocks the proxy page without Tailscale login, internet or Claude calls.
     diagnostics_base, diagnostics_token = start("diagnostics-ui", demo=True, desktop_mode=True)
@@ -305,7 +326,11 @@ try:
     connect_identity(diagnostics_base, diagnostics_token, "host")
     diagnostics_host = request(diagnostics_base, "/api/host", {"tailscaleIp": "127.0.0.1", "bridgePort": 0}, diagnostics_token)
     main_window = wait_ui(diagnostics_process, lambda: fixture_window(diagnostics_process, desktop_class), "namespaced desktop window")
+    fixture_message(diagnostics_process, main_window, 0x0010)  # WM_CLOSE only hides to tray.
+    assert diagnostics_process.poll() is None and not lifecycle_state("diagnostics-ui")["completed"], "Window close was recorded as process exit"
     user32.ShowWindow(owned_fixture_window(diagnostics_process, main_window), 4)  # SW_SHOWNOACTIVATE
+    click_fixture(diagnostics_process, main_window, 104)  # NAV_SETTINGS
+    assert user32.IsWindowVisible(fixture_control(diagnostics_process, main_window, 291)), "Exit log folder control missing"
     wait_ui(diagnostics_process, lambda: user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 103)), "proxy page authorization")
     click_fixture(diagnostics_process, main_window, 103)  # NAV_PROXY
     click_fixture(diagnostics_process, main_window, 240)  # NETWORK_DIAGNOSTICS
@@ -335,6 +360,7 @@ try:
     # Only this namespaced test desktop is operated; the user's real B is not
     # activated or stopped. The dedicated speed window must require a peer,
     # explicit B target selection and an explicit start.
+    assert not user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 290)), "Demo must never refresh a real transport"
     assert not user32.IsWindowEnabled(fixture_control(diagnostics_process, main_window, 260))
     speed_base, speed_token = start("speed-caller", demo=True)
     speed_process = processes[-1]
@@ -363,6 +389,46 @@ try:
     stop(diagnostics_base, diagnostics_token, diagnostics_process)
     assert diagnostics_process.returncode == 0, "Exiting with a diagnostics window failed"
     print("PASS: namespaced desktop diagnostics shows unavailable counters, updates capture time automatically, supports manual refresh, stays closed across its refresh interval and exits cleanly.", flush=True)
+    tray_base, tray_token = start("lifecycle-tray", demo=True, desktop_mode=True)
+    tray_process = processes[-1]
+    tray_window = wait_ui(tray_process, lambda: fixture_window(tray_process, desktop_class), "tray exit fixture")
+    fixture_message(tray_process, tray_window, 0x0111, 202)  # TRAY_EXIT menu command.
+    assert tray_process.wait(timeout=15) == 0
+    assert lifecycle_state("lifecycle-tray")["reason"] == "tray-exit" and lifecycle_state("lifecycle-tray")["completed"]
+    assert any(row["event"] == "exit-requested" and row.get("reason") == "tray-exit"
+               for row in lifecycle_rows("lifecycle-tray"))
+
+    fault_base, fault_token = start("lifecycle-engine-exit", demo=True, desktop_mode=True)
+    fault_process = processes[-1]
+    fault_pid = request(fault_base, "/health")["parentPid"]
+    fault_engine = kernel32.OpenProcess(0x00100001, False, fault_pid)  # Only our fixture's child.
+    if not fault_engine:
+        raise ctypes.WinError(ctypes.get_last_error())
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    try:
+        assert kernel32.TerminateProcess(fault_engine, 23)
+        assert fault_process.wait(timeout=15) == 1, "Background failure became a successful desktop exit"
+    finally:
+        kernel32.CloseHandle(fault_engine)
+    assert any(row["event"] == "engine-exited" and row.get("exitCode") == 23 and not row.get("expected")
+               for row in lifecycle_rows("lifecycle-engine-exit")), "Actual engine code was lost"
+    assert lifecycle_state("lifecycle-engine-exit")["completed"]
+
+    abrupt_base, abrupt_token = start("lifecycle-abrupt", demo=True, desktop_mode=True)
+    abrupt_process = processes[-1]
+    abrupt_session = lifecycle_state("lifecycle-abrupt")["sessionId"]
+    abrupt_process.kill()
+    abrupt_process.wait(timeout=10)
+    assert not lifecycle_state("lifecycle-abrupt")["completed"]
+    resumed_base, resumed_token = start("lifecycle-abrupt", demo=True, desktop_mode=True, port=model_port(abrupt_base))
+    resumed_process = processes[-1]
+    assert any(row["event"] == "previous-session-incomplete" and row.get("previousSessionId") == abrupt_session
+               and row.get("reason") == "no-completion-record" for row in lifecycle_rows("lifecycle-abrupt"))
+    stop(resumed_base, resumed_token, resumed_process)
+    assert lifecycle_state("lifecycle-abrupt")["completed"]
+    print("PASS: packaged lifecycle logs correlate processes, preserve API/tray/engine exit causes, keep window-close running, and detect an interrupted session on next launch.", flush=True)
+
     # Reuse the extracted runtime and shut down as soon as its API appears,
     # before the native desktop necessarily finishes its own bootstrap poll.
     for _ in range(3):
@@ -370,6 +436,9 @@ try:
         quick_process = processes[-1]
         request(quick_base, "/api/shutdown", {}, quick_token)
         assert quick_process.wait(timeout=5) == 0, "A graceful early shutdown returned a failure"
+        assert lifecycle_state("embedded")["completed"] and lifecycle_state("embedded")["exitCode"] == 0
+        assert any(row["event"] == "shutdown-requested" and row.get("reason") == "api-shutdown"
+                   for row in lifecycle_rows("embedded", "runtime"))
         wait_stopped(quick_base)
     print("PASS: three cached starts exit promptly when API shutdown races native desktop initialization.", flush=True)
     # Killing the desktop must close its Windows job, including the local API and network helper.

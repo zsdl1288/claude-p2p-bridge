@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { once } from 'node:events';
 import { Bridge } from '../src/bridge.js';
+import { ChannelRecovery } from '../src/channel-recovery.js';
 import { BridgePeer } from '../src/peer.js';
 import { parseInvitation } from '../src/crypto.js';
 import { randomUUID } from 'node:crypto';
@@ -52,6 +53,75 @@ for (const initiator of ['host', 'client']) test(`a real ${initiator}-initiated 
   assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model);
   assert.equal(host.invitation, invitation);
   await echo('after-speed');
+});
+
+test('B refreshes only its explicitly selected A while both proxy flows and model sessions stay paired', { timeout: 10000 }, async (t) => {
+  const { host, client, invitation } = await setup(t);
+  const firstTarget = host.channelRefresh.status().targets[0].id;
+  const other = new Bridge({ demo: true });
+  t.after(async () => { await other.disconnect(); await other.networkProxy.close(); });
+  await other.join({ invitation });
+  await other.networkProxy.start(); other.networkProxy.configure({ enabled: true });
+  await until(() => other.remoteSharing === true);
+  const echo = await flow(t, client), otherEcho = await flow(t, other);
+  await echo('before-refresh'); await otherEcho('other-before-refresh');
+  const control = client.peer.session, model = client.modelPeer.session, otherControl = other.peer.session;
+  const counts = new Map();
+  for (const bridge of [host, client, other]) {
+    const child = { stdin: { writable: true } };
+    counts.set(bridge, 0); bridge.demo = false;
+    bridge.networkAdapter = { embedded: true, wantRunning: true, child, initialized: new Set([child]),
+      async diagnostics() { return { available: false }; },
+      async refreshTransport() { counts.set(bridge, counts.get(bridge) + 1); return { refreshed: true, reason: 'refreshed' }; },
+      async channelProbe(params, captured) {
+        assert.equal(captured, child); assert.equal(params.host, bridge.peer.pairing.host);
+        return { outcome: 'reply', actualVia: counts.get(bridge) ? 'direct' : 'derp', latencySeconds: counts.get(bridge) ? 0.04 : 0.15,
+          ...(counts.get(bridge) ? {} : { derpRegionId: 3 }) };
+      },
+    };
+  }
+  assert.equal(host.channelRefresh.status().available, true);
+  const job = host.channelRefresh.start({ targetId: firstTarget });
+  await until(() => !host.channelRefresh.status().busy && !client.channelRefresh.status().busy);
+  assert.equal(host.channelRefresh.status().job.id, job.id);
+  assert.equal(host.channelRefresh.status().job.state, 'completed');
+  assert.deepEqual(host.channelRefresh.status().job.result, client.channelRefresh.status().job.result);
+  assert.equal(counts.get(client), 1); assert.equal(counts.get(other), 0); assert.equal(counts.get(host), 0);
+  assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model); assert.equal(other.peer.session, otherControl);
+  assert.equal(host.invitation, invitation);
+  await echo('after-refresh'); await otherEcho('other-after-refresh');
+});
+
+test('authenticated backlog hints only suggest a refresh until A explicitly requests it', { timeout: 10000 }, async (t) => {
+  const { host, client, invitation } = await setup(t);
+  const echo = await flow(t, client); await echo('before-suggestion');
+  const control = client.peer.session, model = client.modelPeer.session;
+  let now = 0, refreshes = 0, probes = 0;
+  const child = { stdin: { writable: true } };
+  client.channelRecovery.close(); client.demo = false;
+  client.networkAdapter = { embedded: true, wantRunning: true, child, initialized: new Set([child]),
+    async diagnostics() { return { available: true, netstack: { counter_tcp_timeouts: 0, counter_tcp_retransmits: 0 } }; },
+    async refreshTransport() { refreshes++; return { refreshed: true, reason: 'refreshed' }; },
+    async channelProbe() { probes++; return { outcome: 'reply', actualVia: 'direct', latencySeconds: 0.04 }; } };
+  client.channelRecovery = new ChannelRecovery({ bridge: client, now: () => now });
+  const connection = [...host.peer.connections][0];
+  for (let i = 0; i < 2; i++) {
+    const id = randomUUID();
+    assert.equal(host.peer.trySendHealthHint({ type: 'proxy-health', id, v: 1, windowMs: 30000, blockedFlows: 1,
+      pendingBytes: 65536, oldestPendingMs: 10000, completedBytes: 0, tcpTimeouts: 3, tcpRetransmits: 32 }, connection), true);
+    await until(() => client.channelRecovery.hint?.id === id); await client.channelRecovery.tick(); now += 5000;
+  }
+  assert.equal(client.channelRecovery.status().notice.phase, 'suggested');
+  assert.equal(refreshes, 0); assert.equal(probes, 0, 'Background suggestions generate no active path probe');
+  assert.equal(client.channelRecovery.status().attemptsInWindow, 0);
+  await echo('while-suggesting');
+  const job = client.channelRefresh.start({ targetId: client.channelRefresh.status().targets[0].id });
+  await until(() => !client.channelRefresh.status().busy);
+  assert.equal(client.channelRefresh.status().job.id, job.id); assert.equal(client.channelRefresh.status().job.state, 'completed');
+  assert.equal(refreshes, 1); assert.equal(probes, 2, 'Before/after probes happen only after the explicit manual request');
+  assert.equal(client.channelRecovery.status().notice, null);
+  assert.equal(client.peer.session, control); assert.equal(client.modelPeer.session, model); assert.equal(host.invitation, invitation);
+  await echo('after-requested-refresh');
 });
 
 test('cancelling an A speed test releases only its speed connection and preserves the pairing', { timeout: 10000 }, async (t) => {

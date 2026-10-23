@@ -205,6 +205,7 @@ export class PersistentBridge extends Bridge {
   }
   close() {
     this.closing = true; this.cancelRestore();
+    this.channelRefresh.close();
     this.channelSpeed.close();
     this.speedTransport.close();
     this.channelRecovery.close();

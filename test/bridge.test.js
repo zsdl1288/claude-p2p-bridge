@@ -45,6 +45,7 @@ test('channel monitoring follows peer lifecycle without leaving timers or resett
   await bridge.host({ tailscaleIp: '127.0.0.1', bridgePort: 0 });
   assert.equal(timers.size, 1); assert.equal(bridge.channelRecovery.status().attemptsInWindow, 1);
   assert.equal(first.channelRecovery.enabled, false, 'Loopback demo never enables transport refresh');
+  assert.equal(first.channelRecovery.mode, 'notify', 'The application defaults to user-controlled refresh suggestions');
   await bridge.networkProxy.close(); assert.equal(timers.size, 0);
   bridge.channelRecovery.start(); assert.equal(timers.size, 0, 'A closed application cannot restart monitoring');
 });

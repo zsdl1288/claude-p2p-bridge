@@ -1,6 +1,8 @@
 import { pages, uiState, allowedPage, deviceIdentity, deviceConnection } from './ui-state.js';
 import { networkDiagnosticsView } from './network-diagnostics.js';
 import { createSpeedTestView } from './speed-test.js';
+import { createChannelRefreshView } from './channel-refresh.js';
+import { channelRecoveryText } from './channel-recovery.js';
 import { proxyRealtimeText } from './proxy-metrics.js';
 
 const $ = (id) => document.getElementById(id);
@@ -12,6 +14,21 @@ const retiredInstances = new Set();
 const roleName = (role) => role === 'host' ? 'B · 服务端' : role === 'client' ? 'A · 调用端' : '尚未选择身份';
 const state = () => uiState(currentStatus, actionBusy || proxyBusy || !localAvailable);
 const speedTestView = createSpeedTestView({ api, $, available: () => localAvailable && state().proxy, toast });
+const channelRefreshView = createChannelRefreshView({ api: refreshChannelApi, $,
+  available: () => localAvailable && !actionBusy && !proxyBusy && state().proxy && !speedTestView.busy(), toast });
+
+async function refreshChannelApi(route, body, signal, keepalive) {
+  ++mutation;
+  try {
+    const value = await (await api(route, body, signal, keepalive)).json();
+    return { json: async () => value };
+  } finally { ++mutation; }
+}
+function renderChannelRefresh() {
+  const role = currentStatus?.identity?.role || currentStatus?.role;
+  channelRefreshView.update(currentStatus?.proxy?.channelRefresh, { role, visible: page === 'proxy',
+    scope: JSON.stringify([currentStatus?.instanceId || '', role || '', currentStatus?.controlConnectionId || '']) });
+}
 
 function toast(message, error = false) {
   $('toast').textContent = message; $('toast').className = `toast${error ? ' error' : ''}`; $('toast').hidden = false;
@@ -34,7 +51,7 @@ function navigate(next, updateHash = true) {
   const access = state();
   const previousPage = page;
   page = allowedPage(next, { ...access, model: access.model || currentStatus?.modelApi?.listening === true });
-  if (previousPage === 'proxy' && page !== 'proxy') { retireNetworkDiagnostics(); speedTestView.close(); }
+  if (previousPage === 'proxy' && page !== 'proxy') { retireNetworkDiagnostics(); speedTestView.close(); channelRefreshView.retire(); }
   for (const [key, content] of Object.entries(pages)) {
     $(key).hidden = page !== key;
     for (const button of document.querySelectorAll(`[data-page="${key}"]`)) {
@@ -44,10 +61,11 @@ function navigate(next, updateHash = true) {
     if (key === page) { $('page-title').textContent = content.title; $('page-description').textContent = content.description; $('breadcrumb-page').textContent = content.title; }
   }
   if (updateHash && location.hash !== `#${page}`) history.replaceState(null, '', `#${page}`);
+  renderChannelRefresh();
 }
 for (const button of document.querySelectorAll('[data-page]')) button.onclick = () => { if (!button.disabled) navigate(button.dataset.page); };
 window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
-window.addEventListener('pagehide', () => speedTestView.close());
+window.addEventListener('pagehide', () => { speedTestView.close(); channelRefreshView.retire(); });
 
 async function action(route, body, message) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -294,7 +312,8 @@ function renderProxy(proxy = {}, ui = state()) {
     row.append(name, address, use, traffic); $('proxy-clients').append(row);
   }
   const connections = `${proxy.connections || 0}${Number.isSafeInteger(proxy.connectionLimit) && proxy.connectionLimit > 0 ? ` / ${proxy.connectionLimit}` : proxy.connectionLimit === 0 ? '（不设数量上限）' : ''}`;
-  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}${proxy.recoveryMessage ? ` · ${proxy.recoveryMessage}` : ''}`;
+  $('proxy-detail').textContent = `${host ? '共享出口' : '本地节点'} · 活跃连接 ${connections} · 上传 ${formatBytes(proxy.uploadBytes)} · 下载 ${formatBytes(proxy.downloadBytes)}`;
+  $('channel-recovery-status').textContent = channelRecoveryText(proxy, ui.role, { available: localAvailable });
 }
 async function proxyAction(route, body) {
   if (actionBusy || proxyBusy || !localAvailable) return;
@@ -385,15 +404,15 @@ function render(status) {
     retiredInstances.add(previousInstance);
     if (retiredInstances.size > 8) retiredInstances.delete(retiredInstances.values().next().value);
     ++mutation;
-    retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); $('probe-result').textContent = '';
+    retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); channelRefreshView.retire(); $('probe-result').textContent = '';
   }
   const previousRole = currentStatus?.identity?.role || currentStatus?.role;
   const previousConnection = currentStatus?.controlConnectionId;
   const wasListening = currentStatus?.modelApi?.listening === true;
   currentStatus = status;
   const ui = state();
-  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); $('probe-result').textContent = ''; navigate('connection'); }
-  if (!ui.proxy) { retireNetworkDiagnostics(); speedTestView.close(); }
+  if (previousRole && previousRole !== ui.role) { ++mutation; selectedPeer = null; $('invitation').value = ''; lastConfig = undefined; retireModelTest(); retireNetworkDiagnostics(); speedTestView.close(); channelRefreshView.retire(); $('probe-result').textContent = ''; navigate('connection'); }
+  if (!ui.proxy) { retireNetworkDiagnostics(); speedTestView.close(); channelRefreshView.retire(); }
   else renderDiagnosticsControls();
   for (const key of ['api', 'proxy']) { const button = document.querySelector(`[data-page="${key}"]`); button.disabled = key === 'api' ? !ui.model && status.modelApi?.listening !== true : !ui.proxy; button.title = button.disabled ? '完成设备配对后可用' : ''; }
   if (!ui.model || ui.role !== 'client' || previousConnection !== status.controlConnectionId) retireModelTest();

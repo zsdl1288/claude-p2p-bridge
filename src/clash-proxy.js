@@ -103,12 +103,13 @@ export class ClashProxy {
     if (this.error) { phase = enabled ? 'blocked' : 'disabled'; message = this.error; }
     if (online && phase === 'ready' && state.lastError?.code === 'PROXY_CAPACITY') message = '代理连接数已达上限，请等待空闲连接释放后重试';
     const channelRecovery = this.bridge.channelRecovery?.status();
-    const recoveryLabels = { monitoring: role === 'host' ? '通道健康监测中' : 'Bridge 自动恢复：监测中', refreshing: 'Bridge 通道刷新中',
-      cooldown: 'Bridge 自动恢复：冷却中', 'budget-exhausted': 'Bridge 自动恢复：等待额度恢复', waiting: 'Bridge 自动恢复：等待连接或任务空闲' };
+    const recoveryLabels = { monitoring: role === 'host' ? '通道健康监测中' : channelRecovery?.mode === 'notify' ? '通道持续受阻时仅提示，由你点击刷新' : 'Bridge 自动恢复：监测中', refreshing: 'Bridge 通道刷新中',
+      cooldown: '线路刷新：冷却中', 'budget-exhausted': '线路刷新：等待额度恢复', waiting: '通道监测：等待连接或任务空闲' };
     const recoveryMessage = channelRecovery?.enabled ? recoveryLabels[channelRecovery.state] || '' : '';
     const subscriptionUrl = enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}/config.yaml` : '';
     return { enabled, sharing, online, state: phase, message, port: state.listenPort, channelRecovery, recoveryMessage,
       speedTest: this.bridge.channelSpeed?.status(),
+      channelRefresh: this.bridge.channelRefresh?.status(),
       connections: state.connections, uploadBytes: state.uploadBytes, downloadBytes: state.downloadBytes,
       uploadBytesPerSecond: state.uploadBytesPerSecond, downloadBytesPerSecond: state.downloadBytesPerSecond,
       latencyMs: state.latencyMs, rateWindowMs: state.rateWindowMs,

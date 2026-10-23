@@ -5,16 +5,19 @@ import { hostname } from 'node:os';
 import { consumeLines } from './line-stream.js';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
+import { createLifecycleLog } from './lifecycle-log.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 
 export class EmbeddedNetwork extends EventEmitter {
-  constructor({ directory, command = process.env.BRIDGE_NET_HELPER || path.join(root, 'bin', process.platform === 'win32' ? 'bridge-net.exe' : 'bridge-net'), args = process.env.BRIDGE_NET_HELPER_ARGS ? JSON.parse(process.env.BRIDGE_NET_HELPER_ARGS) : [], requestTimeoutMs = 25000, shutdownTimeoutMs = 3000 } = {}) {
+  constructor({ directory, command = process.env.BRIDGE_NET_HELPER || path.join(root, 'bin', process.platform === 'win32' ? 'bridge-net.exe' : 'bridge-net'), args = process.env.BRIDGE_NET_HELPER_ARGS ? JSON.parse(process.env.BRIDGE_NET_HELPER_ARGS) : [], requestTimeoutMs = 25000, shutdownTimeoutMs = 3000, lifecycleLog } = {}) {
     super();
     this.directory = path.resolve(directory || '.bridge', 'tailscale');
     this.hostname = `bridge-${hostname()}`;
     this.command = command; this.args = args; this.pending = new Map(); this.sequence = 0; this.embedded = true;
     this.resources = new WeakMap();
+    this.lifecycleLog = lifecycleLog || createLifecycleLog({ directory });
+    this.childLifecycle = new WeakMap();
     this.initialized = new WeakSet();
     this.requestTimeoutMs = requestTimeoutMs; this.shutdownTimeoutMs = shutdownTimeoutMs;
   }
@@ -27,34 +30,49 @@ export class EmbeddedNetwork extends EventEmitter {
     return this.starting;
   }
   async launch() {
-    await access(this.command);
+    try { await access(this.command); }
+    catch (error) { this.lifecycleLog.write('helper-launch-failed', { reason: 'helper-missing', error }); throw error; }
     // close() can run while the filesystem check is in flight.
     if (this.closed) throw new Error('内置组网已关闭');
-    const env = { ...process.env };
+    const env = { ...process.env, BRIDGE_LIFECYCLE_SESSION: this.lifecycleLog.sessionId };
     for (const key of ['TS_AUTHKEY', 'TS_AUTH_KEY', 'TS_CLIENT_SECRET']) delete env[key];
     // The underlay must bootstrap without the proxy it is carrying.
     for (const key of Object.keys(env)) if (/^(all|https?|no)_proxy$/i.test(key)) delete env[key];
     delete env.TS_BIND_TO_INTERFACE_BY_ROUTE;
-    const child = this.child = spawn(this.command, this.args, { windowsHide: true, shell: false, env, stdio: ['pipe', 'pipe', 'pipe'] });
-    consumeLines(child.stdout, { maxBytes: 2 * 1024 * 1024, onError: (error) => this.invalidate(child, error), onLine: (line) => {
+    if (this.hasLaunched) this.lifecycleLog.write('helper-restart', { reason: 'retry-after-retirement' });
+    let child;
+    try { child = this.child = spawn(this.command, this.args, { windowsHide: true, shell: false, env, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (error) { this.lifecycleLog.write('helper-launch-failed', { reason: 'process-error', error }); throw error; }
+    this.hasLaunched = true;
+    this.childLifecycle.set(child, { ownerRequested: false, retired: false });
+    this.lifecycleLog.write('helper-launch', { childPid: child.pid, ownerRequested: false });
+    consumeLines(child.stdout, { maxBytes: 2 * 1024 * 1024, onError: (error) => this.invalidate(child, error, 'stdout-error'), onLine: (line) => {
       try {
         const message = JSON.parse(line); const pending = this.pending.get(message.id);
         if (!pending || pending.child !== child) return;
         this.pending.delete(message.id); clearTimeout(pending.timer);
         if (message.error) pending.reject(new Error(`内置组网：${message.error}`)); else pending.resolve(message.result);
-      } catch (error) { this.invalidate(child, error); }
+      } catch (error) { this.invalidate(child, error, 'protocol-error'); }
     } });
     child.stderr.on('data', () => {});
-    child.stdin.on('error', (error) => this.invalidate(child, error));
-    child.on('error', (error) => this.invalidate(child, error));
-    child.on('exit', () => this.invalidate(child, new Error('内置组网进程已退出，将在下次连接时重试')));
+    child.stdin.on('error', (error) => this.invalidate(child, error, 'stdin-error'));
+    child.on('error', (error) => {
+      this.lifecycleLog.write('helper-error', { childPid: child.pid, reason: 'process-error', ownerRequested: this.childLifecycle.get(child)?.ownerRequested === true, error });
+      this.invalidate(child, error, 'process-error');
+    });
+    child.on('exit', (code, signal) => {
+      const state = this.childLifecycle.get(child);
+      this.lifecycleLog.write('helper-exit', { childPid: child.pid, code, signal, reason: state?.reason || 'child-exit', ownerRequested: state?.ownerRequested === true });
+      this.invalidate(child, new Error('内置组网进程已退出，将在下次连接时重试'), 'child-exit');
+    });
     try {
       await this.request('init', { stateDir: this.directory, hostname: this.hostname }, child);
       this.initialized.add(child);
+      this.lifecycleLog.write('helper-ready', { childPid: child.pid });
       if (this.wantRunning) await this.request('connect', {}, child);
       return child;
     } catch (error) {
-      this.invalidate(child, error);
+      this.invalidate(child, error, 'init-failed');
       throw error;
     }
   }
@@ -64,7 +82,13 @@ export class EmbeddedNetwork extends EventEmitter {
       clearTimeout(pending.timer); this.pending.delete(id); pending.reject(error);
     }
   }
-  invalidate(child, error) {
+  invalidate(child, error, reason = 'unknown') {
+    const state = this.childLifecycle.get(child);
+    if (!state?.retired) {
+      const ownerRequested = reason !== 'child-exit';
+      if (state) { state.retired = true; state.ownerRequested ||= ownerRequested; state.reason ||= reason; }
+      this.lifecycleLog.write('helper-retired', { childPid: child.pid, reason: state?.reason || reason, ownerRequested: state?.ownerRequested ?? ownerRequested, error });
+    }
     this.fail(error, child); child.kill();
     if (this.child === child) {
       this.child = null; this.starting = null;
@@ -77,8 +101,11 @@ export class EmbeddedNetwork extends EventEmitter {
       const id = ++this.sequence;
       const line = `${JSON.stringify({ id, method, params })}\n`;
       const nonfatal = method === 'diagnostics' || method === 'refresh-transport' || method === 'channel-probe';
-      const fail = (error) => {
-        if (!nonfatal) return this.invalidate(child, error);
+      const fail = (error, reason = 'request-write') => {
+        if (!nonfatal) {
+          if (reason === 'request-timeout') this.lifecycleLog.write('helper-timeout-kill', { childPid: child.pid, reason, ownerRequested: true });
+          return this.invalidate(child, error, reason);
+        }
         // A failed maintenance request must not revoke this helper's live transports.
         if (!this.pending.delete(id)) return;
         clearTimeout(timer); reject(error);
@@ -86,7 +113,7 @@ export class EmbeddedNetwork extends EventEmitter {
       const timer = setTimeout(() => {
         // A timed-out listen/dial may still allocate a proxy. Reset its owner
         // so those resources cannot survive without a corresponding JS handle.
-        fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : method === 'refresh-transport' ? '内置组网通道刷新响应超时' : method === 'channel-probe' ? '内置组网探针响应超时' : '内置组网响应超时，将在下次连接时重试'));
+        fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : method === 'refresh-transport' ? '内置组网通道刷新响应超时' : method === 'channel-probe' ? '内置组网探针响应超时' : '内置组网响应超时，将在下次连接时重试'), 'request-timeout');
       }, method === 'channel-probe' ? Math.min(this.requestTimeoutMs, 4000) : method === 'refresh-transport' ? Math.min(this.requestTimeoutMs, 5000) : this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer, child });
       try { child.stdin.write(line, (error) => { if (error) fail(error); }); }
@@ -179,9 +206,12 @@ export class EmbeddedNetwork extends EventEmitter {
     this.closed = true;
     if (this.closing) return this.closing;
     const child = this.child; if (!child) return;
+    const state = this.childLifecycle.get(child);
+    if (state) { state.ownerRequested = true; state.reason ||= 'owner-close'; }
+    this.lifecycleLog.write('helper-stop-requested', { childPid: child.pid, reason: 'owner-close', ownerRequested: true });
     this.fail(new Error('组网正在关闭'));
     this.closing = new Promise((resolve) => {
-      const timer = setTimeout(() => { child.kill(); resolve(); }, this.shutdownTimeoutMs);
+      const timer = setTimeout(() => { this.lifecycleLog.write('helper-timeout-kill', { childPid: child.pid, reason: 'shutdown-timeout', ownerRequested: true }); child.kill(); resolve(); }, this.shutdownTimeoutMs);
       child.once('close', () => { clearTimeout(timer); resolve(); }); child.stdin.end();
     });
     await this.closing;

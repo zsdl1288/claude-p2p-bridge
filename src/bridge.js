@@ -8,6 +8,7 @@ import { runClaude, validateRequest, probeClaude } from './runner.js';
 import { NetworkProxy } from './network-proxy.js';
 import { ChannelRecovery } from './channel-recovery.js';
 import { ChannelSpeed } from './channel-speed.js';
+import { ChannelRefresh } from './channel-refresh.js';
 import { SpeedTransport } from './speed-transport.js';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -15,7 +16,7 @@ import { discoverClaudeModels, normalizeModels } from './claude-models.js';
 import { ModelError } from './model-protocol.js';
 
 export class Bridge extends EventEmitter {
-  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {}, recoveryOptions = {}, speedOptions = {}, modelCatalogProvider = discoverClaudeModels } = {}) {
+  constructor({ demo = false, networkProvider = getTailscaleStatus, networkAdapter = null, cancelTimeoutMs = 5000, responseTimeoutMs = 3610000, proxyOptions = {}, recoveryOptions = {}, speedOptions = {}, refreshOptions = {}, modelCatalogProvider = discoverClaudeModels } = {}) {
     super();
     this.demo = demo;
     this.networkProvider = networkProvider;
@@ -40,6 +41,7 @@ export class Bridge extends EventEmitter {
     this.channelRecovery = new ChannelRecovery({ ...recoveryOptions, bridge: this });
     this.speedTransport = new SpeedTransport({ ...speedOptions, bridge: this });
     this.channelSpeed = new ChannelSpeed({ bridge: this, transport: this.speedTransport });
+    this.channelRefresh = new ChannelRefresh({ ...refreshOptions, bridge: this });
   }
   log(message) { this.logs.unshift({ time: new Date().toISOString(), message }); this.logs = this.logs.slice(0, 40); this.emit('state'); }
   status() {
@@ -52,6 +54,7 @@ export class Bridge extends EventEmitter {
       demo: this.demo, network: this.networkStatus(),
       model: this.modelStatus(),
       channelRecovery: this.channelRecovery.status(),
+      channelRefresh: this.channelRefresh.status(),
       config: this.networkIdentity().role === 'host' && config ? { workspace: config.workspace, profile: config.profile, claudeCommand: config.claudeCommand,
         timeoutMs: config.timeoutMs, maxTurns: config.maxTurns, tailscaleIp: config.tailscaleIp, bridgePort: config.bridgePort } : null,
       invitation: this.invitation || null, activeRequests: this.active.size + this.queue.length + this.pending.size, logs: this.logs
@@ -125,7 +128,7 @@ export class Bridge extends EventEmitter {
   }
   async attach(role, pairing, { retryInitial = false } = {}) {
     const peer = this.peer = new BridgePeer({ role, pairing, retryInitial, allowLoopback: this.demo, networkAdapter: this.demo ? null : this.networkAdapter,
-      capabilities: { speedTest: 2 }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
+      capabilities: { speedTest: 2, channelRefresh: 1 }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
       networkUpgrade: (req, socket, head, current) => {
         if (current !== this.peer) { socket.destroy(); return true; }
         if (this.speedTransport.upgrade(req, socket, head, current)) return true;
@@ -331,6 +334,7 @@ export class Bridge extends EventEmitter {
   onMessage(msg, connection) {
     if (!msg || typeof msg !== 'object' || !/^[a-f0-9-]{36}$/i.test(msg.id)) return;
     if (this.channelSpeed.onMessage(msg, connection, this.peer)) return;
+    if (this.channelRefresh.onMessage(msg, connection, this.peer)) return;
     if (msg.type === 'proxy-health') { this.channelRecovery.onHint(msg, connection); return; }
     if (this.peer?.role === 'host' && msg.type === 'models-refresh' && this.peer.isConnected(connection)) {
       const peer = this.peer;
@@ -523,6 +527,7 @@ export class Bridge extends EventEmitter {
   }
   async disconnect() { await this.stopPeer(); }
   async stopPeer() {
+    this.channelRefresh.cancel('target-changed');
     this.channelSpeed.cancel();
     this.channelRecovery.stop();
     const peer = this.peer, modelPeer = this.modelPeer;

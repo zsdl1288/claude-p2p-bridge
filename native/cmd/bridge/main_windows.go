@@ -159,19 +159,24 @@ func showError(message string) {
 
 func main() {
 	exitCode := 1
+	var lifecycle *lifecycleLog
+	endReason := "startup-failed"
 	// Register this first so process handles and cleanup finish before a
-	// nonzero exit is returned to the native owner.
-	defer func() {
-		if exitCode != 0 {
-			os.Exit(exitCode)
-		}
-	}()
+	// nonzero exit (including a panic) is returned to the native owner.
+	defer finishLifecycleProcess(&lifecycle, &exitCode, &endReason)
 	if len(os.Args) > 1 && os.Args[1] == "--network-mode" {
+		if directory := os.Getenv("BRIDGE_LIFECYCLE_DIRECTORY"); directory != "" {
+			lifecycle = newLifecycleLog(directory, "network")
+			lifecycle.record("launch", "process-start", lifecycleFields{})
+		}
 		netcore.ConfigureBootstrapNetwork()
 		if err := netcore.Run(os.Stdin, os.Stdout); err != nil {
-			os.Exit(1)
+			endReason = "netcore-run-failed"
+			lifecycle.startupFailure("netcore-run-failed", err)
+			return
 		}
 		exitCode = 0
+		endReason = "netcore-eof"
 		return
 	}
 	flags := flag.NewFlagSet("Claude Bridge", flag.ContinueOnError)
@@ -222,13 +227,17 @@ func main() {
 		showError(err.Error())
 		return
 	}
+	lifecycle = newLifecycleLog(dataDir, "engine")
+	lifecycle.record("launch", "process-start", lifecycleFields{})
 	if err := removeLegacyClientLog(dataDir); err != nil {
+		lifecycle.startupFailure("legacy-log-cleanup", err)
 		showError("清理旧运行记录失败：" + err.Error())
 		return
 	}
 	defer removeLegacyClientLog(dataDir)
 	runtimeDir, err := extract(dataDir)
 	if err != nil {
+		lifecycle.startupFailure("runtime-extract", err)
 		showError("解包运行组件失败：" + err.Error())
 		return
 	}
@@ -242,12 +251,13 @@ func main() {
 	}
 	cmd := exec.Command(filepath.Join(runtimeDir, "runtime", "node.exe"), args...)
 	cmd.Dir = runtimeDir
-	cmd.Env = append(os.Environ(), "BRIDGE_NET_HELPER="+self, "BRIDGE_NET_HELPER_ARGS=[\"--network-mode\"]")
+	cmd.Env = append(lifecycleEnvironment(os.Environ(), lifecycle, dataDir), "BRIDGE_NET_HELPER="+self, "BRIDGE_NET_HELPER_ARGS=[\"--network-mode\"]")
 	// Leave console output unset so os/exec connects it to the null device.
 	// Avoid both a persistent client.log and copy pipes inherited by helpers.
 	hide(cmd)
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
+		lifecycle.startupFailure("job-create", err)
 		showError(err.Error())
 		return
 	}
@@ -255,23 +265,36 @@ func main() {
 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		lifecycle.startupFailure("job-configure", err)
 		showError(err.Error())
 		return
 	}
 	if err := cmd.Start(); err != nil {
+		lifecycle.startupFailure("node-start", err)
 		showError("启动失败：" + err.Error())
 		return
 	}
+	lifecycle.record("node-started", "child-started", lifecycleFields{ChildPID: cmd.Process.Pid})
 	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 	if err != nil {
-		cmd.Process.Kill()
+		lifecycle.startupFailure("node-open", err)
+		lifecycle.record("child-kill", "owner-open-process-failed", lifecycleFields{ChildPID: cmd.Process.Pid})
+		if cmd.Process.Kill() == nil {
+			waitError := cmd.Wait()
+			lifecycle.observeChildExit(cmd.ProcessState, waitError, cmd.Process.Pid)
+		}
 		showError(err.Error())
 		return
 	}
 	err = windows.AssignProcessToJobObject(job, process)
 	windows.CloseHandle(process)
 	if err != nil {
-		cmd.Process.Kill()
+		lifecycle.startupFailure("node-assign", err)
+		lifecycle.record("child-kill", "owner-job-assign-failed", lifecycleFields{ChildPID: cmd.Process.Pid})
+		if cmd.Process.Kill() == nil {
+			waitError := cmd.Wait()
+			lifecycle.observeChildExit(cmd.ProcessState, waitError, cmd.Process.Pid)
+		}
 		showError(err.Error())
 		return
 	}
@@ -307,11 +330,12 @@ func main() {
 		}
 		waitError = <-processDone
 	}
+	exitCode = int(lifecycle.observeChildExit(cmd.ProcessState, waitError, cmd.Process.Pid))
+	endReason = "node-exited"
 	if waitError != nil {
 		if !*noBrowser {
 			showError("客户端未能启动或意外退出，请检查本机端口是否占用，然后重新启动客户端。")
 		}
 		return
 	}
-	exitCode = 0
 }

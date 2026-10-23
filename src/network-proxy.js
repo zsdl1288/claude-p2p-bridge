@@ -658,6 +658,7 @@ export class NetworkProxy extends EventEmitter {
   }
   async close() {
     if (this.closing) return this.closing;
+    this.bridge.channelRefresh?.close();
     this.bridge.channelRecovery?.close();
     this.bridge.channelSpeed?.close();
     this.bridge.speedTransport?.close();

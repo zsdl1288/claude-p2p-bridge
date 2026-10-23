@@ -6,6 +6,8 @@
 #include "model-api.hpp"
 #include "network-diagnostics.hpp"
 #include "speed-test.hpp"
+#include "channel-refresh.hpp"
+#include "channel-recovery.hpp"
 #include "options.hpp"
 #include "role-ui.hpp"
 #include "theme.hpp"
@@ -13,6 +15,7 @@
 #include "pairing-ui.hpp"
 #include "single-instance.hpp"
 #include "job-lifecycle.hpp"
+#include "lifecycle.hpp"
 #include <uxtheme.h>
 
 #ifndef BRIDGE_DIAGNOSTICS_BUILD
@@ -31,6 +34,18 @@ constexpr wchar_t APP_TITLE[] = L"Claude Bridge · 本地诊断版";
 constexpr wchar_t APP_TITLE[] = L"Claude Bridge · C++ 桌面版";
 #endif
 using Options = DesktopCli::Options;
+DesktopLifecycle::Journal lifecycle;
+enum class ExitSource { None, Tray, WindowsSession, Engine, Window, StartupFailure, MessageLoopFailure };
+inline const char* ExitSourceName(ExitSource source) {
+    switch (source) {
+    case ExitSource::Tray: return "tray-exit";
+    case ExitSource::WindowsSession: return "windows-session-ending";
+    case ExitSource::Engine: return "engine-exited";
+    case ExitSource::StartupFailure: return "startup-failure";
+    case ExitSource::MessageLoopFailure: return "message-loop-failure";
+    default: return "window-destroyed";
+    }
+}
 struct Reply { std::string kind; Json data; std::string text, requestId; uint64_t viewEpoch = 0; };
 struct Widget {
     HWND window; int page, role, x, y, w, h, font; bool right = false, stretch = false, taller = false;
@@ -53,7 +68,7 @@ class Application {
     uint64_t viewEpoch_ = 0, lastStatusRevision_ = 0;
     std::atomic<bool> stopping_{false}, ready_{false};
     std::mutex engineMutex_; KernelHandle process_, job_, wake_;
-    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_, speedTestThread_, speedStatusThread_, speedCancelThread_;
+    std::thread pollThread_, actionThread_, testThread_, diagnosticsThread_, speedTestThread_, speedStatusThread_, speedCancelThread_, channelRefreshThread_;
     std::mutex speedCancelMutex_;
     std::condition_variable speedCancelWake_;
     std::string pendingSpeedCancel_;
@@ -84,7 +99,11 @@ class Application {
     HWND startupHint_ = nullptr, modelStatus_ = nullptr, hostModelStatus_ = nullptr;
     HWND pairingCaption_ = nullptr;
     bool pairingSummaryShown_ = false;
-    HWND proxyMessage_ = nullptr, proxyDetails_ = nullptr;
+    HWND proxyMessage_ = nullptr, proxyDetails_ = nullptr, channelRefreshMessage_ = nullptr;
+    bool channelRefreshCommandBusy_ = false;
+    uint64_t channelRefreshEpoch_ = 0;
+    std::string channelRefreshScope_;
+    std::wstring channelRefreshNotice_;
 
     Json Object(const Json& value, const char* key) const {
         return value.is_object() && value.contains(key) && value[key].is_object() ? value[key] : Json::object();
@@ -101,7 +120,7 @@ class Application {
     int S(int value) const { return MulDiv(value, static_cast<int>(dpi_), 96); }
     HWND Item(int id) const { return GetDlgItem(window_, id); }
     void Text(HWND target, const std::wstring& value) {
-        const bool message = target == description_ || target == state_ || target == identityMessage_ || target == networkMessage_ || target == connectionHint_ || target == modelStatus_ || target == hostModelStatus_ || target == proxyMessage_ || target == proxyDetails_ || target == activity_;
+        const bool message = target == description_ || target == state_ || target == identityMessage_ || target == networkMessage_ || target == connectionHint_ || target == modelStatus_ || target == hostModelStatus_ || target == proxyMessage_ || target == proxyDetails_ || target == channelRefreshMessage_ || target == activity_;
         const auto display = message ? DesktopAccess::DisplayRoleNames(value) : value;
         if (ControlText(target) != display) SetWindowTextW(target, display.c_str());
     }
@@ -363,17 +382,19 @@ class Application {
         Label(L"本次会话记录", 228, 132, 500, 24, 2, 0, 1);
         Button(L"打开数据目录", OPEN_DATA, 840, 128, 152, 32, 2, 0, true);
         activity_ = Edit(L"等待设备连接，记录会显示在这里。", 0, 228, 180, 764, 484, 2, 0, true, true, true, true);
-        Label(L"调用端 · 本地代理节点", 228, 132, 390, 24, 3, 1, 1);
-        Label(L"服务端 · 网络共享", 228, 132, 390, 24, 3, 2, 1);
+        Label(L"调用端 · 本地代理节点", 228, 132, 326, 24, 3, 1, 1);
+        Label(L"服务端 · 网络共享", 228, 132, 326, 24, 3, 2, 1);
+        Button(L"刷新线路", NETWORK_CHANNEL_REFRESH, 572, 128, 132, 30, 3, 0, true);
         Button(L"网络测速", NETWORK_SPEED_TEST, 716, 128, 132, 30, 3, 0, true);
         Button(L"网络诊断", NETWORK_DIAGNOSTICS, 860, 128, 132, 30, 3, 0, true);
         proxyMessage_ = Label(L"正在读取代理状态…", 228, 172, 764, 44, 3, 0, 0); widgets_.back().stretch = true;
         proxyDetails_ = Label(L"", 228, 224, 440, 42, 3, 0, 3, true); widgets_.back().stretch = true;
         Button(L"启用本地 Clash 节点", PROXY_ENABLE, 690, 224, 302, 36, 3, 1, true);
         Button(L"开启本机网络共享", PROXY_SHARING, 690, 224, 302, 36, 3, 2, true);
-        Label(L"设备与代理连接", 228, 312, 700, 24, 3, 0, 1);
-        Label(L"速率为当前代理流量；延迟为 A ↔ B 往返时间。", 228, 344, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
-        proxyPeerList_ = Add(WC_LISTVIEWW, L"", 0, 228, 380, 764, 184, 3, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true, true);
+        channelRefreshMessage_ = Label(L"连接服务端后可刷新 Bridge 自己的线路，现有配对保留。", 228, 272, 764, 34, 3, 0, 3, true); widgets_.back().stretch = true;
+        Label(L"设备与代理连接", 228, 344, 700, 24, 3, 0, 1);
+        Label(L"速率为当前代理流量；延迟为 A ↔ B 往返时间。", 228, 376, 764, 22, 3, 0, 3, true); widgets_.back().stretch = true;
+        proxyPeerList_ = Add(WC_LISTVIEWW, L"", 0, 228, 412, 764, 152, 3, 0, LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 3, false, true, true);
         ListView_SetExtendedListViewStyle(proxyPeerList_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         const wchar_t* proxyColumns[] = {L"设备 / 身份", L"虚拟 IP", L"代理状态", L"连接 / 已传输", L"实时速率 / 延迟"};
         const int proxyWidths[] = {160, 106, 100, 104, 250};
@@ -398,6 +419,9 @@ class Application {
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
             Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, 530, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
         }
+        Label(L"退出与崩溃诊断", 228, 574, 540, 24, 4, 0, 1);
+        Button(L"打开退出日志", OPEN_LIFECYCLE_LOGS, 784, 570, 208, 34, 4, 0, true);
+        Label(L"自动保留退出来源、异常码和上次未完整结束的记录。\r\n日志只保存在本机，按大小轮转；不会保存模型或代理内容。", 228, 616, 764, 48, 4, 0, 3, true); widgets_.back().stretch = true;
         LoadSettings(); LoadStartup(); Visibility(); Layout(); UpdateButtons();
     }
     DesktopStartup::Registration Startup() const { return {options_.directory, options_.port, options_.system}; }
@@ -513,8 +537,8 @@ class Application {
         if (page_ == 0) { card(208, 112, 808 + extraW, 184); card(208, 312, 370, 424 + extraH); card(594, 312, 422 + extraW, 284 + extraH); card(594, 612 + extraH, 422 + extraW, 124); }
         if (page_ == 1) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 322); card(208, 450, 808 + extraW, 286 + extraH); } }
         if (page_ == 2) card(208, 112, 808 + extraW, 574 + extraH);
-        if (page_ == 3) { card(208, 112, 808 + extraW, 168); card(208, 296, 808 + extraW, 288 + extraH); card(208, 600 + extraH, 808 + extraW, 136); }
-        if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 86); }
+        if (page_ == 3) { card(208, 112, 808 + extraW, 200); card(208, 328, 808 + extraW, 256 + extraH); card(208, 600 + extraH, 808 + extraW, 136); }
+        if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 86); card(208, 556, 808 + extraW, 140); }
         SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); EndPaint(window_, &ps);
     }
     void DrawButton(DRAWITEMSTRUCT* draw) {
@@ -629,6 +653,20 @@ class Application {
         } catch (...) { std::error_code error; fs::remove(temporary, error); throw; }
         return target;
     }
+    std::atomic<ExitSource> exitSource_{ExitSource::None};
+    std::atomic<DWORD> engineExitCode_{STILL_ACTIVE};
+    std::atomic<bool> engineExitLogged_{false};
+    std::atomic<bool> startupFailed_{false};
+    const char* engineStartupPhase_ = "port-probe";
+    void SetExitSource(ExitSource source) {
+        ExitSource none = ExitSource::None;
+        if (exitSource_.compare_exchange_strong(none, source)) lifecycle.Event("exit-requested", {{"reason", ExitSourceName(source)}});
+    }
+    void ObserveEngineExit(DWORD code) {
+        engineExitCode_ = code;
+        if (!engineExitLogged_.exchange(true)) lifecycle.Event("engine-exited", {
+            {"childPid", process_.value ? GetProcessId(process_.value) : DWORD{0}}, {"exitCode", code}, {"expected", stopping_.load()}});
+    }
     void StartEngine() {
         bool occupied = false;
         // A killed desktop releases its mutex before Windows finishes closing
@@ -638,7 +676,11 @@ class Application {
             if (!occupied) break;
             if (WaitForSingleObject(wake_.value, 100) == WAIT_OBJECT_0) return;
         }
-        if (occupied) throw std::runtime_error("本地端口已被其他程序占用，请关闭占用程序，或使用 --port 指定空闲端口");
+        if (occupied) {
+            lifecycle.Event("startup-failed", {{"phase", "port-probe"}, {"reason", "port-occupied"}});
+            throw std::runtime_error("本地端口已被其他程序占用，请关闭占用程序，或使用 --port 指定空闲端口");
+        }
+        engineStartupPhase_ = "extract-engine";
         auto engine = ExtractEngine();
         std::lock_guard lock(engineMutex_); if (stopping_) return;
         if (!job_.value) throw std::runtime_error("后台进程作业尚未就绪");
@@ -648,37 +690,58 @@ class Application {
         if (options_.system) command += L" --system-tailscale";
         STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
         PROCESS_INFORMATION child{};
+        engineStartupPhase_ = "create-engine";
         if (!CreateProcessW(engine.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                            nullptr, options_.directory.c_str(), &startup, &child)) throw std::runtime_error(WindowsError("启动内置引擎"));
+                            nullptr, options_.directory.c_str(), &startup, &child)) {
+            const DWORD code = GetLastError(); const auto message = WindowsError("启动内置引擎");
+            lifecycle.Event("startup-failed", {{"phase", engineStartupPhase_}, {"win32Code", code}});
+            throw std::runtime_error(message);
+        }
         process_.reset(child.hProcess); KernelHandle thread(child.hThread);
-        if (!AssignProcessToJobObject(job_.value, process_.value)) { TerminateProcess(process_.value, 1); throw std::runtime_error(WindowsError("托管后台进程")); }
+        lifecycle.Event("engine-created", {{"childPid", child.dwProcessId}});
+        engineStartupPhase_ = "assign-engine-job";
+        if (!AssignProcessToJobObject(job_.value, process_.value)) {
+            const DWORD code = GetLastError(); const auto message = WindowsError("托管后台进程");
+            lifecycle.Event("startup-failed", {{"phase", engineStartupPhase_}, {"win32Code", code}});
+            lifecycle.Event("engine-kill-requested", {{"reason", "job-assignment-failed"}, {"forced", true}, {"childPid", child.dwProcessId}});
+            TerminateProcess(process_.value, 1); throw std::runtime_error(message);
+        }
+        engineStartupPhase_ = "resume-engine";
         if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) {
-            auto error = WindowsError("运行内置引擎"); TerminateJobObject(job_.value, 1); throw std::runtime_error(error);
+            const DWORD code = GetLastError(); const auto error = WindowsError("运行内置引擎");
+            lifecycle.Event("startup-failed", {{"phase", engineStartupPhase_}, {"win32Code", code}});
+            lifecycle.Event("engine-kill-requested", {{"reason", "resume-failed"}, {"forced", true}, {"childPid", child.dwProcessId}});
+            TerminateJobObject(job_.value, 1); throw std::runtime_error(error);
         }
     }
     bool EngineExited(DWORD* exitCode = nullptr) {
         std::lock_guard lock(engineMutex_);
         if (!process_.value || WaitForSingleObject(process_.value, 0) != WAIT_OBJECT_0) return false;
-        if (exitCode && !GetExitCodeProcess(process_.value, exitCode)) *exitCode = 1;
+        DWORD code = 1; GetExitCodeProcess(process_.value, &code);
+        ObserveEngineExit(code);
+        if (exitCode) *exitCode = code;
         return true;
     }
     void Poll() {
         try {
             StartEngine(); if (stopping_) return;
             bool started = false;
+            engineStartupPhase_ = "wait-health";
             for (int i = 0; i < 120 && !stopping_; ++i) {
                 try {
+                    engineStartupPhase_ = "wait-health";
                     auto health = Api(ControlPort(), "", L"/health");
                     if (health.value("service", "") != "claude-p2p-bridge" || health.value("version", "") != BRIDGE_VERSION) throw std::runtime_error("本地端口返回了其他程序的数据");
                     if (health.value("parentPid", DWORD{0}) != GetProcessId(process_.value)) throw std::runtime_error("正在等待本次启动的引擎");
+                    engineStartupPhase_ = "wait-bootstrap";
                     auto boot = Api(ControlPort(), "", L"/api/bootstrap"); token_ = boot.at("token").get<std::string>();
-                    started = true; ready_ = true; Post({"ready", boot}); break;
+                    started = true; ready_ = true; lifecycle.Event("engine-ready"); Post({"ready", boot}); break;
                 } catch (...) {
                     DWORD exitCode = 1;
                     if (EngineExited(&exitCode)) {
                         // The local API can receive a shutdown request before
                         // this startup poll has finished its first bootstrap.
-                        if (exitCode == 0) { PostMessageW(window_, MSG_EXIT, 0, 0); return; }
+                        if (exitCode == 0) { SetExitSource(ExitSource::Engine); PostMessageW(window_, MSG_EXIT, 0, 0); return; }
                         throw std::runtime_error("内置引擎启动失败，请检查本机端口是否被占用，或重新启动客户端");
                     }
                 }
@@ -687,7 +750,7 @@ class Application {
             if (!started) { if (!stopping_) throw std::runtime_error("内置引擎启动超时，请检查本机端口是否被占用，或重新启动客户端"); return; }
             int count = 0;
             while (!stopping_) {
-                if (EngineExited()) { PostMessageW(window_, MSG_EXIT, 0, 0); return; }
+                if (EngineExited()) { SetExitSource(ExitSource::Engine); PostMessageW(window_, MSG_EXIT, 0, 0); return; }
                 try { Post({"status", Api(ControlPort(), token_, L"/api/status")}); }
                 catch (const std::exception& error) { Post({"poll-error", {}, error.what()}); }
                 if (count++ % 3 == 0) {
@@ -698,7 +761,11 @@ class Application {
                 }
                 if (WaitForSingleObject(wake_.value, 1800) == WAIT_OBJECT_0) break;
             }
-        } catch (const std::exception& error) { Post({"startup-error", {}, error.what()}); }
+        } catch (const std::exception& error) {
+            startupFailed_ = true;
+            lifecycle.Event("startup-failed", {{"phase", engineStartupPhase_}, {"reason", "engine-start-failed"}});
+            Post({"startup-error", {}, error.what()});
+        }
     }
     void UpdateButtons() {
         bool enabled = ready_ && statusAvailable_ && Identity().value("loaded", false) && !busy_;
@@ -740,6 +807,57 @@ class Application {
         EnableWindow(Item(PROXY_ENABLE), enabled && proxyAvailable_ && Capability("proxy") && role == "client");
         EnableWindow(Item(PROXY_SHARING), enabled && proxyAvailable_ && Capability("proxy") && role == "host");
         EnableWindow(Item(COPY_SUBSCRIPTION), enabled && proxyAvailable_ && !proxy_.value("subscriptionUrl", "").empty());
+        UpdateChannelRefreshControls();
+    }
+    void UpdateChannelRefreshControls() {
+        const auto refresh = Object(proxy_, "channelRefresh");
+        const auto scope = DesktopChannelRefresh::Scope(status_, refresh, Role());
+        if (scope != channelRefreshScope_) {
+            channelRefreshScope_ = scope; ++channelRefreshEpoch_; channelRefreshNotice_.clear();
+        }
+        EnableWindow(Item(NETWORK_CHANNEL_REFRESH), ready_ && statusAvailable_ && proxyAvailable_ && Capability("proxy") && !stopping_ && !busy_ && !testing_ &&
+            !channelRefreshCommandBusy_ && DesktopChannelRefresh::CanStart(refresh, Role()));
+        Text(NETWORK_CHANNEL_REFRESH, DesktopChannelRefresh::Button(refresh, channelRefreshCommandBusy_));
+        Text(channelRefreshMessage_, channelRefreshNotice_.empty() ? DesktopChannelRefresh::Message(refresh) : channelRefreshNotice_);
+    }
+    void StartChannelRefresh() {
+        UpdateChannelRefreshControls();
+        if (!IsWindowEnabled(Item(NETWORK_CHANNEL_REFRESH))) return;
+        auto refresh = Object(proxy_, "channelRefresh");
+        const auto role = Role(); const auto targets = DesktopChannelRefresh::Targets(refresh, role);
+        const auto epoch = channelRefreshEpoch_;
+        std::string id;
+        if (role == "client") {
+            if (targets.size() != 1) return;
+            id = DesktopChannelRefresh::Text(targets.front(), "id");
+        } else if (role == "host") {
+            HMENU menu = CreatePopupMenu();
+            if (!menu) throw std::runtime_error("无法创建线路刷新设备菜单");
+            AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"选择要刷新线路的调用端");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            for (size_t index = 0; index < targets.size(); ++index) {
+                const auto label = DesktopChannelRefresh::MenuLabel(targets[index]);
+                AppendMenuW(menu, MF_STRING | (DesktopChannelRefresh::Flag(targets[index], "supported") ? MF_ENABLED : MF_DISABLED), index + 1, label.c_str());
+            }
+            RECT rect; GetWindowRect(Item(NETWORK_CHANNEL_REFRESH), &rect); SetForegroundWindow(window_);
+            const auto selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN, rect.left, rect.bottom, 0, window_, nullptr);
+            DestroyMenu(menu);
+            if (selected < 1 || static_cast<size_t>(selected) > targets.size()) return;
+            id = DesktopChannelRefresh::Text(targets[static_cast<size_t>(selected) - 1], "id");
+        }
+        // Menu tracking can dispatch polls. Revalidate the opaque session ID
+        // against the current pairing instead of using a row name or address.
+        if (epoch != channelRefreshEpoch_ || !DesktopChannelRefresh::CanStartTarget(Object(proxy_, "channelRefresh"), Role(), id)) return;
+        if (channelRefreshThread_.joinable()) channelRefreshThread_.join();
+        channelRefreshCommandBusy_ = true; channelRefreshNotice_ = L"正在提交线路刷新请求…"; UpdateChannelRefreshControls();
+        try {
+            channelRefreshThread_ = std::thread([this, id, epoch] {
+                try {
+                    const Json body = {{"targetId", id}};
+                    Post({"channel-refresh", Api(ControlPort(), token_, L"/api/proxy/refresh", &body, 4000), {}, {}, epoch});
+                } catch (const std::exception&) { Post({"channel-refresh-error", {}, {}, {}, epoch}); }
+            });
+        } catch (...) { channelRefreshCommandBusy_ = false; channelRefreshNotice_.clear(); UpdateChannelRefreshControls(); throw; }
     }
     void RenderProxy(const Json& proxy) {
         if (!proxy.is_object()) return;
@@ -756,8 +874,9 @@ class Application {
             connections += L" / " + std::to_wstring(proxy["connectionLimit"].get<int>());
         else if (proxy.contains("connectionLimit") && proxy["connectionLimit"].is_number_integer() && proxy["connectionLimit"].get<int>() == 0)
             connections += L"（不设数量上限）";
-        const auto recovery = proxy.value("recoveryMessage", "");
-        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + L"\r\n" + (sharing ? L"服务端网络共享已开启" : L"服务端网络共享已关闭") + (recovery.empty() ? L"" : L" · " + Wide(recovery)));
+        const auto recovery = DesktopChannelRecovery::Summary(Object(proxy, "channelRecovery"), Role(),
+            channelRefreshCommandBusy_ || DesktopChannelRefresh::Running(Object(proxy, "channelRefresh")));
+        Text(proxyDetails_, endpoint + L" · 活跃连接 " + connections + L"\r\n" + recovery);
         Text(PROXY_ENABLE, proxy.value("enabled", false) ? L"关闭本地 Clash 节点" : L"启用本地 Clash 节点");
         Text(PROXY_SHARING, proxy.value("sharing", false) ? L"停止共享本机网络" : L"允许已配对的 调用端 使用本机网络");
         auto subscription = proxy.value("subscriptionUrl", "");
@@ -951,6 +1070,17 @@ class Application {
         });
     }
     void OnReply(const Reply& reply) {
+        if (reply.kind == "channel-refresh" || reply.kind == "channel-refresh-error") {
+            channelRefreshCommandBusy_ = false;
+            if (channelRefreshThread_.joinable()) channelRefreshThread_.join();
+            if (reply.viewEpoch == channelRefreshEpoch_ && statusAvailable_ && !stopping_) {
+                if (reply.kind == "channel-refresh" && reply.data.is_object() &&
+                    DesktopChannelRefresh::Scope(status_, reply.data, Role()) == channelRefreshScope_) {
+                    channelRefreshNotice_.clear(); proxy_["channelRefresh"] = DesktopChannelRefresh::MergeCommand(Object(proxy_, "channelRefresh"), reply.data);
+                } else if (reply.kind == "channel-refresh-error") channelRefreshNotice_ = L"刷新请求未完成，请查看当前连接状态；不会自动重试。";
+            }
+            UpdateChannelRefreshControls(); return;
+        }
         if (reply.kind == "speed-test-command" || reply.kind == "speed-test-error") {
             speedTestCommandBusy_ = false;
             speedStatusEpoch_.Settled();
@@ -1506,7 +1636,7 @@ class Application {
                 break;
             case MINIMIZE_TRAY: case TRAY_HIDE: HideToTray(); break;
             case TRAY_RESTORE: Restore(); break;
-            case TRAY_EXIT: DestroyWindow(window_); break;
+            case TRAY_EXIT: SetExitSource(ExitSource::Tray); DestroyWindow(window_); break;
             case STARTUP_ENABLE: SetStartup(); break;
             case THEME_TOGGLE: ToggleTheme(); break;
             case NETWORK_CONNECT: Action(L"/api/network/login", Json::object(), "login"); break;
@@ -1514,6 +1644,7 @@ class Application {
             case NETWORK_REFRESH: Action(L"/api/tailscale", Json::object(), "refresh"); break;
             case NETWORK_DIAGNOSTICS: OpenNetworkDiagnostics(); break;
             case NETWORK_SPEED_TEST: OpenSpeedTest(); break;
+            case NETWORK_CHANNEL_REFRESH: StartChannelRefresh(); break;
             case NETWORK_LOGIN: if (!authUrl_.empty() && SafeLoginUrl(authUrl_)) OpenLink(window_, Wide(authUrl_)); break;
             case PAIR_JOIN:
                 if (IsWindowEnabled(Item(PAIR_JOIN))) {
@@ -1559,25 +1690,43 @@ class Application {
             case TEST_SEND: StartTest(); break;
             case TEST_CANCEL: if (!requestId_.empty()) Action(L"/v1/requests/" + Wide(requestId_) + L"/cancel", Json::object(), "cancel"); break;
             case OPEN_DATA: OpenLink(window_, options_.directory.wstring()); break;
+            case OPEN_LIFECYCLE_LOGS:
+                if (lifecycle.Started()) OpenLink(window_, (options_.directory / L"diagnostics" / L"lifecycle").wstring());
+                else Message(L"退出诊断日志目录不可写或路径不安全，本次无法保存退出日志。", true);
+                break;
             case OPEN_LICENSES: OpenLink(window_, L"http://127.0.0.1:" + std::to_wstring(ControlPort()) + L"/licenses"); break;
             }
         } catch (const std::exception& error) { Message(Wide(error.what()), true); }
     }
     void Stop() {
         if (stopping_.exchange(true)) return;
+        lifecycle.Event("cleanup-started", {{"reason", ExitSourceName(exitSource_.load())}});
         if (diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
         if (speedTestWindow_) DestroyWindow(speedTestWindow_);
         SaveSettings(); SetEvent(wake_.value);
         {
             std::lock_guard lock(engineMutex_);
             if (process_.value && WaitForSingleObject(process_.value, 0) == WAIT_TIMEOUT) {
-                if (ready_) { try { Json body = Json::object(); Api(ControlPort(), token_, L"/api/shutdown", &body, 1000); } catch (...) {} }
+                if (ready_) {
+                    lifecycle.Event("engine-shutdown-requested", {{"reason", ExitSourceName(exitSource_.load())}, {"childPid", GetProcessId(process_.value)}});
+                    try {
+                        Json body = Json::object(); Api(ControlPort(), token_, L"/api/shutdown", &body, 1000);
+                        lifecycle.Event("engine-shutdown-accepted");
+                    } catch (...) { lifecycle.Event("engine-shutdown-request-failed", {{"reason", "local-request-failed"}}); }
+                }
                 WaitForSingleObject(process_.value, 1500);
             }
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+            bool membersRemain = job_.value && QueryInformationJobObject(job_.value, JobObjectBasicAccountingInformation,
+                &accounting, sizeof(accounting), nullptr) && accounting.ActiveProcesses != 0;
+            // DrainOwnedJob explicitly terminates residual members with code 0.
+            // Record ownership before doing so; that code is not a natural exit.
+            lifecycle.Event("owned-job-cleanup", {{"forced", membersRemain}, {"reason", membersRemain ? "residual-processes" : "all-processes-exited"}});
             DrainOwnedJob(job_.value, process_.value);
+            if (process_.value) { DWORD code = 1; if (GetExitCodeProcess(process_.value, &code)) ObserveEngineExit(code); }
             job_.reset();
         }
-        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &speedTestThread_, &speedStatusThread_}) if (thread->joinable()) thread->join();
+        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &speedTestThread_, &speedStatusThread_, &channelRefreshThread_}) if (thread->joinable()) thread->join();
         {
             std::lock_guard lock(speedCancelMutex_); speedCancelStopping_ = true; pendingSpeedCancel_.clear();
         }
@@ -1585,6 +1734,7 @@ class Application {
         if (speedCancelThread_.joinable()) speedCancelThread_.join();
         if (trayAdded_) { NOTIFYICONDATAW icon{}; icon.cbSize = sizeof(icon); icon.hWnd = window_; icon.uID = 1; Shell_NotifyIconW(NIM_DELETE, &icon); trayAdded_ = false; }
         MSG message; while (PeekMessageW(&message, window_, MSG_REPLY, MSG_REPLY, PM_REMOVE)) delete reinterpret_cast<Reply*>(message.lParam);
+        lifecycle.Event("cleanup-completed");
     }
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == taskbarMessage_) { trayAdded_ = false; Tray(true); if (!trayAdded_) Restore(); return 0; }
@@ -1620,12 +1770,16 @@ class Application {
         case WM_DPICHANGED: { dpi_ = HIWORD(wParam); Fonts(); auto rect = reinterpret_cast<RECT*>(lParam); SetWindowPos(window_, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE); Layout(); return 0; }
         case WM_GETMINMAXINFO: { auto info = reinterpret_cast<MINMAXINFO*>(lParam); RECT rect{0, 0, S(1040), S(760)}; AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi_); info->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0; }
         case WM_QUERYENDSESSION: return TRUE;
-        case WM_ENDSESSION: if (wParam) { Stop(); DestroyWindow(window_); } return 0;
+        case WM_ENDSESSION: if (wParam) {
+            SetExitSource(ExitSource::WindowsSession);
+            lifecycle.Event("windows-session-ending", {{"flags", static_cast<DWORD>(lParam)}});
+            Stop(); DestroyWindow(window_);
+        } return 0;
         case MSG_TRAY: { UINT event = LOWORD(lParam); if (event == WM_LBUTTONDBLCLK || event == NIN_SELECT || event == NIN_KEYSELECT) Restore(); if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) TrayMenu(); return 0; }
         case MSG_RESTORE: Restore(); return 0;
-        case MSG_EXIT: DestroyWindow(window_); return 0;
+        case MSG_EXIT: SetExitSource(ExitSource::Engine); DestroyWindow(window_); return 0;
         case MSG_REPLY: { std::unique_ptr<Reply> reply(reinterpret_cast<Reply*>(lParam)); if (!stopping_) { try { OnReply(*reply); } catch (const std::exception& error) { Report(Wide(error.what())); } } return 0; }
-        case WM_DESTROY: Stop(); PostQuitMessage(0); return 0;
+        case WM_DESTROY: SetExitSource(ExitSource::Window); Stop(); PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(window_, message, wParam, lParam);
     }
@@ -1659,6 +1813,7 @@ public:
         fs::create_directories(options_.directory);
         DataDirectoryLock profile(options_.directory);
         if (!profile.Acquired()) throw std::runtime_error("此数据目录仍被其他客户端或后台进程使用，请先正常退出占用程序，再启动本客户端。");
+        lifecycle.Start(options_.directory, BRIDGE_VERSION);
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS}; InitCommonControlsEx(&controls);
         WNDCLASSEXW type{}; type.cbSize = sizeof(type); type.hInstance = instance_; type.lpfnWndProc = WindowProc;
         type.lpszClassName = className_.c_str(); type.hCursor = LoadCursorW(nullptr, IDC_ARROW); type.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101)); type.hIconSm = type.hIcon;
@@ -1673,14 +1828,24 @@ public:
         if (!window_) throw std::runtime_error(WindowsError("创建主窗口"));
         if (options_.minimized && trayAdded_) HideToTray(); else ShowWindow(window_, SW_SHOWNORMAL);
         UpdateWindow(window_); pollThread_ = std::thread([this] { Poll(); });
-        MSG message;
-        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        MSG message{}; BOOL messageResult;
+        while ((messageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
             if (diagnosticsWindow_ && IsDialogMessageW(diagnosticsWindow_, &message)) continue;
             if (speedTestWindow_ && IsDialogMessageW(speedTestWindow_, &message)) continue;
             if (!IsDialogMessageW(window_, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
         }
-        return 0;
+        if (messageResult == -1) {
+            const DWORD code = GetLastError();
+            SetExitSource(ExitSource::MessageLoopFailure);
+            lifecycle.Event("message-loop-failed", {{"win32Code", code}});
+        }
+        Stop();
+        const DWORD engineCode = engineExitCode_.load();
+        const int result = messageResult == -1 || startupFailed_.load()
+            || (exitSource_ == ExitSource::Engine && engineCode != STILL_ACTIVE && engineCode != 0) ? 1 : 0;
+        return result;
     }
+    const char* ExitReason() const { return ExitSourceName(exitSource_.load()); }
 };
 }
 
@@ -1703,8 +1868,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             if (SUCCEEDED(com)) CoUninitialize();
             return 0;
         }
-        Application application(instance, std::move(options)); int result = application.Run();
+        int result; const char* reason;
+        {
+            Application application(instance, std::move(options)); result = application.Run();
+            reason = application.ExitReason();
+        }
         if (SUCCEEDED(com)) CoUninitialize();
+        lifecycle.Finish(reason, static_cast<DWORD>(result));
         return result;
-    } catch (const std::exception& error) { MessageBoxW(nullptr, Wide(error.what()).c_str(), APP_TITLE, MB_ICONERROR); if (SUCCEEDED(com)) CoUninitialize(); return 1; }
+    } catch (const std::exception& error) {
+        lifecycle.Event("startup-failed", {{"phase", "native-desktop"}, {"reason", "native-startup-exception"}});
+        MessageBoxW(nullptr, Wide(error.what()).c_str(), APP_TITLE, MB_ICONERROR);
+        if (SUCCEEDED(com)) CoUninitialize();
+        lifecycle.Finish("startup-failure", 1);
+        return 1;
+    }
 }

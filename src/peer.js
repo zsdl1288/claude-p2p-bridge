@@ -4,6 +4,13 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { SecureChannel, digest, randomId, equalSecret } from './crypto.js';
 import { validatePeerAddress } from './tailscale.js';
 import { rejectUpgrade } from './http-upgrade.js';
+import { isRefreshMessage } from './channel-refresh.js';
+
+function controlCapabilities(channel, value) {
+  if (channel !== 'control') return {};
+  return { ...([1, 2].includes(value?.speedTest) ? { speedTest: value.speedTest } : {}),
+    ...(value?.channelRefresh === 1 ? { channelRefresh: 1 } : {}) };
+}
 
 // B owns a private listener with one independently authenticated channel per A.
 // Connections never share nonces, sequence counters, replay windows or replies.
@@ -14,7 +21,7 @@ export class BridgePeer extends EventEmitter {
     Object.assign(this, { role, pairing, allowLoopback, heartbeatMs, retryMs, networkAdapter, retryInitial, maxClients });
     this.networkUpgrade = networkUpgrade;
     Object.assign(this, { channel, sharedListener, parentSession, authorize, metadata, info });
-    this.capabilities = channel === 'control' && [1, 2].includes(capabilities?.speedTest) ? { speedTest: capabilities.speedTest } : {};
+    this.capabilities = controlCapabilities(channel, capabilities);
     this.route = `${channel === 'model' ? '/model' : '/bridge'}/${pairing.room}`;
     this.authLabel = channel === 'model' ? 'p2pcc-model-v1' : 'p2pcc-v2';
     this.state = { mode: 'tailscale', role, online: false, listening: false, connectedClients: 0, maxClients, transport: 'offline', endpoint: `${pairing.host}:${pairing.port}`, error: null };
@@ -183,7 +190,7 @@ export class BridgePeer extends EventEmitter {
           if (typeof msg.nonce !== 'string' || !/^[\w-]{32}$/.test(msg.nonce) || (connection.remoteNonce && connection.remoteNonce !== msg.nonce)) throw new Error('身份验证失败');
           if (this.authorize && !this.authorize(msg, connection)) throw new Error('控制连接身份无效');
           connection.parentSession = typeof msg.parentSession === 'string' ? msg.parentSession : null;
-          connection.capabilities = this.channel === 'control' && [1, 2].includes(msg.capabilities?.speedTest) ? { speedTest: msg.capabilities.speedTest } : {};
+          connection.capabilities = controlCapabilities(this.channel, msg.capabilities);
           if (msg.device && typeof msg.device === 'object') connection.device = {
             name: typeof msg.device.name === 'string' ? msg.device.name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 80) : '',
             address: typeof msg.device.address === 'string' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(msg.device.address) ? msg.device.address : ''
@@ -285,6 +292,19 @@ export class BridgePeer extends EventEmitter {
     if (Object.keys(body).length !== allowed.length || Object.keys(body).some((key) => !allowed.includes(key)) ||
         (body.type === 'speed-offer' && (!equalSecret(body.session, connection.session) || typeof body.ticket !== 'string' || !/^[\w-]{43}$/.test(body.ticket))) ||
         (['speed-reject', 'speed-cancel'].includes(body.type) && !reasons.has(body.reason))) return false;
+    try {
+      if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;
+      const sequence = connection.sendSequence + 1;
+      const packet = JSON.stringify(connection.crypto.seal({ kind: 'message', session: connection.session, sequence, body }));
+      connection.ws.send(packet, () => {});
+      connection.sendSequence = sequence;
+      return true;
+    } catch { return false; }
+  }
+  // A route refresh is optional maintenance. Its control writes must never
+  // turn a full queue or failed write into a proxy/model disconnection.
+  trySendRefreshMessage(body, connection = this.clientConnection) {
+    if (this.channel !== 'control' || !this.isConnected(connection) || connection.ws.bufferedAmount >= 64 * 1024 || !isRefreshMessage(body)) return false;
     try {
       if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;
       const sequence = connection.sendSequence + 1;

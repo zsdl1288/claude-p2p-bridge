@@ -13,7 +13,7 @@ import { sendJson as json, readJsonObject as readBody } from './http.js';
 import { ClashProxy } from './clash-proxy.js';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
-const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/network-diagnostics.js': ['network-diagnostics.js', 'text/javascript; charset=utf-8'], '/speed-test.js': ['speed-test.js', 'text/javascript; charset=utf-8'], '/proxy-metrics.js': ['proxy-metrics.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
+const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/ui-state.js': ['ui-state.js', 'text/javascript; charset=utf-8'], '/network-diagnostics.js': ['network-diagnostics.js', 'text/javascript; charset=utf-8'], '/speed-test.js': ['speed-test.js', 'text/javascript; charset=utf-8'], '/channel-refresh.js': ['channel-refresh.js', 'text/javascript; charset=utf-8'], '/channel-recovery.js': ['channel-recovery.js', 'text/javascript; charset=utf-8'], '/proxy-metrics.js': ['proxy-metrics.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/licenses': ['licenses.txt', 'text/plain; charset=utf-8'] };
 const modelPaths = new Set(['/v1/chat/completions', '/v1/models', '/v1/responses', '/v1/messages']);
 const tokenLoads = new Map();
 export function getApiToken(directory) {
@@ -135,7 +135,7 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
       // are loading. Other APIs must not race restoration and overwrite it.
       if (req.method === 'POST' && url.pathname === '/api/shutdown' && onShutdown) {
         if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return reject(401, '需要有效的 Authorization: Bearer <API_TOKEN>', 'invalid_api_key');
-        await readBody(req); json(res, 200, { stopping: true }); setImmediate(onShutdown); return;
+        await readBody(req); json(res, 200, { stopping: true }); setImmediate(onShutdown, 'api-shutdown'); return;
       }
       await initialized;
       if (stopping || !ready) return reject(503, '客户端尚未就绪或正在退出', 'server_stopping');
@@ -183,6 +183,17 @@ export function createLocalServer({ port = 3210, controlPort = port === 0 ? 0 : 
       if (proxy && req.method === 'POST' && url.pathname === '/api/proxy') return json(res, 200, await proxy.configure(await readBody(req)));
       if (req.method === 'GET' && url.pathname === '/api/tailscale') return json(res, 200, await bridge.networkInfo(true));
       if (!modelListener && req.method === 'GET' && url.pathname === '/api/network/diagnostics') return json(res, 200, await bridge.networkDiagnostics());
+      if (!modelListener && url.pathname === '/api/proxy/refresh') {
+        if (req.method === 'GET') return json(res, 200, bridge.channelRefresh.status());
+        if (req.method === 'POST') {
+          const body = await readBody(req, 1024);
+          if (Object.keys(body).length !== 1 || typeof body.targetId !== 'string' || !body.targetId.length || body.targetId.length > 128)
+            throw new Error('请选择当前已连接的配对设备，无需其他参数');
+          bridge.channelRefresh.start(body);
+          return json(res, 202, bridge.channelRefresh.status());
+        }
+        return reject(405, '仅支持 GET 或 POST', 'method_not_allowed');
+      }
       if (!modelListener && url.pathname === '/api/proxy/speed-test') {
         if (req.method === 'GET') return json(res, 200, bridge.channelSpeed.status());
         if (req.method === 'POST') {

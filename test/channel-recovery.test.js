@@ -21,7 +21,7 @@ function fixture(role = 'client', options = {}) {
   const proxy = { enabled: role === 'client', sharing: role === 'host', downloadBytes: 0, recoverySnapshot: () => entries };
   const bridge = { networkAdapter: adapter, networkProxy: proxy, peer, remoteSharing: true, intentOnline: true,
     pending: new Map(), active: new Map(), queue: [], log: (message) => logs.push(message) };
-  const controller = new ChannelRecovery({ bridge, now: () => now, ...options.controller });
+  const controller = new ChannelRecovery({ bridge, mode: 'automatic', now: () => now, ...options.controller });
   const hint = (changes = {}) => ({ type: 'proxy-health', id: randomUUID(), v: 1, windowMs: 30000, blockedFlows: 2,
     pendingBytes: 65536, oldestPendingMs: 10000, completedBytes: 0, tcpTimeouts: 3, tcpRetransmits: 0, ...changes });
   return { bridge, adapter, peer, proxy, entry, counters, controller, connection, sent, logs, hint,
@@ -33,6 +33,91 @@ async function twoHints(f) {
   f.controller.onHint(f.hint(), f.connection); await f.controller.tick();
   f.advance(); f.controller.onHint(f.hint(), f.connection); await f.controller.tick();
 }
+
+test('production defaults to suggestions and never refreshes or consumes attempts in the background', async () => {
+  const f = fixture('client', { controller: { mode: undefined } }); f.entry.blockedFlows = 0;
+  assert.equal(f.controller.status().mode, 'notify');
+  await twoHints(f);
+  const notice = f.controller.status().notice;
+  assert.deepEqual(notice, { id: 1, phase: 'suggested', ageMs: 0, result: null });
+  for (let i = 0; i < 24; i++) {
+    f.advance(); f.controller.onHint(f.hint(), f.connection); await f.controller.tick();
+    assert.equal(f.controller.status().notice.id, notice.id, 'Ongoing evidence updates a single inline suggestion');
+  }
+  assert.equal(f.refreshes, 0); assert.equal(f.controller.attempts.length, 0); assert.equal(f.controller.lastAttempt, null);
+  await f.controller.refresh('download-stall', f.controller.epoch, f.peer, f.adapter, f.adapter.child);
+  assert.equal(f.refreshes, 0, 'Notification mode refuses even a direct automatic entry');
+  assert.equal((await f.controller.manualRefresh()).refreshed, true);
+  assert.equal(f.refreshes, 1, 'Only the user-requested manual path touches the existing helper');
+  assert.equal(f.controller.status().notice, null); assert.equal(f.controller.status().lastReason, 'manual-refresh');
+  assert.equal(f.controller.status().attemptsInWindow, 1);
+});
+
+test('suggestions expire without fresh evidence and do not serialize connection or helper details', async () => {
+  const f = fixture('client', { controller: { mode: 'notify' } });
+  await twoHints(f);
+  const text = JSON.stringify(f.controller.status());
+  for (const secret of ['private-session', 'connection', 'child', 'resource', 'pendingBytes']) assert.equal(text.includes(secret), false, secret);
+  f.advance(12501); assert.equal(f.controller.status().notice, null);
+  await f.tick(); assert.equal(f.controller.status().notice, null);
+  await twoHints(f); assert.equal(f.controller.status().notice.phase, 'suggested');
+  assert.equal(f.refreshes, 0);
+});
+
+test('sampling an old hint never extends the evidence lifetime of its suggestion', async () => {
+  const f = fixture('client', { controller: { mode: 'notify' } }); await twoHints(f);
+  const id = f.controller.status().notice.id;
+  await f.tick(5000); assert.equal(f.controller.status().notice.id, id);
+  assert.equal(f.controller.status().notice.ageMs, 5000);
+  await f.tick(5000); assert.equal(f.controller.status().notice.ageMs, 10000);
+  await f.tick(3000); assert.equal(f.controller.status().notice, null);
+  assert.equal(f.refreshes, 0); assert.equal(f.controller.attempts.length, 0);
+});
+
+test('suggestions are cleared by work, stop, healthy progress, no traffic and replaced connection resources', async () => {
+  for (const mutate of [(f) => f.bridge.active.set('model', {}), (f) => { f.bridge.channelSpeedActive = true; },
+    (f) => { f.bridge.channelRefreshActive = true; }, (f) => { f.bridge.paused = true; },
+    (f) => { f.entry.consumerBlocked = true; }, (f) => { f.entry.activeFlows = f.entry.blockedFlows = 0; },
+    (f) => { f.proxy.enabled = false; }, (f) => { f.bridge.remoteSharing = false; },
+    (f) => { f.connection.session = 'replacement-session'; }, (f) => { f.peer.dialResource = {}; },
+    (f) => { f.adapter.child = { stdin: { writable: true } }; }, (f) => { f.bridge.peer = { ...f.peer }; },
+    (f) => f.controller.stop(), (f) => f.controller.close()]) {
+    const f = fixture('client', { controller: { mode: 'notify' } }); await twoHints(f);
+    assert.equal(f.controller.status().notice.phase, 'suggested'); mutate(f);
+    assert.equal(f.controller.status().notice, null); assert.equal(f.refreshes, 0);
+  }
+  const f = fixture('client', { controller: { mode: 'notify' } }); await twoHints(f);
+  f.proxy.downloadBytes += 1024 * 1024; await f.tick(5000);
+  assert.equal(f.controller.status().notice, null, 'Healthy progress withdraws a stale suggestion');
+  assert.equal(f.refreshes, 0);
+});
+
+test('notification mode rejects a single hint, busy work and cross-session hints before suggesting', async () => {
+  const f = fixture('client', { controller: { mode: 'notify' } });
+  f.controller.onHint(f.hint(), f.connection); await f.tick(); assert.equal(f.controller.status().notice, null);
+  f.connection.session = 'new-private-session';
+  f.advance(); f.controller.onHint(f.hint(), f.connection); await f.tick();
+  assert.equal(f.controller.status().notice, null, 'Same connection object with a new session needs fresh confirmation');
+  f.advance(); f.controller.onHint(f.hint(), f.connection); await f.tick();
+  assert.equal(f.controller.status().notice.phase, 'suggested');
+  f.bridge.active.set('model', {}); await f.tick(); assert.equal(f.controller.status().notice, null);
+  f.bridge.active.clear(); await f.tick(); assert.equal(f.controller.status().notice, null);
+  assert.equal(f.refreshes, 0);
+});
+
+test('a rejected old diagnostic read cannot erase fresh evidence from a newer monitoring epoch', async () => {
+  const f = fixture('client', { controller: { mode: 'notify' } });
+  await f.tick(); f.controller.onHint(f.hint(), f.connection); f.advance(); f.controller.onHint(f.hint(), f.connection);
+  const original = f.adapter.diagnostics; let reject;
+  f.adapter.diagnostics = () => new Promise((resolve, failed) => { reject = failed; });
+  const oldRead = f.controller.tick(); assert.equal(typeof reject, 'function');
+  f.controller.reset(); f.controller.onHint(f.hint(), f.connection); f.advance();
+  const fresh = f.hint(); f.controller.onHint(fresh, f.connection);
+  reject(new Error('old private failure')); await oldRead;
+  assert.equal(f.controller.hint.id, fresh.id); assert.equal(f.controller.hint.count, 2);
+  f.adapter.diagnostics = original; await f.tick();
+  assert.equal(f.controller.status().notice.phase, 'suggested'); assert.equal(f.refreshes, 0);
+});
 
 test('idle traffic, unavailable helpers and compatibility mode never start or refresh a node', async () => {
   for (const change of [(f) => { f.entry.activeFlows = f.entry.blockedFlows = 0; }, (f) => { f.adapter.child = null; },
@@ -152,6 +237,7 @@ test('model execution, queueing, cancellation waiting and user stop states erase
     (f) => { f.bridge.paused = true; }, (f) => { f.bridge.stopRequested = true; }, (f) => { f.bridge.closing = true; },
     (f) => { f.bridge.channelProbeActive = true; },
     (f) => { f.bridge.channelSpeedActive = true; },
+    (f) => { f.bridge.channelRefreshActive = true; },
     (f) => { f.bridge.applicationClosing = true; }, (f) => { f.bridge.identityChanging = true; }, (f) => { f.bridge.intentOnline = false; },
     (f) => { f.bridge.pairingInvalid = true; }, (f) => { f.proxy.enabled = false; }, (f) => { f.bridge.remoteSharing = false; }]) {
     const f = fixture(); f.entry.blockedFlows = 0; await f.tick(); f.controller.onHint(f.hint(), f.connection);
@@ -265,4 +351,80 @@ test('public status and fixed logs never serialize identities, credentials, flow
   for (const forbidden of ['private-session', 'private credential', 'hostname', 'URL', 'connection', 'pendingBytes', 'completedBytes']) assert.equal(text.includes(forbidden), false, forbidden);
   assert.equal(f.controller.status().attemptsInWindow, 1);
   assert.equal(f.controller.status().remainingAttempts, 2);
+});
+
+test('manual refresh works without backlog or local proxy and shares the automatic cooldown and attempt budget', async () => {
+  const f = fixture(); f.entry.activeFlows = f.entry.blockedFlows = 0; f.proxy.enabled = false;
+  assert.equal(f.controller.manualStatus().available, true);
+  const manual = () => f.controller.manualRefresh({ peer: f.peer, adapter: f.adapter, child: f.adapter.child, isCurrent: () => true });
+  assert.deepEqual(await manual(), { refreshed: true, reason: 'refreshed' });
+  assert.equal(f.refreshes, 1); assert.equal(f.controller.status().lastReason, 'manual-refresh');
+  assert.deepEqual(f.controller.manualStatus(), { available: false, reason: 'cooldown', retryAfterMs: 120000 });
+  assert.equal((await manual()).reason, 'cooldown'); assert.equal(f.refreshes, 1);
+  f.proxy.enabled = true; f.entry.activeFlows = 2; f.entry.blockedFlows = 0;
+  await twoHints(f); assert.equal(f.refreshes, 1, 'Automatic hints cannot bypass a manual cooldown');
+  f.advance(120000); f.controller.reset(); await twoHints(f); assert.equal(f.refreshes, 2); assert.equal(f.controller.status().lastReason, 'download-stall');
+  assert.equal((await manual()).reason, 'cooldown', 'Manual requests cannot bypass an automatic cooldown');
+  f.advance(120000); assert.equal((await manual()).refreshed, true); assert.equal(f.refreshes, 3);
+  f.advance(120000); assert.equal(f.controller.manualStatus().reason, 'budget-exhausted');
+  assert.equal((await manual()).reason, 'budget-exhausted'); assert.equal(f.refreshes, 3);
+  f.advance(1800000); assert.equal((await manual()).refreshed, true); assert.equal(f.refreshes, 4);
+});
+
+test('manual refresh never starts a helper or acts on B and rechecks captured lifecycle before the native call', async () => {
+  for (const mutate of [(f) => { f.adapter.child = null; }, (f) => { f.adapter.wantRunning = false; },
+    (f) => { f.adapter.embedded = false; }, (f) => { f.peer.role = 'host'; }, (f) => { f.bridge.channelSpeedActive = true; },
+    (f) => f.bridge.active.set('job', {}), (f) => f.controller.stop(), (f) => f.controller.close()]) {
+    const f = fixture(); mutate(f);
+    const result = await f.controller.manualRefresh(); assert.equal(result.refreshed, false); assert.equal(f.refreshes, 0);
+    assert.equal(f.controller.attempts.length, 0);
+  }
+  const f = fixture(), child = f.adapter.child;
+  assert.equal((await f.controller.manualRefresh({ peer: f.peer, adapter: f.adapter, child, isCurrent: () => false })).refreshed, false);
+  assert.equal(f.refreshes, 0); assert.equal(f.controller.attempts.length, 0);
+});
+
+test('manual native failures consume the shared budget and concurrent manual requests are single-flight', async () => {
+  const f = fixture(); let done;
+  f.adapter.refreshTransport = () => new Promise((resolve) => { done = resolve; });
+  const running = f.controller.manualRefresh(); assert.equal(typeof done, 'function');
+  assert.equal(f.controller.manualStatus().reason, 'recovery-busy'); assert.equal((await f.controller.manualRefresh()).reason, 'recovery-busy');
+  assert.equal(f.controller.attempts.length, 1); done({ refreshed: false, reason: 'unavailable' });
+  assert.equal((await running).reason, 'unavailable'); assert.equal(f.controller.manualStatus().reason, 'cooldown');
+  assert.equal(f.controller.status().lastResult, 'unavailable'); assert.equal(f.controller.refreshing, false);
+});
+
+test('synchronous manual refresh log observers cannot start native work after changing model, session or helper state', async () => {
+  for (const mutate of [(f) => f.bridge.pending.set('queued-by-log-observer', {}),
+    (f) => { f.connection.session = 'replacement-session'; }, (f) => { f.adapter.child = { stdin: { writable: true } }; },
+    (f) => { f.bridge.channelSpeedActive = true; }, (f) => f.controller.stop()]) {
+    const f = fixture(), child = f.adapter.child;
+    f.bridge.log = () => mutate(f);
+    const result = await f.controller.manualRefresh({ peer: f.peer, adapter: f.adapter, child });
+    assert.equal(result.refreshed, false); assert.equal(f.refreshes, 0);
+    assert.equal(f.controller.attempts.length, 0, 'An observer-cancelled call never reserves a native attempt');
+    assert.equal(f.controller.lastAttempt, null); assert.equal(f.controller.refreshing, false);
+  }
+});
+
+test('automatic recovery rechecks its evidence and authenticated session after synchronous log state observers', async () => {
+  for (const mutate of [(f) => f.bridge.pending.set('queued-by-state-observer', {}),
+    (f) => { f.connection.session = 'replacement-session'; },
+    (f) => {
+      const connection = { authenticated: true, session: 'replacement-session' };
+      f.peer.clientConnection = connection; f.peer.connections = new Set([connection]);
+      f.setEntries([{ ...f.entry, connection }]);
+    },
+    (f) => { f.adapter.child = { stdin: { writable: true } }; f.adapter.initialized.add(f.adapter.child); },
+    (f) => { f.peer.dialResource = { port: 9999 }; },
+    (f) => { f.entry.activeFlows = 0; }, (f) => { f.entry.consumerBlocked = true; },
+    (f) => { f.controller.downloadFast = true; }, (f) => { f.bridge.channelRefreshActive = true; },
+    (f) => f.controller.stop()]) {
+    const f = fixture(); f.entry.blockedFlows = 0;
+    f.bridge.log = () => mutate(f);
+    await twoHints(f);
+    assert.equal(f.refreshes, 0, 'A log observer cannot let stale evidence reach native refresh');
+    assert.equal(f.controller.attempts.length, 0); assert.equal(f.controller.lastAttempt, null);
+    assert.equal(f.controller.refreshing, false);
+  }
 });

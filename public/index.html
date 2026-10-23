@@ -58,6 +58,8 @@
           <label for="proxy-subscription">完整配置订阅 <span>仅供本机使用，请妥善保管</span></label><div class="proxy-subscription-row"><input id="proxy-subscription" readonly spellcheck="false" placeholder="启用本地节点后生成"><button type="button" class="secondary" id="copy-subscription" disabled>复制订阅地址</button></div>
           <p class="field-hint">配置将互联网流量固定经 B。B 掉线后入口保持运行并拒绝请求，B 恢复后自动重连。导入完整配置可同时设置节点和 DNS。</p>
         </div><p class="field-hint" id="proxy-detail"></p>
+        <p class="field-hint channel-recovery-status" id="channel-recovery-status" role="status" aria-live="polite">后台监测：正在读取当前通道状态。</p>
+        <div class="channel-refresh-entry"><label for="channel-refresh-target" id="channel-refresh-target-label" hidden>刷新指定调用端</label><select id="channel-refresh-target" hidden disabled><option value="">选择要刷新线路的 A</option></select><button type="button" class="secondary" id="channel-refresh-start" disabled>刷新线路</button><span class="field-hint" id="channel-refresh-status" role="status" aria-live="polite">连接已授权的配对设备后可刷新线路。</span></div>
         <div class="diagnostics-entry"><button type="button" class="secondary" id="speed-test-open" aria-haspopup="dialog" disabled>网络测速</button><button type="button" class="secondary" id="network-diagnostics-open" aria-expanded="false" aria-controls="network-diagnostics-panel" disabled>网络诊断</button><span class="subtle">读取本机节点累计统计</span></div>
         <section id="network-diagnostics-panel" class="network-diagnostics" aria-label="本机网络诊断" hidden>
           <div class="card-heading"><h3>本机网络诊断</h3><div><button type="button" class="secondary" id="network-diagnostics-refresh">刷新</button><button type="button" class="text-button" id="network-diagnostics-close">收起</button></div></div>

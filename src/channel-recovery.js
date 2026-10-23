@@ -7,13 +7,15 @@ const number = (value) => Number.isSafeInteger(value) && value >= 0;
 const uuid = (value) => typeof value === 'string' && /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(value);
 const safeResults = new Set(['refreshed', 'cooldown', 'unavailable', 'busy']);
 
-// Observe existing traffic only. A recovery refreshes the running A transport;
-// it never starts a helper, changes pairing, closes streams or changes the OS.
+// Observe existing traffic only. Production defaults to a local suggestion;
+// refreshing requires the user's existing manual action. The automatic mode
+// remains available to internal callers and uses the same conservative guards.
 export class ChannelRecovery {
-  constructor({ bridge, intervalMs = 5000, now = () => performance.now(), setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
-    if (!bridge || !Number.isFinite(intervalMs) || intervalMs < 1) throw new Error('通道恢复配置无效');
-    Object.assign(this, { bridge, intervalMs, now, setIntervalFn, clearIntervalFn });
+  constructor({ bridge, mode = 'notify', intervalMs = 5000, now = () => performance.now(), setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
+    if (!bridge || !['notify', 'automatic'].includes(mode) || !Number.isFinite(intervalMs) || intervalMs < 1) throw new Error('通道恢复配置无效');
+    Object.assign(this, { bridge, mode, intervalMs, now, setIntervalFn, clearIntervalFn });
     this.windows = new Map(); this.attempts = []; this.epoch = 0;
+    this.notice = null; this.noticeSerial = 0;
     this.lastAttempt = null; this.lastRefresh = null; this.lastResult = null; this.lastReason = null;
   }
   start() {
@@ -34,8 +36,37 @@ export class ChannelRecovery {
   }
   reset() {
     ++this.epoch; this.windows.clear(); this.hint = null;
+    if (this.notice?.phase === 'suggested') this.notice = null;
     this.lastTick = null; this.downloadSample = null; this.downloadFast = false;
     this.owner = null; this.helper = null;
+  }
+  setNotice(phase, peer, adapter, child, result = null) {
+    const connection = peer.clientConnection, session = connection?.session, resource = peer.dialResource;
+    const previous = this.notice;
+    const same = previous?.peer === peer && previous.adapter === adapter && previous.child === child &&
+      previous.connection === connection && previous.session === session && previous.resource === resource;
+    this.notice = { id: same ? previous.id : ++this.noticeSerial, at: phase === 'suggested' ? this.hint.at : this.now(), phase, result,
+      peer, adapter, child, connection, session, resource };
+  }
+  freshHint(now, peer, child) {
+    const h = this.hint;
+    return Boolean(h && h.peer === peer && h.connection === peer?.clientConnection && h.session === peer?.clientConnection?.session &&
+      h.resource === peer?.dialResource && h.helper === child && h.count >= 2 && now >= h.at && now - h.at <= 2.5 * this.intervalMs);
+  }
+  currentNotice(now) {
+    const n = this.notice, b = this.bridge, peer = b.peer, adapter = b.networkAdapter;
+    if (!n) return null;
+    const age = now - n.at;
+    const current = !this.closed && !this.stopped && !b.closing && !b.applicationClosing && !b.stopRequested && !b.paused &&
+      !b.identityChanging && b.intentOnline !== false && !b.pairingInvalid && peer?.role === 'client' && peer.state?.online &&
+      peer === n.peer && adapter === n.adapter && adapter?.child === n.child && peer.clientConnection === n.connection &&
+      n.connection?.session === n.session && peer.dialResource === n.resource && peer.isConnected?.(n.connection) &&
+      Number.isFinite(age) && age >= 0 && age <= (n.phase === 'suggested' ? 2.5 * this.intervalMs : 300000);
+    if (!current || (n.phase === 'suggested' && (!this.freshHint(now, peer, adapter.child) || !this.allowed('client') ||
+        !this.manualStatus().available || this.downloadFast || !this.clientSnapshot()))) {
+      this.notice = null; return null;
+    }
+    return { id: n.id, phase: n.phase, ageMs: Math.floor(age), result: n.result };
   }
   modelBusy() {
     const b = this.bridge;
@@ -44,7 +75,7 @@ export class ChannelRecovery {
   log(message) { try { this.bridge.log?.(message); } catch { /* Observability must not control recovery. */ } }
   allowed(role = this.bridge.peer?.role) {
     const b = this.bridge, adapter = b.networkAdapter, peer = b.peer;
-    if (this.closed || this.stopped || b.channelSpeedActive || b.channelProbeActive || b.demo || b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging ||
+    if (this.closed || this.stopped || b.channelRefreshActive || b.channelSpeedActive || b.channelProbeActive || b.demo || b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging ||
         b.intentOnline === false || b.pairingInvalid || !adapter?.embedded || adapter.closed || adapter.wantRunning !== true ||
         !adapter.child || !adapter.child.stdin?.writable || !adapter.initialized?.has(adapter.child) ||
         typeof adapter.diagnostics !== 'function' || !peer || peer.role !== role || !peer.state?.online) return false;
@@ -90,10 +121,13 @@ export class ChannelRecovery {
     if (this.downloadFast) { this.hint = null; return; }
     const previous = this.hint;
     if (previous?.id === msg.id) return;
-    if (previous && previous.connection === connection && previous.helper === this.bridge.networkAdapter.child &&
+    if (previous && previous.connection === connection && previous.peer === peer && previous.session === connection.session &&
+        previous.resource === peer.dialResource && previous.helper === this.bridge.networkAdapter.child &&
         now - previous.at <= 2.5 * this.intervalMs && now - previous.at >= this.intervalMs) {
-      this.hint = { connection, helper: this.bridge.networkAdapter.child, id: msg.id, at: now, count: Math.min(2, previous.count + 1) };
-    } else if (!previous || now - previous.at >= this.intervalMs) this.hint = { connection, helper: this.bridge.networkAdapter.child, id: msg.id, at: now, count: 1 };
+      this.hint = { connection, peer, session: connection.session, resource: peer.dialResource,
+        helper: this.bridge.networkAdapter.child, id: msg.id, at: now, count: Math.min(2, previous.count + 1) };
+    } else if (!previous || now - previous.at >= this.intervalMs) this.hint = { connection, peer, session: connection.session, resource: peer.dialResource,
+      helper: this.bridge.networkAdapter.child, id: msg.id, at: now, count: 1 };
   }
   sampleWindow(entry, counters, now) {
     if (!entry.activeFlows || !entry.blockedFlows || entry.pendingBytes < MIN_PENDING || entry.oldestPendingMs < MIN_PENDING_AGE || entry.consumerBlocked) {
@@ -130,20 +164,21 @@ export class ChannelRecovery {
     this.updateDownload(now);
     let entries = this.snapshots().filter((entry) => entry.side === peer.role && peer.isConnected(entry.connection));
     if (peer.role === 'client' && (!this.clientSnapshot(entries) || this.downloadFast)) {
-      this.windows.clear(); this.hint = null; return;
+      this.windows.clear(); this.hint = null; this.notice = null; return;
     }
-    if (!entries.some((entry) => entry.activeFlows)) { this.windows.clear(); this.hint = null; return; }
-    const readyHint = this.hint?.connection === peer.clientConnection && this.hint.helper === adapter.child &&
-      this.hint.count >= 2 && now - this.hint.at <= 2.5 * this.intervalMs;
+    if (!entries.some((entry) => entry.activeFlows)) { this.windows.clear(); this.hint = null; this.notice = null; return; }
+    const readyHint = this.freshHint(now, peer, adapter.child);
     // Healthy browsing/video needs only these small in-memory counters. Read
     // the heavier native snapshot only for a real backlog or confirmed hints.
     const hasBacklog = entries.some((entry) => entry.activeFlows > 0 && entry.blockedFlows > 0 &&
       entry.pendingBytes >= MIN_PENDING && entry.oldestPendingMs >= MIN_PENDING_AGE && !entry.consumerBlocked);
-    if ((peer.role === 'host' && !hasBacklog) || (peer.role === 'client' && !readyHint)) { this.windows.clear(); return; }
+    if ((peer.role === 'host' && !hasBacklog) || (peer.role === 'client' && !readyHint)) {
+      this.windows.clear(); if (this.notice?.phase === 'suggested') this.notice = null; return;
+    }
     const epoch = this.epoch, child = adapter.child;
     if (!this.allowed() || b.peer !== peer || adapter.child !== child) { this.reset(); return; }
     let diagnostics;
-    try { diagnostics = await adapter.diagnostics(); } catch { this.reset(); return; }
+    try { diagnostics = await adapter.diagnostics(); } catch { if (this.epoch === epoch) this.reset(); return; }
     if (this.epoch !== epoch) return;
     if (!this.allowed() || b.peer !== peer || adapter !== b.networkAdapter || adapter.child !== child) { this.reset(); return; }
     const at = this.now();
@@ -171,31 +206,91 @@ export class ChannelRecovery {
     }
     if (peer.role !== 'client') return;
     const hint = this.hint;
-    const download = hint?.connection === peer.clientConnection && hint.helper === child && hint.count >= 2 && at - hint.at <= 2.5 * this.intervalMs;
+    const download = this.freshHint(at, peer, child);
     if (hint && at - hint.at > 2.5 * this.intervalMs) this.hint = null;
     if (!download) return;
+    if (this.mode === 'notify') {
+      if (this.manualStatus().available && !this.downloadFast && this.clientSnapshot()) this.setNotice('suggested', peer, adapter, child);
+      return;
+    }
     await this.refresh('download-stall', epoch, peer, adapter, child);
   }
   pruneBudget(now) { this.attempts = this.attempts.filter((at) => now - at < BUDGET_WINDOW && now >= at); }
+  manualStatus({ ignoreRefreshing = false } = {}) {
+    const b = this.bridge, adapter = b.networkAdapter, peer = b.peer, now = this.now(); this.pruneBudget(now);
+    let reason = 'ready', retryAfterMs = 0;
+    if (this.closed || this.stopped || b.demo || b.closing || b.applicationClosing || b.stopRequested || b.paused || b.identityChanging || b.intentOnline === false || b.pairingInvalid) reason = 'network-stopped';
+    else if (this.modelBusy()) reason = 'model-busy';
+    else if (b.channelSpeedActive || b.channelProbeActive) reason = 'speed-busy';
+    else if (this.refreshing && !ignoreRefreshing) reason = 'recovery-busy';
+    else if (!adapter?.embedded || adapter.closed || adapter.wantRunning !== true || !adapter.child?.stdin?.writable ||
+        !adapter.initialized?.has(adapter.child) || typeof adapter.refreshTransport !== 'function') reason = 'unavailable';
+    else if (peer?.role !== 'client' || !peer.state?.online || !peer.isConnected?.(peer.clientConnection)) reason = 'not-connected';
+    else if (this.attempts.length >= 3) {
+      reason = 'budget-exhausted'; retryAfterMs = Math.max(1, Math.ceil(this.attempts[0] + BUDGET_WINDOW - now));
+    } else if (this.lastAttempt !== null && now - this.lastAttempt < COOLDOWN) {
+      reason = 'cooldown'; retryAfterMs = Math.max(1, Math.ceil(COOLDOWN - (now - this.lastAttempt)));
+    }
+    return { available: reason === 'ready', reason, retryAfterMs };
+  }
+  async manualRefresh({ peer = this.bridge.peer, adapter = this.bridge.networkAdapter, child = adapter?.child, isCurrent = () => true } = {}) {
+    const connection = peer?.clientConnection, session = connection?.session, resource = peer?.dialResource;
+    const current = () => !this.closed && !this.stopped && this.bridge.peer === peer && this.bridge.networkAdapter === adapter &&
+      adapter?.child === child && peer?.clientConnection === connection && connection?.session === session && peer?.dialResource === resource && isCurrent() === true;
+    if (!current()) return { refreshed: false, reason: 'unavailable' };
+    const status = this.manualStatus();
+    if (!status.available) return { refreshed: false, reason: status.reason, ...(status.retryAfterMs ? { retryAfterMs: status.retryAfterMs } : {}) };
+    this.notice = null;
+    this.refreshing = true;
+    try {
+      this.log('正在按请求重新探测本机桥接传输，保留现有配对和服务端');
+      // Logs can synchronously notify application observers. Recheck after
+      // those callbacks, before reserving an attempt or touching the helper.
+      if (!current()) return { refreshed: false, reason: 'unavailable' };
+      const ready = this.manualStatus({ ignoreRefreshing: true });
+      if (!ready.available) return { refreshed: false, reason: ready.reason, ...(ready.retryAfterMs ? { retryAfterMs: ready.retryAfterMs } : {}) };
+      const now = this.now(); this.attempts.push(now); this.lastAttempt = now; this.lastReason = 'manual-refresh';
+      const result = await adapter.refreshTransport();
+      if (!current()) return { refreshed: false, reason: 'unavailable' };
+      const reason = safeResults.has(result?.reason) && result.refreshed === (result.reason === 'refreshed') ? result.reason : 'unavailable';
+      this.lastResult = reason;
+      if (reason === 'refreshed') this.lastRefresh = this.now();
+      return { refreshed: reason === 'refreshed', reason,
+        ...(Number.isSafeInteger(result?.retryAfterMs) && result.retryAfterMs > 0 && result.retryAfterMs <= COOLDOWN ? { retryAfterMs: result.retryAfterMs } : {}) };
+    } catch { if (current()) this.lastResult = 'unavailable'; return { refreshed: false, reason: 'unavailable' }; }
+    finally { this.refreshing = false; if (current()) this.reset(); }
+  }
   async refresh(reason, epoch, peer, adapter, child) {
+    if (this.mode !== 'automatic') return;
     const now = this.now(); this.pruneBudget(now);
     if (this.refreshing || this.epoch !== epoch || !this.allowed('client') || this.bridge.peer !== peer ||
         this.bridge.networkAdapter !== adapter || adapter.child !== child || !this.clientSnapshot() || this.downloadFast ||
         (this.lastAttempt !== null && now - this.lastAttempt < COOLDOWN) || this.attempts.length >= 3) return;
-    this.attempts.push(now); this.lastAttempt = now; this.lastReason = reason; this.refreshing = true;
-    this.log('检测到桥接通道持续受阻，正在刷新本机桥接传输；配对保持不变');
+    const connection = peer.clientConnection, session = connection?.session, resource = peer.dialResource;
+    this.refreshing = true;
     const current = () => this.epoch === epoch && !this.closed && this.bridge.peer === peer &&
-      this.bridge.networkAdapter === adapter && adapter.child === child;
+      this.bridge.networkAdapter === adapter && adapter.child === child && peer.clientConnection === connection &&
+      connection?.session === session && peer.dialResource === resource;
     try {
+      this.log('检测到桥接通道持续受阻，正在刷新本机桥接传输；配对保持不变');
+      // State observers may synchronously replace the authenticated session or
+      // queue model work while processing the log. Old backlog is not evidence
+      // for a replacement session, and cancelled work consumes no attempt.
+      if (!current() || !this.allowed('client') || this.modelBusy() || !this.clientSnapshot() || this.downloadFast) return;
+      const at = this.now(); this.pruneBudget(at);
+      if ((this.lastAttempt !== null && at - this.lastAttempt < COOLDOWN) || this.attempts.length >= 3) return;
+      this.attempts.push(at); this.lastAttempt = at; this.lastReason = reason;
+      this.setNotice('refreshing', peer, adapter, child);
       const result = await adapter.refreshTransport();
       if (!current()) return;
       this.lastResult = safeResults.has(result?.reason) && result.refreshed === (result.reason === 'refreshed') ? result.reason : 'unavailable';
+      this.setNotice(this.lastResult === 'refreshed' ? 'refreshed' : 'failed', peer, adapter, child, this.lastResult);
       if (result?.refreshed === true && result.reason === 'refreshed') {
         this.lastRefresh = this.now();
         this.log('本机桥接传输已刷新，继续观察通道状态');
       } else this.log('本次桥接传输未刷新，已进入恢复冷却期');
     } catch {
-      if (current()) { this.lastResult = 'unavailable'; this.log('本次桥接传输暂不可用，已进入恢复冷却期'); }
+      if (current()) { this.lastResult = 'unavailable'; this.setNotice('failed', peer, adapter, child, 'unavailable'); this.log('本次桥接传输暂不可用，已进入恢复冷却期'); }
     } finally { this.refreshing = false; if (current()) this.reset(); }
   }
   status() {
@@ -203,7 +298,7 @@ export class ChannelRecovery {
     const cooldownMs = this.lastAttempt === null ? 0 : Math.max(0, Math.ceil(COOLDOWN - (now - this.lastAttempt)));
     const enabled = !this.closed && this.bridge.networkAdapter?.embedded === true;
     const state = !enabled ? 'disabled' : this.refreshing ? 'refreshing' : this.attempts.length >= 3 ? 'budget-exhausted' : cooldownMs ? 'cooldown' : this.allowed() ? 'monitoring' : 'waiting';
-    return { enabled, state, attemptsInWindow: this.attempts.length, remainingAttempts: Math.max(0, 3 - this.attempts.length), cooldownMs,
+    return { enabled, mode: this.mode, state, notice: this.currentNotice(now), attemptsInWindow: this.attempts.length, remainingAttempts: Math.max(0, 3 - this.attempts.length), cooldownMs,
       lastAttemptAgoMs: this.lastAttempt === null ? null : Math.max(0, Math.floor(now - this.lastAttempt)),
       lastRefreshAgoMs: this.lastRefresh === null ? null : Math.max(0, Math.floor(now - this.lastRefresh)),
       lastResult: this.lastResult, lastReason: this.lastReason };

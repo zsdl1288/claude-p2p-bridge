@@ -43,6 +43,10 @@ test('the browser entry point and its role-state module are served together', as
   assert.equal(state.status, 200);
   assert.match(state.headers.get('content-type'), /javascript/);
   assert.match(await state.text(), /export function uiState/);
+  const monitoring = await fetch(`${url}/channel-recovery.js`);
+  assert.equal(monitoring.status, 200);
+  assert.match(monitoring.headers.get('content-type'), /javascript/);
+  assert.match(await monitoring.text(), /export function channelRecoveryText/);
   const diagnostics = await fetch(`${url}/network-diagnostics.js`);
   assert.equal(diagnostics.status, 200);
   assert.match(diagnostics.headers.get('content-type'), /javascript/);
@@ -113,6 +117,44 @@ test('channel speed tests are authenticated management jobs and cannot accept ar
   assert.equal(cancels, 1);
   assert.equal((await fetch(`${url}${route}`, { method: 'PUT', headers })).status, 405);
   const module = await fetch(`${url}/speed-test.js`); assert.equal(module.status, 200); assert.match(module.headers.get('content-type'), /javascript/);
+});
+
+test('manual route refresh is an authenticated management action with a fixed paired target', async (t) => {
+  let reads = 0, starts = 0;
+  const state = { connected: true, available: true, busy: false, reason: 'ready', retryAfterMs: 0,
+    targets: [{ id: 'paired-control', role: 'host', supported: true }], job: null };
+  const channelRefresh = {
+    status() { reads++; return structuredClone(state); },
+    start(body) {
+      if (body.targetId !== 'paired-control') throw Object.assign(new Error('Target changed'), { status: 409 });
+      starts++; state.busy = true; state.available = false;
+      state.job = { id, targetId: body.targetId, state: 'running', phase: 'before', result: null };
+      return state.job;
+    },
+  };
+  const { url, modelUrl } = await fixture(t, { channelRefresh }, { modelApi: true });
+  const route = '/api/proxy/refresh';
+  for (const method of ['GET', 'POST']) {
+    const options = { method, ...(method === 'POST' ? { body: '{"targetId":"paired-control"}' } : {}) };
+    assert.equal((await fetch(url + route, options)).status, 401);
+    assert.equal((await fetch(url + route, { ...options, headers: { ...headers, Origin: 'https://example.invalid' } })).status, 403);
+    assert.equal((await fetch(modelUrl + route, { ...options, headers })).status, 404);
+  }
+  assert.equal(reads + starts, 0, 'Rejected requests cannot reach the refresh controller');
+  const status = await fetch(url + route, { headers });
+  assert.equal(status.status, 200); assert.equal(status.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await status.json(), state);
+  for (const body of [{}, { host: '8.8.8.8' }, { targetId: '' }, { targetId: 7 }, { targetId: 'x'.repeat(129) },
+    { targetId: 'paired-control', region: 1 }, { targetId: 'paired-control', action: 'pick-new-derp' }]) {
+    assert.equal((await fetch(url + route, { method: 'POST', headers, body: JSON.stringify(body) })).status, 400);
+  }
+  assert.equal((await fetch(url + route, { method: 'POST', headers, body: '{"targetId":"unrelated"}' })).status, 409);
+  assert.equal(starts, 0);
+  const accepted = await fetch(url + route, { method: 'POST', headers, body: '{"targetId":"paired-control"}' });
+  assert.equal(accepted.status, 202); assert.deepEqual(await accepted.json(), state); assert.equal(starts, 1);
+  assert.equal((await fetch(url + route, { method: 'PUT', headers })).status, 405);
+  const module = await fetch(url + '/channel-refresh.js');
+  assert.equal(module.status, 200); assert.match(module.headers.get('content-type'), /javascript/);
 });
 
 test('task responses handle synchronous completion without missing headers, IDs or cleanup', async (t) => {
