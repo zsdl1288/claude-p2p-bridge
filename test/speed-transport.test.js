@@ -76,6 +76,112 @@ test('a stalled write callback ends within the phase confirmation budget with ac
   assert.equal(f.host.peer.isConnected(f.bConnection), true); assert.equal(f.client.peer.isConnected(f.aConnection), true);
 });
 
+test('cancelling a paced send wakes its scheduled wait without sending another frame', { timeout: 3000 }, async (t) => {
+  const f = await fixture(t, { phaseMs: 1500, maxBytes: 8 * 1024 * 1024 }), abort = new AbortController();
+  f.host.networkAdapter = { embedded: true, child: {} };
+  f.b.startLatency = (s) => { s.metrics.latency = { samples: [1000], minMs: 1000, medianMs: 1000, maxMs: 1000, failedSamples: 0 }; };
+  f.b.ping = () => {};
+  const send = f.b.send.bind(f.b), started = performance.now();
+  let timer, session, binaryWrites = 0, waitingBeforeCreditExhaustion = false;
+  t.after(() => clearTimeout(timer));
+  f.b.send = (s, value, binary) => {
+    if (binary) {
+      session = s; binaryWrites++;
+      if (binaryWrites === 1) timer = setTimeout(() => {
+        waitingBeforeCreditExhaustion = s.credits.size > 0 && s.sending.sentBytes < 128 * 1024;
+        abort.abort('user-cancelled');
+      }, 20);
+    }
+    return send(s, value, binary);
+  };
+  const [b, a] = await Promise.all([f.b.host({ ...f.bArgs, signal: abort.signal }), f.a.client(f.aArgs)]);
+  assert.equal(waitingBeforeCreditExhaustion, true, 'The sender was waiting for its next send time with receiver credit still available');
+  assert.equal(b.completed, false); assert.equal(b.stopReason, 'user-cancelled'); assert.equal(a.completed, false);
+  assert.ok(performance.now() - started < 800, 'Cancel must not wait for the sampling phase to finish');
+  assert.equal(binaryWrites, 1); assert.equal(session.credits.size, 0);
+  await delay(150);
+  assert.equal(binaryWrites, 1, 'An expired pacing timer must not send after cancellation');
+  assert.equal(f.host.peer.isConnected(f.bConnection), true);
+});
+
+test('the phase deadline interrupts pacing while preserving actual receiver totals', { timeout: 3000 }, async (t) => {
+  const f = await fixture(t, { phaseMs: 40, maxBytes: 8 * 1024 * 1024, confirmationMs: 500 });
+  f.host.networkAdapter = { embedded: true, child: {} };
+  f.b.startLatency = (s) => { s.metrics.latency = { samples: [1000], minMs: 1000, medianMs: 1000, maxMs: 1000, failedSamples: 0 }; };
+  f.b.ping = () => {};
+  const send = f.b.send.bind(f.b), frames = [], started = performance.now();
+  let session;
+  f.b.send = (s, value, binary) => {
+    if (binary) { session = s; frames.push(value.length); }
+    return send(s, value, binary);
+  };
+  const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+  assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
+  assert.equal(frames.length, 1, 'A send scheduled after the phase must be skipped');
+  assert.ok(frames[0] > 0 && frames[0] <= 32 * 1024);
+  assert.equal(a.download.receivedBytes, frames.reduce((total, bytes) => total + bytes, 0));
+  assert.equal(a.download.bytesPerSecond, a.download.receivedBytes * 1000 / a.download.durationMs);
+  assert.equal(a.download.limitReached, false); assert.equal(session.credits.size, 0);
+  assert.ok(performance.now() - started < 1000, 'Pacing must retain the existing bounded phase and confirmation');
+});
+
+test('scheduled receiver feedback does not skip a period after small timer jitter', (t) => {
+  let now = 0;
+  const messages = [], transport = Object.create(SpeedTransport.prototype);
+  Object.assign(transport, { now: () => now, progressMs: 200, progress() {},
+    async sendJSON(_session, message) { messages.push(structuredClone(message)); } });
+  const receive = { direction: 'download', bytes: 32 * 1024, reportedBytes: 0, at: 0, lastProgress: -Infinity };
+  const session = { receive, metrics: {} };
+  t.after(() => clearTimeout(receive.timer));
+  transport.receiveProgress(session);
+  assert.equal(messages.length, 1);
+  const deadline = receive.timer;
+  now = 199.5; receive.bytes = 64 * 1024;
+  transport.receiveProgress(session);
+  assert.equal(messages.length, 1); assert.equal(receive.timer, deadline, 'Insufficient data time must not postpone feedback');
+  transport.receiveProgress(session, true);
+  assert.equal(messages.length, 2, 'A scheduled tick must not wait a second full period');
+  assert.equal(messages[1].metrics.receivedBytes, 64 * 1024);
+  now = 200; receive.bytes = 128 * 1024;
+  transport.receiveProgress(session);
+  assert.equal(messages.length, 3, 'The initial window gets one prompt receipt');
+  now = 201; receive.bytes += 32 * 1024;
+  transport.receiveProgress(session);
+  assert.equal(messages.length, 3, 'Ordinary data still respects the feedback cadence');
+  assert.ok(messages.every((message) => message.metrics.bytesPerSecond === message.metrics.receivedBytes * 1000 / message.metrics.durationMs));
+});
+
+test('receiver feedback rejects intervals that overflow the platform timer', () => {
+  for (const progressMs of [0x80000000, Number.MAX_SAFE_INTEGER]) {
+    assert.throws(() => new SpeedTransport({ bridge: {}, progressMs }), /测速传输配置无效/);
+  }
+  const transport = new SpeedTransport({ bridge: {}, progressMs: 0x7fffffff });
+  transport.close();
+});
+
+test('overflowing peer rates cannot poison the send window or pacing clock', { timeout: 5000 }, async (t) => {
+  for (const durations of [[Number.MIN_VALUE], [1e-300, 1e-300 * (1 + Number.EPSILON)]]) {
+    const f = await fixture(t, { phaseMs: 1000, maxBytes: 8 * 1024 * 1024 });
+    const sendJSON = f.a.sendJSON.bind(f.a);
+    let injected = false;
+    f.a.sendJSON = async (s, message) => {
+      if (!injected && message.type === 'progress' && message.direction === 'download') {
+        injected = true;
+        for (const [index, durationMs] of durations.entries()) {
+          await sendJSON(s, { ...message, metrics: { ...message.metrics, receivedBytes: index + 1, durationMs } });
+        }
+        return;
+      }
+      return sendJSON(s, message);
+    };
+    const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
+    assert.equal(injected, true); assert.equal(b.completed, false); assert.equal(a.completed, false);
+    assert.equal(b.stopReason, 'transport-failed');
+    assert.ok(Number.isFinite(b.download.bytesPerSecond));
+    assert.equal(f.host.peer.isConnected(f.bConnection), true, 'Invalid test feedback must not close the paired control channel');
+  }
+});
+
 test('missing receiver acknowledgement is bounded independently of the overall deadline', async (t) => {
   const f = await fixture(t, { confirmationMs: 100, deadlineMs: 2500 });
   const sendJSON = f.a.sendJSON.bind(f.a), started = performance.now();
@@ -201,7 +307,9 @@ test('receiver credits grow beyond a small bandwidth-delay window on an actual d
   const [b, a] = await Promise.all([f.b.host(f.bArgs), f.a.client(f.aArgs)]);
   assert.equal(a.completed, true, JSON.stringify(a)); assert.deepEqual(a, b);
   assert.ok(a.latency.minMs >= 50, JSON.stringify(a.latency));
-  assert.ok(largestUnreceived > 256 * 1024, 'Actual receiver feedback grows the initial credit window');
+  // Pacing can grow credit without filling it in a burst. The receiver byte
+  // totals below verify useful growth without requiring a queued burst.
+  t.diagnostic(JSON.stringify({ download: a.download, upload: a.upload, largestUnreceived }));
   assert.ok(largestUnreceived <= 4 * 1024 * 1024 + 64 * 1024, 'Unreceived application bytes remain bounded');
   assert.ok(a.download.receivedBytes >= 4 * 1024 * 1024 && a.download.receivedBytes <= 8 * 1024 * 1024);
   assert.ok(a.upload.receivedBytes >= 4 * 1024 * 1024 && a.upload.receivedBytes <= 8 * 1024 * 1024);

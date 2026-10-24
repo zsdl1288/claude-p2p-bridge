@@ -4,6 +4,7 @@ import { digest, equalSecret } from './crypto.js';
 import { rejectUpgrade } from './http-upgrade.js';
 
 const FRAME_BYTES = 64 * 1024, MAX_BYTES = 256 * 1024 * 1024, MAX_BUFFER = 4 * 1024 * 1024;
+const SEND_FRAME_BYTES = 16 * 1024, INITIAL_CREDIT_BYTES = 128 * 1024;
 const MAX_RTT_SAMPLES = 64;
 const UUID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 const STOP_REASONS = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy',
@@ -30,7 +31,7 @@ export class SpeedTransport {
     pingMs = 2500, pingIntervalMs = 1000, confirmationMs = 5000, progressMs = 200, now = () => performance.now() } = {}) {
     if (!bridge || ![phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, pingIntervalMs, confirmationMs, progressMs].every((n) => Number.isSafeInteger(n) && n > 0) ||
         phaseMs > 20000 || maxBytes > MAX_BYTES || deadlineMs > 60000 || handshakeMs > 5000 || pingMs > 2500 ||
-        pingIntervalMs < 20 || confirmationMs > 5000) throw new Error('测速传输配置无效');
+        pingIntervalMs < 20 || confirmationMs > 5000 || progressMs > 0x7fffffff) throw new Error('测速传输配置无效');
     Object.assign(this, { bridge, phaseMs, maxBytes, deadlineMs, handshakeMs, pingMs, pingIntervalMs, confirmationMs, progressMs, now });
     this.sessions = new Set(); this.pending = new Map(); this.unverified = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false });
@@ -156,7 +157,13 @@ export class SpeedTransport {
           if (partial.receivedBytes < previous.receivedBytes || partial.durationMs < previous.durationMs) throw failure();
           if (!s.sending || s.sending.direction !== msg.direction || partial.receivedBytes > s.sending.sentBytes) throw failure();
           const elapsed = partial.durationMs - previous.durationMs;
-          s.sending.recentBytesPerSecond = elapsed > 0 ? (partial.receivedBytes - previous.receivedBytes) * 1000 / elapsed : 0;
+          const sampleRate = elapsed > 0 ? (partial.receivedBytes - previous.receivedBytes) * 1000 / elapsed : 0;
+          if (!Number.isFinite(sampleRate)) throw failure();
+          const weight = 1 - Math.exp(-elapsed / (2 * Math.max(this.progressMs, s.metrics.latency.minMs || 250)));
+          const recentRate = s.sending.recentBytesPerSecond;
+          // Frame boundaries and feedback timers can yield one zero-delta
+          // sample. Smooth it in time; sustained stalls still decay the rate.
+          s.sending.recentBytesPerSecond = recentRate > 0 ? recentRate + weight * (sampleRate - recentRate) : sampleRate;
           s.metrics[msg.direction] = { ...partial, completion: partial.receivedBytes ? 'partial' : 'failed' };
           for (const waiter of [...s.credits]) waiter();
           this.progress(s, msg.direction, { bytes: partial.receivedBytes, elapsedMs: partial.durationMs,
@@ -285,8 +292,8 @@ export class SpeedTransport {
   beginReceive(s, direction) {
     if (s.receive) throw failure();
     s.confirmUntil = null;
-    const receive = s.receive = { direction, bytes: 0, at: this.now(), lastProgress: -Infinity };
-    receive.timer = setInterval(() => this.receiveProgress(s), this.progressMs);
+    const receive = s.receive = { direction, bytes: 0, reportedBytes: 0, at: this.now(), lastProgress: -Infinity };
+    receive.timer = setTimeout(() => { if (s.receive === receive) this.receiveProgress(s, true); }, this.progressMs);
     receive.timer.unref?.();
     // The receiver also owns a phase deadline: a peer that keeps its socket
     // alive but never sends phase-end must not hold the UI until the group cap.
@@ -299,10 +306,20 @@ export class SpeedTransport {
     return { receivedBytes: r.bytes, durationMs: elapsed, bytesPerSecond: r.bytes * 1000 / elapsed,
       completion: complete ? 'complete' : r.bytes ? 'partial' : 'failed', limitReached };
   }
-  receiveProgress(s) {
+  receiveProgress(s, scheduled = false) {
     const r = s.receive, now = this.now();
-    if (!r || s.error || s.finished || now - r.lastProgress < this.progressMs) return;
+    if (!r || s.error || s.finished) return;
+    const due = scheduled || now - r.lastProgress >= this.progressMs;
+    const initialCreditReceived = r.bytes >= INITIAL_CREDIT_BYTES && r.reportedBytes < INITIAL_CREDIT_BYTES;
+    if (!due && !initialCreditReceived) return;
+    // A single deadline follows actual feedback. A fixed interval plus an
+    // elapsed-time guard can skip a whole tick after sub-ms timer jitter.
+    // Data that cannot emit feedback must not postpone this deadline.
     r.lastProgress = now;
+    r.reportedBytes = r.bytes;
+    clearTimeout(r.timer);
+    r.timer = setTimeout(() => { if (s.receive === r) this.receiveProgress(s, true); }, this.progressMs);
+    r.timer.unref?.();
     const metrics = this.receiverResult(s);
     s.metrics[r.direction] = metrics;
     this.progress(s, r.direction, { bytes: metrics.receivedBytes, elapsedMs: metrics.durationMs, bytesPerSecond: metrics.bytesPerSecond });
@@ -311,7 +328,7 @@ export class SpeedTransport {
   endReceive(s, complete, limitReached = false) {
     if (!s.receive) return;
     const { direction } = s.receive, metrics = this.receiverResult(s, complete, limitReached);
-    clearInterval(s.receive.timer); clearTimeout(s.receive.deadline);
+    clearTimeout(s.receive.timer); clearTimeout(s.receive.deadline);
     s.metrics[direction] = metrics; s.received[direction] = metrics; s.receive = null;
     this.progress(s, direction, { bytes: metrics.receivedBytes, elapsedMs: metrics.durationMs, bytesPerSecond: metrics.bytesPerSecond });
     return metrics;
@@ -322,12 +339,14 @@ export class SpeedTransport {
         typeof value.limitReached !== 'boolean' || !['complete', 'partial', 'failed'].includes(value.completion) ||
         (complete && value.completion !== 'complete') || (value.limitReached && value.receivedBytes !== this.maxBytes)) throw failure();
     // Recompute the rate, rather than trusting a peer-supplied quotient.
-    return { receivedBytes: value.receivedBytes, durationMs: value.durationMs, bytesPerSecond: value.receivedBytes * 1000 / value.durationMs,
+    const bytesPerSecond = value.receivedBytes * 1000 / value.durationMs;
+    if (!Number.isFinite(bytesPerSecond)) throw failure();
+    return { receivedBytes: value.receivedBytes, durationMs: value.durationMs, bytesPerSecond,
       completion: value.completion, limitReached: value.limitReached };
   }
   async sendPhase(s, direction) {
-    const startedAt = this.now(), data = Buffer.alloc(FRAME_BYTES, 0xa5), pending = new Set();
-    let sentBytes = 0;
+    const startedAt = this.now(), data = Buffer.alloc(SEND_FRAME_BYTES, 0xa5), pending = new Set();
+    let sentBytes = 0, paceAt = startedAt;
     s.confirmUntil = null;
     s.sending = { direction, sentBytes: 0 };
     this.progress(s, direction);
@@ -341,25 +360,51 @@ export class SpeedTransport {
       // cap local/nearby paths at one tiny credit window every 200 ms. Cover
       // that feedback interval without adding it twice to long-RTT queues.
       const feedbackMs = Math.max(Math.max(1, rtt) * 2, Math.max(1, rtt) + this.progressMs);
-      const credit = Math.min(MAX_BUFFER, Math.max(128 * 1024, rate * feedbackMs / 1000 + 128 * 1024));
+      // A first small frame can arrive with the phase header in one read.
+      // Its near-zero duration is not evidence for a multi-MiB send window.
+      const credit = remote.receivedBytes < INITIAL_CREDIT_BYTES ? INITIAL_CREDIT_BYTES
+        : Math.min(MAX_BUFFER, Math.max(INITIAL_CREDIT_BYTES, rate * feedbackMs / 1000 + INITIAL_CREDIT_BYTES));
       if (sentBytes - remote.receivedBytes >= credit) {
         await new Promise((resolve, reject) => {
           const finish = (error) => { clearTimeout(timer); s.credits.delete(finish); if (error) reject(error); else resolve(); };
           const timer = setTimeout(finish, Math.max(1, this.phaseMs - (this.now() - startedAt)));
           s.credits.add(finish);
         });
+        paceAt = this.now();
         continue;
       }
       // A four-MiB pipeline accommodates a high-latency path without allowing
       // unbounded ws memory or treating local write callbacks as remote receipt.
-      if (pending.size >= MAX_BUFFER / FRAME_BYTES || s.ws.bufferedAmount >= MAX_BUFFER) {
+      if (pending.size >= MAX_BUFFER / SEND_FRAME_BYTES || s.ws.bufferedAmount >= MAX_BUFFER) {
         if (!pending.size) throw failure();
         // A local write callback is only queue backpressure. Never let it turn
         // a 20-second sampling phase into an unbounded wait for the path.
         if (await this.waitUntil(s, Promise.race(pending), startedAt + this.phaseMs) === false) break;
+        paceAt = this.now();
         continue;
       }
-      const length = Math.min(FRAME_BYTES, this.maxBytes - sentBytes);
+      const length = Math.min(SEND_FRAME_BYTES, this.maxBytes - sentBytes);
+      // The embedded userspace TCP path benefits from smaller paced bursts.
+      // Kernel TCP keeps its own scheduling. Use actual receiver feedback,
+      // never local write callbacks, to estimate a useful sending rate.
+      const paceEnabled = s.adapter?.embedded === true && s.metrics.latency.minMs >= 20;
+      const paceRate = Math.min(32 * 1024 * 1024, Math.max(256 * 1024,
+        rate * 1.25 + INITIAL_CREDIT_BYTES * 1000 / Math.max(20, rtt)));
+      if (paceEnabled && paceAt > this.now()) {
+        await new Promise((resolve, reject) => {
+          const finish = (error) => { clearTimeout(timer); s.credits.delete(finish); if (error) reject(error); else resolve(); };
+          const timer = setTimeout(finish, Math.max(1, Math.min(paceAt, startedAt + this.phaseMs) - this.now()));
+          s.credits.add(finish);
+        });
+        this.check(s);
+        if (this.now() >= startedAt + this.phaseMs) break;
+        if (paceAt - this.now() > 0.1) continue;
+      }
+      // Compensate coarse timer wakeups, but cap total catchup at the initial
+      // window. Credit/write stalls above reset this clock instead of banking
+      // an entire blocked interval for an oversized burst on recovery.
+      const intervalMs = length * 1000 / paceRate;
+      paceAt = paceEnabled ? Math.max(paceAt, this.now() - (INITIAL_CREDIT_BYTES - length) * 1000 / paceRate) + intervalMs : this.now();
       const write = this.send(s, data.subarray(0, length), true);
       pending.add(write);
       write.then(() => pending.delete(write), () => pending.delete(write));
