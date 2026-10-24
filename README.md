@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.2.3
+# Claude Bridge · Windows 桌面托盘版 v1.2.4
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,9 +8,9 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-发布文件为 `release/ClaudeBridge-1.2.3-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+发布文件为 `release/ClaudeBridge-1.2.4-windows-x64.exe`，支持 Windows 10/11 x64。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
-桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.2.3.zip`，不含本机账号、配对或 API Token。
+桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码包为 `release/claude-p2p-bridge-1.2.4.zip`，不含本机账号、配对或 API Token。
 
 调用端与服务端均支持浅色、深色主题，切换按钮位于左下角“设置”上方。右上角状态框以绿色表示已连接、黄色表示等待连接、红色表示尚未选择身份或需要登录。设备、配对、模型和代理页面统一使用明确的调用端／服务端名称及彩色按钮。
 
@@ -63,6 +63,16 @@ B 的“Claude 程序路径或命令”保留默认 `claude` 即可自动检测�
 拔网线、Wi-Fi 切换、宽带重拨及公网 IP 变化时，客户端使用原 Tailscale 身份和配对重连，重试间隔逐步增长、最高 15 秒。公网 IP 不写入配对码。删除设备身份、重新注册造成 Tailscale 虚拟地址改变时，需重新授权或配对；自动重连不能替代失效的账号授权。
 
 两端需保持开机联网，休眠、关机或客户端完全退出期间无法提供服务。
+
+### 批量丢包后的 TCP 恢复修复（1.2.4）
+
+修复 RACK 丢失标记与恢复阶段在途计数不一致的问题：已经判定丢失的数据不再占住重传窗口，恢复发送前按当前丢失标记重新计算可发送空间。传统 SACK 恢复继续使用原有 RFC6675 计数，避免把两种丢失判定混用。
+
+同时落实成功数据重传后的保守超时计时器刷新，避免沿用过早的到期时间而反复退回超时恢复；发送失败不会错误延后既有计时器。只有新数据发送或累计确认推进才重排已有 PTO，对端仅回反向数据或重复确认时保留原期限；进入恢复及探测后确保 RTO 兜底，避免计时器被不断推迟。该修复不修改 CUBIC、最小 RTO 或公网线路。相关计数、计时器和批量丢包回归位于 `native/_tcp_recovery/gvisor/`，构建仍核对固定上游源码及补丁来源。
+
+超时后继续遵守恢复点，在旧数据尚未恢复到该点前保持 RTO 慢启动，不重新进入快速恢复。选择确认账本可以清空重建，但同一发送次数的 RACK 送达记录单独保留，避免把重复旧确认再次采样成越来越大的 RTT；实际重传后的新送达仍可用于学习。
+
+设计依据：[RFC8985 的 RACK/TLP 发送与计时规则](https://www.rfc-editor.org/rfc/rfc8985.html#section-7.2)，以及 [RFC6675 的恢复重传计时器规则](https://www.rfc-editor.org/rfc/rfc6675.html#section-6)。
 
 ### 乱序连接的 TCP 恢复修复（1.2.3）
 

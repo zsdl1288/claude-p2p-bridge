@@ -75,6 +75,34 @@
         {
           "old": "\t\tif s.Outstanding < 0 {\n\t\t\ts.Outstanding = 0\n\t\t}\n\n\t\ts.SetPipe()\n\n\t\t// If all outstanding data was acknowledged the disable the timer.\n\t\t// RFC 6298 Rule 5.3\n\t\tif s.SndUna == s.SndNxt {\n\t\t\ts.Outstanding = 0\n\t\t\t// Reset firstRetransmittedSegXmitTime to the zero value.\n\t\t\ts.firstRetransmittedSegXmitTime = tcpip.MonotonicTime{}\n",
           "new": "\t\tif s.Outstanding < 0 {\n\t\t\ts.Outstanding = 0\n\t\t}\n\n\t\ts.SetPipe()\n\n\t\t// A recovery pipe excludes SACKed packets; normal Outstanding includes\n\t\t// every sent packet not cumulatively acknowledged. Convert once.\n\t\tif pipeWasCalculated && !s.FastRecovery.Active && s.state == tcpip.Open {\n\t\t\toutstanding, sacked := 0, 0\n\t\t\tfor seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {\n\t\t\t\tif !seg.sequenceNumber.LessThan(s.SndNxt) {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t\tcount := s.pCount(seg, s.MaxPayloadSize)\n\t\t\t\toutstanding += count\n\t\t\t\tif seg.acked {\n\t\t\t\t\tsacked += count\n\t\t\t\t}\n\t\t\t}\n\t\t\ts.Outstanding, s.SackedOut = outstanding, sacked\n\t\t}\n\t\t// If all outstanding data was acknowledged the disable the timer.\n\t\t// RFC 6298 Rule 5.3\n\t\tif s.SndUna == s.SndNxt {\n\t\t\ts.Outstanding = 0\n\t\t\t// Reset firstRetransmittedSegXmitTime to the zero value.\n\t\t\ts.firstRetransmittedSegXmitTime = tcpip.MonotonicTime{}\n"
+        },
+        {
+          "old": "\t\t\tif s.ep.scoreboard.IsSACKED(sb) {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// SetPipe():",
+          "new": "\t\t\tif s.ep.scoreboard.IsSACKED(sb) {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// RACK marks loss by transmit time, including data beyond the\n\t\t\t// highest SACK. sendSegment clears lost for a new transmission,\n\t\t\t// so count that copy once; RFC6675 HighRxt would count it twice.\n\t\t\tif s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {\n\t\t\t\tif !s1.lost {\n\t\t\t\t\tpipe++\n\t\t\t\t}\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// SetPipe():"
+        },
+        {
+          "old": "\tif err != nil && seg.payloadSize() != 0 {\n\t\tif s.FastRecovery.Active && seg.xmitCount > 1 && s.ep.SACKPermitted {",
+          "new": "\tif seg.payloadSize() != 0 {\n\t\tif err == nil && s.FastRecovery.Active && seg.xmitCount > 1 && s.ep.SACKPermitted {"
+        },
+        {
+          "old": "\t\tif shouldScheduleProbe && s.shouldSchedulePTO() {\n\t\t\t// Schedule PTO after transmitting new data that wasn't itself a TLP probe.\n\t\t\ts.schedulePTO()\n\t\t} else if !s.resendTimer.enabled() {\n\t\t\ts.probeTimer.disable()\n\t\t\tif s.Outstanding > 0 {\n\t\t\t\t// Enable the resend timer if it's not enabled yet and there is\n\t\t\t\t// outstanding data.\n\t\t\t\ts.resendTimer.enable(s.RTO)\n\t\t\t}\n\t\t}",
+          "new": "\t\tif shouldScheduleProbe && s.shouldSchedulePTO() {\n\t\t\t// Only new data may restart PTO here. Cumulative ACK progress\n\t\t\t// schedules it explicitly in handleRcvdSegment; reverse payload\n\t\t\t// with no ACK progress must preserve the existing PTO or RTO.\n\t\t\tif dataSent || (!s.probeTimer.enabled() && !s.resendTimer.enabled()) {\n\t\t\t\ts.schedulePTO()\n\t\t\t}\n\t\t} else {\n\t\t\t// Recovery and the post-probe RTO path must cancel PTO even\n\t\t\t// when sendSegment has already armed the resend timer.\n\t\t\ts.probeTimer.disable()\n\t\t\tif !s.resendTimer.enabled() && s.Outstanding > 0 {\n\t\t\t\t// Enable the resend timer if it's not enabled yet and there is\n\t\t\t\t// outstanding data.\n\t\t\t\ts.resendTimer.enable(s.RTO)\n\t\t\t}\n\t\t}"
+        },
+        {
+          "old": "\tfor _, sb := range sackBlocks {\n\t\tfor seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0 {\n\t\t\tif sb.Start.LessThanEq(seg.sequenceNumber) && !seg.acked && s.ep.scoreboard.IsSACKED(seg.sackBlock()) {\n\t\t\t\ts.rc.update(seg, rcvdSeg)\n\t\t\t\ts.rc.detectReorder(seg)\n\t\t\t\tseg.acked = true\n\t\t\t\ts.SackedOut += s.pCount(seg, s.MaxPayloadSize)\n\t\t\t}\n",
+          "new": "\tfor _, sb := range sackBlocks {\n\t\tfor seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0 {\n\t\t\tif sb.Start.LessThanEq(seg.sequenceNumber) && !seg.acked && s.ep.scoreboard.IsSACKED(seg.sackBlock()) {\n\t\t\t\tif s.rc.update(seg, rcvdSeg) {\n\t\t\t\t\ts.rc.detectReorder(seg)\n\t\t\t\t}\n\t\t\t\tseg.acked = true\n\t\t\t\ts.SackedOut += s.pCount(seg, s.MaxPayloadSize)\n\t\t\t}\n"
+        },
+        {
+          "old": "\n\t\t\t// Update the RACK fields if SACK is enabled.\n\t\t\tif s.ep.SACKPermitted && !seg.acked && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {\n\t\t\t\ts.rc.update(seg, rcvdSeg)\n\t\t\t\ts.rc.detectReorder(seg)\n\t\t\t}\n\n\t\t\ts.writeList.Remove(seg)\n",
+          "new": "\n\t\t\t// Update the RACK fields if SACK is enabled.\n\t\t\tif s.ep.SACKPermitted && !seg.acked && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {\n\t\t\t\tif s.rc.update(seg, rcvdSeg) {\n\t\t\t\t\ts.rc.detectReorder(seg)\n\t\t\t\t}\n\t\t\t}\n\n\t\t\ts.writeList.Remove(seg)\n"
+        },
+        {
+          "old": "\t\t// After the reorder window is calculated, detect any loss by checking\n\t\t// if the time elapsed after the segments are sent is greater than the\n\t\t// reorder window.\n\t\tif numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active {\n\t\t\t// If any segment is marked as lost by\n\t\t\t// RACK, enter recovery and retransmit\n\t\t\t// the lost segments.\n",
+          "new": "\t\t// After the reorder window is calculated, detect any loss by checking\n\t\t// if the time elapsed after the segments are sent is greater than the\n\t\t// reorder window.\n\t\tif numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active && s.state != tcpip.RTORecovery {\n\t\t\t// If any segment is marked as lost by\n\t\t\t// RACK, enter recovery and retransmit\n\t\t\t// the lost segments.\n"
+        },
+        {
+          "old": "\t} else {\n\t\t// Detect loss by counting the duplicates and enter recovery.\n\t\tfastRetransmit = s.detectLoss(rcvdSeg)\n\t}",
+          "new": "\t} else if s.state != tcpip.RTORecovery {\n\t\t// Detect loss by counting the duplicates and enter recovery.\n\t\t// RTO slow start must not be downgraded to Disorder by duplicate ACKs.\n\t\tfastRetransmit = s.detectLoss(rcvdSeg)\n\t}"
         }
       ]
     },
@@ -89,6 +117,40 @@
         {
           "old": "\t\trc.ReoWndPersist = tcpRACKRecoveryThreshold\n\t} else if rc.exitedRecovery {\n\t\t// Else if exiting loss recovery:\n\t\t//   RACK.reo_wnd_persist -= 1\n\t\t//   If RACK.reo_wnd_persist <= 0:\n\t\t//      RACK.reo_wnd_incr = 1\n\t\trc.ReoWndPersist--\n\t\tif rc.ReoWndPersist <= 0 {\n\t\t\trc.ReoWndIncr = 1\n\t\t}\n\t\trc.exitedRecovery = false\n\t}\n\n",
           "new": "\t\trc.ReoWndPersist = tcpRACKRecoveryThreshold\n\t} else if rc.exitedRecovery {\n\t\t// Else if exiting loss recovery:\n\t\t//   RACK.reo_wnd_persist -= 1\n\t\t//   If RACK.reo_wnd_persist <= 0:\n\t\t//      RACK.reo_wnd_incr = 1\n\t\tif rc.ReoWndPersist > 0 {\n\t\t\trc.ReoWndPersist--\n\t\t}\n\t\tif rc.ReoWndPersist <= 0 {\n\t\t\trc.ReoWndIncr = 1\n\t\t}\n\t\trc.exitedRecovery = false\n\t}\n\n"
+        },
+        {
+          "old": "\tif fastRetransmit {\n\t\tsnd.resendSegment()\n\t}\n\n\tvar dataSent bool",
+          "new": "\tif fastRetransmit {\n\t\tsnd.resendSegment()\n\t\t// RTO rewinds writeNext. The fast retransmit already sent this\n\t\t// head; do not send it again when sendData resumes that cursor.\n\t\tif head := snd.writeList.Front(); head != nil && head == snd.writeNext {\n\t\t\tsnd.updateWriteNext(head.Next())\n\t\t}\n\t} else {\n\t\t// ACK and reorder-timer paths mark losses after their last\n\t\t// SetPipe call. Refresh the budget before checking cwnd.\n\t\tsnd.SetPipe()\n\t}\n\n\tvar dataSent bool"
+        },
+        {
+          "old": "// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2\n//\n// +checklocks:rc.snd.ep.mu\nfunc (rc *rackControl) update(seg *segment, ackSeg *segment) {\n\t// Compute the RTT sample against the time the ACK was received at ingress\n\t// (ackSeg.rcvdTime), not the current clock. The two differ when the ACK was\n\t// delayed inside the stack before being processed (e.g. it sat in the\n",
+          "new": "// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2\n//\n// +checklocks:rc.snd.ep.mu\nfunc (rc *rackControl) update(seg *segment, ackSeg *segment) bool {\n\t// RTO may discard the SACK ledger, but repeated reports for the same\n\t// transmission are not newly delivered data and must not age RACK.RTT.\n\tif seg.rackAckedXmitCount == seg.xmitCount {\n\t\treturn false\n\t}\n\t// Compute the RTT sample against the time the ACK was received at ingress\n\t// (ackSeg.rcvdTime), not the current clock. The two differ when the ACK was\n\t// delayed inside the stack before being processed (e.g. it sat in the\n"
+        },
+        {
+          "old": "\tif seg.xmitCount > 1 {\n\t\tif ackSeg.parsedOptions.TS && ackSeg.parsedOptions.TSEcr != 0 {\n\t\t\tif ackSeg.parsedOptions.TSEcr < rc.snd.ep.tsVal(seg.xmitTime) {\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t\tif rtt < rc.minRTT {\n\t\t\treturn\n\t\t}\n\t}\n\n\trc.RTT = rtt\n\n\t// The sender can either track a simple global minimum of all RTT\n",
+          "new": "\tif seg.xmitCount > 1 {\n\t\tif ackSeg.parsedOptions.TS && ackSeg.parsedOptions.TSEcr != 0 {\n\t\t\tif ackSeg.parsedOptions.TSEcr < rc.snd.ep.tsVal(seg.xmitTime) {\n\t\t\t\treturn false\n\t\t\t}\n\t\t}\n\t\tif rtt < rc.minRTT {\n\t\t\treturn false\n\t\t}\n\t}\n\n\tseg.rackAckedXmitCount = seg.xmitCount\n\trc.RTT = rtt\n\n\t// The sender can either track a simple global minimum of all RTT\n"
+        },
+        {
+          "old": "\t\trc.XmitTime = seg.xmitTime\n\t\trc.EndSequence = endSeq\n\t}\n}\n\n// detectReorder detects if packet reordering has been observed.\n",
+          "new": "\t\trc.XmitTime = seg.xmitTime\n\t\trc.EndSequence = endSeq\n\t}\n\treturn true\n}\n\n// detectReorder detects if packet reordering has been observed.\n"
+        },
+        {
+          "old": "\tif rc.snd.reorderTimer.isUninitialized() || !rc.snd.reorderTimer.checkExpiration() {\n\t\treturn nil\n\t}\n\n\t// Evaluate loss as of the time the reorder timer was scheduled to fire (its\n\t// target), not the current clock. The timer is armed for the instant a\n",
+          "new": "\tif rc.snd.reorderTimer.isUninitialized() || !rc.snd.reorderTimer.checkExpiration() {\n\t\treturn nil\n\t}\n\t// A timeout recovery must retain slow start until its recover point is\n\t// cumulatively acknowledged. A stale reorder timer must not restart fast\n\t// recovery or overwrite the currently live RTO retransmission.\n\tif rc.snd.state == tcpip.RTORecovery {\n\t\treturn nil\n\t}\n\n\t// Evaluate loss as of the time the reorder timer was scheduled to fire (its\n\t// target), not the current clock. The timer is armed for the instant a\n"
+        }
+      ]
+    },
+    {
+      "path": "pkg/tcpip/transport/tcp/segment.go",
+      "sha256": "0f6088dbe501341aa8a25a00f7483025512bc3ede2c94d0561154b067f047c2e",
+      "replacements": [
+        {
+          "old": "\t// xmitTime is the last transmit time of this segment.\n\txmitTime  tcpip.MonotonicTime\n\txmitCount uint32\n\n\t// acked indicates if the segment has already been SACKed.\n\tacked bool\n",
+          "new": "\t// xmitTime is the last transmit time of this segment.\n\txmitTime  tcpip.MonotonicTime\n\txmitCount uint32\n\n\t// rackAckedXmitCount is the last transmission consumed by RACK delivery\n\t// tracking. It survives RTO SACK-ledger resets, but not a new transmission.\n\trackAckedXmitCount uint32 `state:\"nosave\"`\n\n\t// acked indicates if the segment has already been SACKed.\n\tacked bool\n"
+        },
+        {
+          "old": "\tt.rcvdTime = s.rcvdTime\n\tt.xmitTime = s.xmitTime\n\tt.xmitCount = s.xmitCount\n\tt.ep = s.ep\n\tt.qFlags = s.qFlags\n\tt.dataMemSize = s.dataMemSize\n",
+          "new": "\tt.rcvdTime = s.rcvdTime\n\tt.xmitTime = s.xmitTime\n\tt.xmitCount = s.xmitCount\n\tt.rackAckedXmitCount = s.rackAckedXmitCount\n\tt.ep = s.ep\n\tt.qFlags = s.qFlags\n\tt.dataMemSize = s.dataMemSize\n"
         }
       ]
     }
