@@ -37,7 +37,9 @@ var tcpDiagnosticMetricNames = [...]string{
 	"state", "ccState", "sendWindowBytes", "zeroWindowProbing",
 	"sendBufferUsedBytes", "sendBufferSizeBytes", "receiveBufferUsedBytes",
 	"outstandingPackets", "inFlightSequenceBytes", "cwndPackets",
+	"sackedOutNegative", "sackedOutAbsPackets",
 	"srttNs", "rttVarNs", "rttValid", "rtoNs", "reorderSeen",
+	"reorderWindowNs", "reorderWindowMultiplier", "reorderPersistNegative", "reorderPersistAbs",
 	"segmentsSent", "segmentsReceived", "retransmits", "fastRetransmits", "timeouts",
 	"localZeroWindowAdvertisements", "localReceiveBufferOverflows", "localSegmentQueueDrops",
 }
@@ -99,7 +101,7 @@ func (s *tcpFlowIDs) snapshot(ctx context.Context, subsystem any) (*TCPDiagnosti
 				}
 				flow.Metrics[name] = value
 			}
-			for _, name := range [...]string{"zeroWindowProbing", "rttValid", "reorderSeen"} {
+			for _, name := range [...]string{"zeroWindowProbing", "rttValid", "reorderSeen", "sackedOutNegative", "reorderPersistNegative"} {
 				if flow.Metrics[name] > 1 {
 					return nil, errors.New("embedded TCP diagnostic flag invalid")
 				}

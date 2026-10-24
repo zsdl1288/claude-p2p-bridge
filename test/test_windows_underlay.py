@@ -110,11 +110,11 @@ func defaultRoute() {}
 
     def test_all_windows_build_callers_share_policy_and_bootstrap_can_download_first(self):
         with patch.object(build_support, 'ROOT', self.root), patch.dict(os.environ, {'GOFLAGS': '-p=4', 'GOOS': 'windows'}, clear=True):
-            env = build_support.go_environment()
+            env = build_support.go_environment(tcp_recovery=False)
             self.assertIn('-p=4', env['GOFLAGS'])
             self.assertIn('-modfile=', env['GOFLAGS'])
             (self.upstream / windows_underlay.UPSTREAM_RELATIVE).unlink()
-            bootstrap = build_support.go_environment(offline=False, underlay_policy=False)
+            bootstrap = build_support.go_environment(offline=False, underlay_policy=False, tcp_recovery=False)
             self.assertEqual(bootstrap['GOFLAGS'], '-p=4')
             self.assertNotEqual(bootstrap['GOPROXY'], 'off')
 

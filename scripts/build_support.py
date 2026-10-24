@@ -14,7 +14,7 @@ if not re.fullmatch(r'\d+\.\d+\.\d+', VERSION):
     raise ValueError('Release version must contain three numeric components')
 
 
-def go_environment(*, offline=True, underlay_policy=True, tcp_diagnostics=None):
+def go_environment(*, offline=True, underlay_policy=True, tcp_diagnostics=None, tcp_recovery=True):
     env = os.environ.copy()
     env.update(GOPATH=str(ROOT / '.cache/go'), GOMODCACHE=str(ROOT / '.cache/gomod'),
                GOCACHE=str(ROOT / '.cache/gobuild'), CGO_ENABLED='0',
@@ -22,20 +22,36 @@ def go_environment(*, offline=True, underlay_policy=True, tcp_diagnostics=None):
     # Only --diagnostics opts in. The marker propagates that explicit choice
     # to nested prepare-windows.py calls; normal builds explicitly opt out.
     diagnostics = env.get('BRIDGE_TCP_DIAGNOSTICS_BUILD') == '1' if tcp_diagnostics is None else tcp_diagnostics
+    recovery = env.get('BRIDGE_TCP_RECOVERY_BUILD') == '1' if tcp_recovery is None else tcp_recovery
     if tcp_diagnostics is False:
         env.pop('BRIDGE_TCP_DIAGNOSTICS_BUILD', None)
+    if tcp_recovery is False:
+        env.pop('BRIDGE_TCP_RECOVERY_BUILD', None)
+    elif recovery:
+        env['BRIDGE_TCP_RECOVERY_BUILD'] = '1'
     if underlay_policy and env.get('GOOS', 'windows' if os.name == 'nt' else '') == 'windows':
+        if recovery or 'tcp-recovery' in env.get('GOFLAGS', ''):
+            try:
+                from .tcp_recovery import prepare_tcp_recovery, strip_recovery_modfile
+            except ImportError:
+                from tcp_recovery import prepare_tcp_recovery, strip_recovery_modfile
+            # A nested prepare-windows starts from the audited base, never
+            # from an already patched sender copy or an inherited overlay.
+            env = strip_recovery_modfile(ROOT, env)
         if diagnostics:
             try:
                 from .tcp_diagnostics import prepare_tcp_diagnostics
             except ImportError:
                 from tcp_diagnostics import prepare_tcp_diagnostics
-            return prepare_tcp_diagnostics(ROOT, env)
-        try:
-            from .windows_underlay import prepare_windows_underlay
-        except ImportError:
-            from windows_underlay import prepare_windows_underlay
-        env = prepare_windows_underlay(ROOT, env)
+            env = prepare_tcp_diagnostics(ROOT, env)
+        else:
+            try:
+                from .windows_underlay import prepare_windows_underlay
+            except ImportError:
+                from windows_underlay import prepare_windows_underlay
+            env = prepare_windows_underlay(ROOT, env)
+        if recovery:
+            env = prepare_tcp_recovery(ROOT, env)
     return env
 
 

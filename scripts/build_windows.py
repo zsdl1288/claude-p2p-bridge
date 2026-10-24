@@ -49,6 +49,8 @@ def run(args, cwd=root):
 
 verify_source_version(root, version)
 initial_sources = source_manifest()
+if env.get("BRIDGE_TCP_RECOVERY_BUILD") == "1":
+    run([go, "test", "gvisor.dev/gvisor/pkg/tcpip/transport/tcp", "-run", "^TestAudit", "-count=1"], root / "native")
 run([go, "build", "-trimpath", "-ldflags=-s -w", "-o", helper, "./cmd/bridge-net"], root / "native")
 run([sys.executable, root / "scripts/prepare-windows.py"])
 build_sources = source_manifest()
@@ -150,6 +152,12 @@ build_record = {
     'v': 1, 'version': version, 'executable': target.name, 'sha256': digest,
     'sources': build_sources
 }
+if env.get('BRIDGE_TCP_RECOVERY_BUILD') == '1':
+    policy_file = root / 'native/_tcp_recovery/policy.json'
+    policy = json.loads(policy_file.read_text(encoding='utf-8'))
+    build_record.update(tcpRecoveryApplied=True,
+                        tcpRecoveryModuleVersion=policy['moduleVersion'],
+                        tcpRecoveryPolicySha256=hashlib.sha256(policy_file.read_bytes()).hexdigest())
 if diagnostic_label:
     build_record.update(diagnostics=True, buildLabel=diagnostic_label)
 atomic_write(target.with_suffix('.build.json'), json.dumps(build_record, ensure_ascii=False, indent=2).encode('utf-8'))

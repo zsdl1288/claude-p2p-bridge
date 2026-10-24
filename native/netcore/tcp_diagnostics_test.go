@@ -27,7 +27,7 @@ func tcpActiveFixture() *tcpFixtureEndpoint {
 	for index, name := range tcpDiagnosticMetricNames {
 		values[name] = uint64(index)
 	}
-	for _, name := range []string{"zeroWindowProbing", "rttValid", "reorderSeen"} {
+	for _, name := range []string{"zeroWindowProbing", "rttValid", "reorderSeen", "sackedOutNegative", "reorderPersistNegative"} {
 		values[name] = 1
 	}
 	values["secret_tuple_100.64.0.1:3211"] = 123
@@ -111,6 +111,42 @@ func TestTCPDiagnosticsFailsClosedOnInvalidExtension(t *testing.T) {
 	m.Close()
 	if m.tcpFlowIDs.ids != nil {
 		t.Fatal("closing the manager retained endpoint references")
+	}
+}
+
+func TestTCPDiagnosticsSignedAccountingAndReorderFields(t *testing.T) {
+	endpoint := tcpActiveFixture()
+	want := map[string]uint64{
+		"sackedOutNegative": 1, "sackedOutAbsPackets": 7,
+		"reorderWindowNs": 63_000_000, "reorderWindowMultiplier": 2,
+		"reorderPersistNegative": 1, "reorderPersistAbs": 3,
+	}
+	for name, value := range want {
+		endpoint.values[name] = value
+	}
+	var ids tcpFlowIDs
+	got, err := ids.snapshot(context.Background(), tcpFixtureProvider{[]any{endpoint}})
+	if err != nil || len(got.Flows) != 1 || !got.Flows[0].Available {
+		t.Fatal("negative signed accounting suppressed a valid snapshot", got, err)
+	}
+	for name, value := range want {
+		if got.Flows[0].Metrics[name] != value {
+			t.Errorf("%s=%d, want %d", name, got.Flows[0].Metrics[name], value)
+		}
+	}
+	for name := range want {
+		delete(endpoint.values, name)
+		if _, err := ids.snapshot(context.Background(), tcpFixtureProvider{[]any{endpoint}}); err == nil {
+			t.Errorf("missing metric %s was accepted", name)
+		}
+		endpoint.values[name] = want[name]
+	}
+	for _, name := range []string{"sackedOutNegative", "reorderPersistNegative"} {
+		endpoint.values[name] = 2
+		if _, err := ids.snapshot(context.Background(), tcpFixtureProvider{[]any{endpoint}}); err == nil {
+			t.Errorf("invalid flag %s was accepted", name)
+		}
+		endpoint.values[name] = want[name]
 	}
 }
 

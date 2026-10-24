@@ -58,13 +58,13 @@ class TCPDiagnosticsBuildTests(unittest.TestCase):
 
     def test_nested_build_environment_and_explicit_normal_opt_out(self):
         with patch.object(build_support, 'ROOT', self.root), patch.dict(os.environ, {**self.env, 'GOOS': 'windows'}, clear=True):
-            diagnostic = build_support.go_environment(tcp_diagnostics=True)
+            diagnostic = build_support.go_environment(tcp_diagnostics=True, tcp_recovery=False)
         with patch.object(build_support, 'ROOT', self.root), patch.dict(os.environ, {**diagnostic, 'GOOS': 'windows'}, clear=True):
-            self.assertEqual(build_support.go_environment()['GOFLAGS'], diagnostic['GOFLAGS'])
+            self.assertEqual(build_support.go_environment(tcp_recovery=False)['GOFLAGS'], diagnostic['GOFLAGS'])
             with self.assertRaisesRegex(ValueError, 'conflicts'):
-                build_support.go_environment(tcp_diagnostics=False)
+                build_support.go_environment(tcp_diagnostics=False, tcp_recovery=False)
         with patch.object(build_support, 'ROOT', self.root), patch.dict(os.environ, {**self.env, 'GOOS': 'windows', tcp_diagnostics.BUILD_MARKER: '1'}, clear=True):
-            normal = build_support.go_environment(tcp_diagnostics=False)
+            normal = build_support.go_environment(tcp_diagnostics=False, tcp_recovery=False)
         self.assertNotIn(tcp_diagnostics.BUILD_MARKER, normal)
         self.assertNotIn('tcp-diagnostics', normal['GOFLAGS'])
         normal_mod = Path(tcp_diagnostics.MODFILE_FLAG.search(normal['GOFLAGS']).group(1))
