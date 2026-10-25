@@ -18,7 +18,9 @@ void CheckNativeState() {
         {L"--data-dir", L""}, {L"--data-dir", L" \t"}, {L"--data-dir"},
         {L"--port", L" 3210"}, {L"--port", L"+3210"}, {L"--port", L"3210x"},
         {L"--port", L"0"}, {L"--port", L"65536"}, {L"--port", std::wstring(300, L'9')},
-        {L"--port"}, {L"--unknown"}, {L"--version", L"--unknown"}
+        {L"--port"}, {L"--unknown"}, {L"--version", L"--unknown"},
+        {L"--update-ready-event"}, {L"--update-ready-event", L"Global\\unrelated-event"},
+        {L"--update-ready-event", L"Local\\ClaudeBridge.UpdateReady.short"}
     }) {
         bool rejected = false;
         try { DesktopCli::Parse(arguments, L"Q:\\default"); } catch (...) { rejected = true; }
@@ -30,6 +32,13 @@ void CheckNativeState() {
             "Native desktop startup parsing changed valid options");
     Require(DesktopCli::Port(L"0", true) == 0 && DesktopCli::Port(L"65535") == 65535,
             "Demo ephemeral ports and maximum valid bridge ports must remain supported");
+    const auto updateEvent = L"Local\\ClaudeBridge.UpdateReady." + std::wstring(64, L'a');
+    auto updated = DesktopCli::Parse({L"--update-ready-event", updateEvent, L"--port", L"3218", L"--data-dir", L"Q:\\my profile"}, L"Q:\\default");
+    Require(updated.updateReadyEvent == updateEvent && updated.port == 3218 && updated.directory == L"Q:\\my profile",
+            "Update restart must retain the exact profile and port with a bounded readiness token");
+    bool duplicateReady = false;
+    try { DesktopCli::Parse({L"--update-ready-event", updateEvent, L"--update-ready-event", updateEvent}, L"Q:\\default"); } catch (...) { duplicateReady = true; }
+    Require(duplicateReady, "Duplicate update readiness credentials were accepted");
 
     Require(!DesktopAccess::FromStatus(Json()).CanSwitchRole() && !DesktopAccess::FromStatus(Json()).CanOpenPage(1),
             "An unloaded desktop status must not authorize role changes or model access");

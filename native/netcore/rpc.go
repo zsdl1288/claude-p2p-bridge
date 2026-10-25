@@ -24,6 +24,12 @@ type response struct {
 
 // Private stdio RPC: no control port, auth keys, or login URLs on command lines.
 func Run(input io.Reader, output io.Writer) error {
+	return runWithManagerFactory(input, output, New)
+}
+
+// Factory injection is used by local test binaries, never by a production
+// command line option or RPC parameter.
+func runWithManagerFactory(input io.Reader, output io.Writer, create func(Config) (*Manager, error)) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	scanner := bufio.NewScanner(input)
@@ -53,7 +59,7 @@ func Run(input io.Reader, output io.Writer) error {
 			var config Config
 			err := json.Unmarshal(req.Params, &config)
 			if err == nil {
-				manager, err = New(config)
+				manager, err = create(config)
 			}
 			if err != nil {
 				write(response{ID: req.ID, Error: err.Error()})
@@ -96,6 +102,46 @@ func Run(input io.Reader, output io.Writer) error {
 					result, err = manager.Status(callCtx)
 				case "diagnostics":
 					result, err = manager.Diagnostics(callCtx)
+				case "native-proxy-configure":
+					var config NativeProxyConfig
+					if err = json.Unmarshal(req.Params, &config); err == nil {
+						result, err = manager.NativeProxyConfigure(callCtx, config)
+					}
+				case "native-proxy-status":
+					result = manager.NativeProxyStatus()
+				case "native-speed-prepare", "native-speed-start":
+					var reservation NativeSpeedRequest
+					if err = json.Unmarshal(req.Params, &reservation); err == nil {
+						if req.Method == "native-speed-prepare" {
+							result, err = manager.NativeSpeedPrepare(callCtx, reservation)
+						} else {
+							result, err = manager.NativeSpeedStart(callCtx, reservation)
+						}
+					}
+				case "native-speed-status":
+					var query struct {
+						ID    string `json:"id"`
+						Renew bool   `json:"renew"`
+					}
+					if err = json.Unmarshal(req.Params, &query); err == nil {
+						result, err = manager.NativeSpeedStatus(query.ID, query.Renew)
+					}
+				case "native-speed-cancel":
+					var cancelRequest struct {
+						Epoch  uint64 `json:"epoch"`
+						ID     string `json:"id"`
+						Reason string `json:"reason"`
+					}
+					if err = json.Unmarshal(req.Params, &cancelRequest); err == nil {
+						result, err = manager.NativeSpeedCancel(cancelRequest.Epoch, cancelRequest.ID, cancelRequest.Reason)
+					}
+				case "native-proxy-close":
+					var closeRequest struct {
+						Epoch uint64 `json:"epoch"`
+					}
+					if err = json.Unmarshal(req.Params, &closeRequest); err == nil {
+						result, err = manager.NativeProxyClose(closeRequest.Epoch)
+					}
 				case "channel-probe":
 					result, err = manager.ChannelProbe(callCtx, params.Host, params.Type, params.Size)
 				case "refresh-transport":

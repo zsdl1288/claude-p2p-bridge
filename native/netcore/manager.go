@@ -53,7 +53,17 @@ type Manager struct {
 	resources         map[string]*proxy
 	tcpFlowIDs        tcpFlowIDs // guarded by startMu; diagnostics-only anonymous identities
 	transportRecovery transportRecovery
-	channelProbeMu    sync.Mutex // probe-only; normal control and Close never acquire it
+	channelProbeMu    sync.Mutex         // probe-only; normal control and Close never acquire it
+	nativeProxy       *nativeProxy       // lifecycle guarded by startMu
+	nativeEpoch       uint64             // retained across close and disconnect
+	nativeBackend     nativeProxyBackend // test-only injection; production uses server
+	nativeOptions     nativeProxyOptions // test-only network policy injection
+	nativeReady       bool               // test-only: local fixture has no real tailnet
+	speedMu           sync.Mutex
+	speedEpoch        uint64
+	speedJob          *nativeSpeedJob
+	speedOptions      nativeSpeedOptions // test-only bounded duration overrides
+	speedLastStart    time.Time
 }
 
 func New(config Config) (*Manager, error) {
@@ -263,6 +273,11 @@ func (m *Manager) Connect(ctx context.Context) (Status, error) {
 func (m *Manager) Disconnect(ctx context.Context) (Status, error) {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
+	m.closeNativeSpeed("network-stopped")
+	if m.nativeProxy != nil {
+		m.nativeProxy.close()
+		m.nativeProxy = nil
+	}
 	m.mu.Lock()
 	started, closed := m.started, m.closed
 	resources := m.resources
@@ -354,6 +369,11 @@ func (m *Manager) Release(id string) {
 func (m *Manager) Close() {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
+	m.closeNativeSpeed("closed")
+	if m.nativeProxy != nil {
+		m.nativeProxy.close()
+		m.nativeProxy = nil
+	}
 	m.tcpFlowIDs.ids = nil
 	m.mu.Lock()
 	m.closed = true

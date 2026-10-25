@@ -16,6 +16,8 @@
 #include "single-instance.hpp"
 #include "job-lifecycle.hpp"
 #include "lifecycle.hpp"
+#include "update-release.hpp"
+#include "update-install.hpp"
 #include <uxtheme.h>
 
 #ifndef BRIDGE_DIAGNOSTICS_BUILD
@@ -35,7 +37,7 @@ constexpr wchar_t APP_TITLE[] = L"Claude Bridge · C++ 桌面版";
 #endif
 using Options = DesktopCli::Options;
 DesktopLifecycle::Journal lifecycle;
-enum class ExitSource { None, Tray, WindowsSession, Engine, Window, StartupFailure, MessageLoopFailure };
+enum class ExitSource { None, Tray, WindowsSession, Engine, Window, StartupFailure, MessageLoopFailure, Update };
 inline const char* ExitSourceName(ExitSource source) {
     switch (source) {
     case ExitSource::Tray: return "tray-exit";
@@ -43,6 +45,7 @@ inline const char* ExitSourceName(ExitSource source) {
     case ExitSource::Engine: return "engine-exited";
     case ExitSource::StartupFailure: return "startup-failure";
     case ExitSource::MessageLoopFailure: return "message-loop-failure";
+    case ExitSource::Update: return "client-update";
     default: return "window-destroyed";
     }
 }
@@ -79,7 +82,8 @@ class Application {
     uint64_t diagnosticsEpoch_ = 0;
     HWND speedTestWindow_ = nullptr, speedTestTarget_ = nullptr, speedTestStart_ = nullptr, speedTestCancel_ = nullptr, speedTestExport_ = nullptr, speedTestOutput_ = nullptr, speedTestClose_ = nullptr;
     HWND speedTestDownload_ = nullptr, speedTestDownloadSecondary_ = nullptr, speedTestUpload_ = nullptr, speedTestUploadSecondary_ = nullptr;
-    HWND speedTestLatency_ = nullptr, speedTestSamples_ = nullptr, speedTestProgress_ = nullptr, speedTestPhase_ = nullptr, speedTestLabels_[3]{};
+    HWND speedTestMultiDownload_ = nullptr, speedTestMultiDownloadSecondary_ = nullptr, speedTestMultiUpload_ = nullptr, speedTestMultiUploadSecondary_ = nullptr;
+    HWND speedTestLatency_ = nullptr, speedTestSamples_ = nullptr, speedTestProgress_ = nullptr, speedTestPhase_ = nullptr, speedTestLabels_[5]{};
     HFONT speedTestFont_ = nullptr, speedTestValueFont_ = nullptr;
     bool speedStatusBusy_ = false;
     ULONGLONG speedLastPoll_ = 0;
@@ -104,6 +108,12 @@ class Application {
     uint64_t channelRefreshEpoch_ = 0;
     std::string channelRefreshScope_;
     std::wstring channelRefreshNotice_;
+    std::thread updateThread_;
+    std::atomic<bool> updateCancel_{false};
+    bool updateBusy_ = false, updateDownloading_ = false, updateHandoff_ = false;
+    Json updateRelease_;
+    fs::path updateStaging_;
+    HWND updateMessage_ = nullptr;
 
     Json Object(const Json& value, const char* key) const {
         return value.is_object() && value.contains(key) && value[key].is_object() ? value[key] : Json::object();
@@ -413,20 +423,104 @@ class Application {
         startupHint_ = Label(L"", 228, 364, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
         auto versionLabel = L"Claude Bridge · v" + Wide(BRIDGE_VERSION);
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) versionLabel += L" · 本地诊断版";
-        Label(versionLabel.c_str(), 228, 458, 540, 24, 4);
-        Button(L"开源许可", OPEN_LICENSES, 784, 450, 208, 34, 4, 0, true);
-        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 492, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label(versionLabel.c_str(), 228, 440, 540, 24, 4);
+        Button(L"开源许可", OPEN_LICENSES, 784, 432, 208, 34, 4, 0, true);
+        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 476, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
-            Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, 530, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
+            Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, 500, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
         }
-        Label(L"退出与崩溃诊断", 228, 574, 540, 24, 4, 0, 1);
-        Button(L"打开退出日志", OPEN_LIFECYCLE_LOGS, 784, 570, 208, 34, 4, 0, true);
-        Label(L"自动保留退出来源、异常码和上次未完整结束的记录。\r\n日志只保存在本机，按大小轮转；不会保存模型或代理内容。", 228, 616, 764, 48, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label(L"软件更新", 228, 538, 540, 24, 4, 0, 1);
+        Button(L"检查更新", APP_UPDATE, 784, 534, 208, 34, 4, 0, true);
+        updateMessage_ = Add(L"STATIC", L"检查 GitHub 正式版；下载完成后自动替换并重启，连接会短暂中断。", APP_UPDATE_STATUS, 228, 578, 764, 48, 4, 0, SS_LEFT, 3, false, true);
+        Label(L"退出与崩溃诊断", 228, 646, 540, 24, 4, 0, 1);
+        Button(L"打开退出日志", OPEN_LIFECYCLE_LOGS, 784, 642, 208, 34, 4, 0, true);
+        Label(L"自动保留退出来源、异常码和上次未完整结束的记录。\r\n日志只保存在本机，按大小轮转；不会保存模型或代理内容。", 228, 688, 764, 48, 4, 0, 3, true); widgets_.back().stretch = true;
         LoadSettings(); LoadStartup(); Visibility(); Layout(); UpdateButtons();
+    }
+    void UpdateUpdateButton() {
+        EnableWindow(Item(APP_UPDATE), !stopping_ && options_.updateReadyEvent.empty() && !updateHandoff_ && !(updateBusy_ && updateCancel_));
+        Text(APP_UPDATE, updateBusy_ ? (updateDownloading_ ? L"取消下载" : L"取消检查") : updateRelease_.is_object() ? L"更新并重启" : L"检查更新");
+    }
+    void CleanupUpdate() noexcept {
+        if (updateStaging_.empty()) return;
+        try { DesktopUpdate::CleanupStaging(updateStaging_); } catch (...) {}
+        updateStaging_.clear();
+    }
+    void StartUpdate() {
+        if (stopping_ || !options_.updateReadyEvent.empty() || updateHandoff_) return;
+        if (updateBusy_) {
+            updateCancel_ = true; Text(updateMessage_, L"正在取消，请稍候…"); UpdateUpdateButton(); return;
+        }
+        if (updateThread_.joinable()) updateThread_.join();
+        updateCancel_ = false; updateBusy_ = true; updateDownloading_ = updateRelease_.is_object();
+        UpdateUpdateButton();
+        try {
+            if (!updateDownloading_) {
+                Text(updateMessage_, L"正在检查 GitHub 正式版…");
+                updateThread_ = std::thread([this] {
+                    try { Post({"update-checked", DesktopUpdate::CheckRelease(BRIDGE_VERSION, updateCancel_)}); }
+                    catch (const std::exception& error) { Post({"update-error", {}, error.what()}); }
+                });
+            } else {
+                CleanupUpdate(); updateStaging_ = DesktopUpdate::CreateStaging();
+                const auto staging = updateStaging_;
+                const auto release = updateRelease_;
+                Text(updateMessage_, L"正在下载 v" + Wide(release.at("version").get<std::string>()) + L"；完成校验后将自动替换并重启。\r\n下载期间可以取消，现有连接继续运行。");
+                updateThread_ = std::thread([this, staging, release] {
+                    try {
+                        ULONGLONG last = 0;
+                        const auto candidate = DesktopUpdate::DownloadRelease(release, staging, updateCancel_, [this, &last](uint64_t received, uint64_t total) {
+                            const auto now = GetTickCount64();
+                            if (received != total && now - last < 200) return;
+                            last = now; Post({"update-progress", {{"received", received}, {"total", total}}});
+                        });
+                        Post({"update-downloaded", {{"candidate", Utf8(candidate.wstring())}}});
+                    } catch (const std::exception& error) { Post({"update-error", {}, error.what()}); }
+                });
+            }
+        } catch (const std::exception& error) {
+            updateBusy_ = false; updateDownloading_ = false; CleanupUpdate();
+            updateRelease_ = Json();
+            Text(updateMessage_, L"更新未完成：" + Wide(error.what())); UpdateUpdateButton();
+        }
+    }
+    void UpdateReply(const Reply& reply) {
+        if (reply.kind == "update-progress") {
+            if (!updateBusy_ || updateCancel_) return;
+            const auto received = reply.data.value("received", uint64_t{0}), total = reply.data.value("total", uint64_t{0});
+            const auto percent = total ? std::min<uint64_t>(100, received * 100 / total) : 0;
+            Text(updateMessage_, L"正在下载 v" + Wide(updateRelease_.value("version", "")) + L" · " + std::to_wstring(percent) + L"%\r\n完成校验后自动替换并重启；原有配对和配置保留。"); return;
+        }
+        if (updateThread_.joinable()) updateThread_.join();
+        updateBusy_ = false; updateDownloading_ = false;
+        if (updateCancel_) { CleanupUpdate(); Text(updateMessage_, L"更新已取消，当前客户端继续运行。"); UpdateUpdateButton(); return; }
+        if (reply.kind == "update-checked") {
+            updateRelease_ = reply.data;
+            Text(updateMessage_, updateRelease_.is_object() ? L"发现新版 v" + Wide(updateRelease_.at("version").get<std::string>()) +
+                L"。点击“更新并重启”后自动下载、校验并替换；连接会短暂中断。" : L"当前 v" + Wide(BRIDGE_VERSION) + L"，暂无版本号更高的 GitHub 正式版。");
+        } else if (reply.kind == "update-downloaded") {
+            try {
+                Text(updateMessage_, L"下载校验完成，正在准备替换并重启…");
+                EnableWindow(Item(APP_UPDATE), FALSE); UpdateWindow(window_);
+                std::vector<std::wstring> arguments{L"--port", std::to_wstring(options_.port), L"--data-dir", fs::absolute(options_.directory).lexically_normal().wstring()};
+                if (options_.system) arguments.push_back(L"--system-tailscale");
+                if (options_.demo) arguments.push_back(L"--demo");
+                if (!IsWindowVisible(window_)) arguments.push_back(L"--minimized");
+                DesktopUpdate::InstallRequest request{updateStaging_, DesktopStartup::ExecutablePath(), fs::path(Wide(reply.data.at("candidate").get<std::string>())),
+                    updateRelease_.at("sha256").get<std::string>(), updateRelease_.at("version").get<std::string>(), std::move(arguments)};
+                DesktopUpdate::LaunchInstall(request, &updateCancel_);
+                updateHandoff_ = true; SetExitSource(ExitSource::Update); DestroyWindow(window_); return;
+            } catch (const std::exception& error) {
+                CleanupUpdate(); updateRelease_ = Json(); Text(updateMessage_, L"更新未完成，当前客户端继续运行：" + Wide(error.what()));
+            }
+        } else if (reply.kind == "update-error") {
+            CleanupUpdate(); updateRelease_ = Json(); Text(updateMessage_, L"更新未完成：" + Wide(reply.text));
+        }
+        UpdateUpdateButton();
     }
     DesktopStartup::Registration Startup() const { return {options_.directory, options_.port, options_.system}; }
     void LoadStartup() {
-        EnableWindow(Item(STARTUP_ENABLE), !options_.demo && !BRIDGE_DIAGNOSTICS_BUILD);
+        EnableWindow(Item(STARTUP_ENABLE), !options_.demo && !BRIDGE_DIAGNOSTICS_BUILD && options_.updateReadyEvent.empty());
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
             Text(startupHint_, L"本地诊断版不修改 Windows 自启动设置。\r\n已保存的正式版设置保持不变。");
             return;
@@ -435,14 +529,14 @@ class Application {
         try {
             auto startup = Startup();
             SendMessageW(Item(STARTUP_ENABLE), BM_SETCHECK, startup.Enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
-            startup.RefreshIfNewer(DesktopStartup::ExecutablePath(), Wide(BRIDGE_VERSION));
+            if (options_.updateReadyEvent.empty()) startup.RefreshIfNewer(DesktopStartup::ExecutablePath(), Wide(BRIDGE_VERSION));
             bool enabled = startup.Enabled();
             SendMessageW(Item(STARTUP_ENABLE), BM_SETCHECK, enabled ? BST_CHECKED : BST_UNCHECKED, 0);
             Text(startupHint_, enabled ? L"已启用 · 登录后在托盘运行。\r\n客户端副本已保存。" : L"未启用 · 勾选一次即可。\r\n仅对当前 Windows 用户生效。");
         } catch (const std::exception& error) { Text(startupHint_, L"自启动设置不可用：\r\n" + Wide(error.what())); }
     }
     void SetStartup() {
-        if (options_.demo || BRIDGE_DIAGNOSTICS_BUILD) return;
+        if (options_.demo || BRIDGE_DIAGNOSTICS_BUILD || !options_.updateReadyEvent.empty()) return;
         bool requested = SendMessageW(Item(STARTUP_ENABLE), BM_GETCHECK, 0, 0) == BST_CHECKED;
         try {
             auto startup = Startup();
@@ -768,6 +862,7 @@ class Application {
         }
     }
     void UpdateButtons() {
+        UpdateUpdateButton();
         bool enabled = ready_ && statusAvailable_ && Identity().value("loaded", false) && !busy_;
         auto identity = Identity();
         const auto role = Role();
@@ -1070,6 +1165,7 @@ class Application {
         });
     }
     void OnReply(const Reply& reply) {
+        if (reply.kind.starts_with("update-")) { UpdateReply(reply); return; }
         if (reply.kind == "channel-refresh" || reply.kind == "channel-refresh-error") {
             channelRefreshCommandBusy_ = false;
             if (channelRefreshThread_.joinable()) channelRefreshThread_.join();
@@ -1115,7 +1211,19 @@ class Application {
             EnableWindow(diagnosticsRefresh_, ready_ && !stopping_);
             return;
         }
-        if (reply.kind == "ready") { Text(API_TOKEN, Wide(token_)); SetStatus(L"服务已就绪 · 正在读取身份", DesktopConnectionStatus::Tone::Waiting); UpdateButtons(); return; }
+        if (reply.kind == "ready") {
+            Text(API_TOKEN, Wide(token_)); SetStatus(L"服务已就绪 · 正在读取身份", DesktopConnectionStatus::Tone::Waiting);
+            if (!options_.updateReadyEvent.empty()) {
+                DesktopUpdate::SignalUpdateReady(options_.updateReadyEvent);
+                options_.updateReadyEvent.clear();
+                Text(updateMessage_, L"已更新至 v" + Wide(BRIDGE_VERSION) + L"，客户端已重启，原有配对和配置已保留。");
+                if (!options_.demo && !BRIDGE_DIAGNOSTICS_BUILD) {
+                    try { Startup().RefreshAfterUpdate(DesktopStartup::ExecutablePath(), Wide(BRIDGE_VERSION)); LoadStartup(); }
+                    catch (const std::exception& error) { Text(updateMessage_, L"客户端已更新，但开机启动同步失败：" + Wide(error.what())); }
+                }
+            }
+            UpdateButtons(); return;
+        }
         if (reply.kind == "startup-error") { SetStatus(L"本机服务启动失败", DesktopConnectionStatus::Tone::Error); Message(Wide(reply.text), true); return; }
         if (reply.kind == "poll-error") {
             SetStatus(L"本机服务暂时不可用", DesktopConnectionStatus::Tone::Error); proxyAvailable_ = false; statusAvailable_ = false;
@@ -1314,10 +1422,24 @@ class Application {
     }
     void RenderSpeedTest() {
         if (!speedTestWindow_) return;
+        const bool nativeSpeed = DesktopSpeedTest::Native(speedTestState_, speedTestReport_);
+        Text(speedTestLabels_[0], nativeSpeed ? L"TCP 单连接 · A 下载" : L"A 下载 B → A");
+        Text(speedTestLabels_[1], nativeSpeed ? L"TCP 单连接 · A 上传" : L"A 上传 A → B");
         const auto download = DesktopSpeedTest::Speed(speedTestState_, speedTestReport_, "download");
         const auto upload = DesktopSpeedTest::Speed(speedTestState_, speedTestReport_, "upload");
         Text(speedTestDownload_, DesktopSpeedTest::Rate(download)); Text(speedTestDownloadSecondary_, DesktopSpeedTest::Rate(download, false));
         Text(speedTestUpload_, DesktopSpeedTest::Rate(upload)); Text(speedTestUploadSecondary_, DesktopSpeedTest::Rate(upload, false));
+        const bool multi = DesktopSpeedTest::Multi(speedTestState_, speedTestReport_);
+        const bool ramp = DesktopSpeedTest::Ramp(speedTestState_, speedTestReport_);
+        Text(speedTestLabels_[3], ramp ? L"TCP 已测最高 · A 下载" : L"TCP 四连接 · A 下载");
+        Text(speedTestLabels_[4], ramp ? L"TCP 已测最高 · A 上传" : L"TCP 四连接 · A 上传");
+        const bool layoutChanged = ((GetWindowLongPtrW(speedTestMultiDownload_, GWL_STYLE) & WS_VISIBLE) != 0) != multi;
+        for (auto child : {speedTestMultiDownload_, speedTestMultiUpload_, speedTestMultiDownloadSecondary_, speedTestMultiUploadSecondary_, speedTestLabels_[3], speedTestLabels_[4]}) ShowWindow(child, multi ? SW_SHOW : SW_HIDE);
+        const auto multiDownload = DesktopSpeedTest::MultiSpeed(speedTestState_, speedTestReport_, "download"), multiUpload = DesktopSpeedTest::MultiSpeed(speedTestState_, speedTestReport_, "upload");
+        Text(speedTestMultiDownload_, DesktopSpeedTest::Rate(multiDownload)); Text(speedTestMultiUpload_, DesktopSpeedTest::Rate(multiUpload));
+        Text(speedTestMultiDownloadSecondary_, DesktopSpeedTest::Rate(multiDownload, false) + L"\r\n" + DesktopSpeedTest::MultiLabel(speedTestState_, speedTestReport_, "download"));
+        Text(speedTestMultiUploadSecondary_, DesktopSpeedTest::Rate(multiUpload, false) + L"\r\n" + DesktopSpeedTest::MultiLabel(speedTestState_, speedTestReport_, "upload"));
+        if (layoutChanged) LayoutSpeedTest();
         Text(speedTestLatency_, DesktopSpeedTest::Milliseconds(DesktopSpeedTest::Latency(speedTestState_, speedTestReport_)));
         Text(speedTestSamples_, DesktopSpeedTest::SamplesLabel(speedTestState_, speedTestReport_));
         const auto progress = DesktopSpeedTest::ViewProgress(speedTestState_);
@@ -1331,7 +1453,7 @@ class Application {
         Text(speedTestPhase_, progress.text);
         const auto selected = SendMessageW(speedTestTarget_, CB_GETCURSEL, 0, 0);
         if (!DesktopSpeedTest::Running(speedTestState_) && selected >= 0 && static_cast<size_t>(selected) < speedTestSupported_.size() && !speedTestSupported_[selected])
-            Text(speedTestPhase_, L"所选设备需升级至 1.2.0；双方均升级后才能开始测速。");
+            Text(speedTestPhase_, L"双方需升级至 1.2.11，才能使用 TCP 低增幅提前停止测速。");
         Text(speedTestOutput_, DesktopSpeedTest::Details(speedTestState_, speedTestReport_));
     }
     void ReadSpeedTestStatus() {
@@ -1353,9 +1475,9 @@ class Application {
         const auto font = create(14, FW_NORMAL), valueFont = create(22, FW_SEMIBOLD);
         if (!font || !valueFont) { if (font) DeleteObject(font); if (valueFont) DeleteObject(valueFont); throw std::runtime_error("无法创建测速窗口字体"); }
         for (auto child : {speedTestTarget_, speedTestStart_, speedTestCancel_, speedTestExport_, speedTestClose_, speedTestOutput_,
-                speedTestDownloadSecondary_, speedTestUploadSecondary_, speedTestSamples_, speedTestPhase_, speedTestLabels_[0], speedTestLabels_[1], speedTestLabels_[2]})
+                speedTestDownloadSecondary_, speedTestUploadSecondary_, speedTestMultiDownloadSecondary_, speedTestMultiUploadSecondary_, speedTestSamples_, speedTestPhase_, speedTestLabels_[0], speedTestLabels_[1], speedTestLabels_[2], speedTestLabels_[3], speedTestLabels_[4]})
             SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-        for (auto child : {speedTestDownload_, speedTestUpload_, speedTestLatency_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(valueFont), TRUE);
+        for (auto child : {speedTestDownload_, speedTestUpload_, speedTestMultiDownload_, speedTestMultiUpload_, speedTestLatency_}) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(valueFont), TRUE);
         if (speedTestFont_) DeleteObject(speedTestFont_);
         if (speedTestValueFont_) DeleteObject(speedTestValueFont_);
         speedTestFont_ = font; speedTestValueFont_ = valueFont;
@@ -1374,9 +1496,18 @@ class Application {
             MoveWindow(values[i], x, scale(108), column, scale(40), TRUE);
             MoveWindow(secondary[i], x, scale(154), column, scale(42), TRUE);
         }
-        MoveWindow(speedTestProgress_, margin, scale(208), width, scale(14), TRUE);
-        MoveWindow(speedTestPhase_, margin, scale(236), width, scale(48), TRUE);
-        const int footer = rect.bottom - margin - buttonH, detailsTop = scale(296);
+        const bool multi = DesktopSpeedTest::Multi(speedTestState_, speedTestReport_);
+        const HWND multiValues[] = {speedTestMultiDownload_, speedTestMultiUpload_}, multiSecondary[] = {speedTestMultiDownloadSecondary_, speedTestMultiUploadSecondary_};
+        for (int i = 0; i < 2; ++i) {
+            const int x = margin + i * (column + gap);
+            MoveWindow(speedTestLabels_[i + 3], x, scale(202), column, scale(22), TRUE);
+            MoveWindow(multiValues[i], x, scale(230), column, scale(40), TRUE);
+            MoveWindow(multiSecondary[i], x, scale(274), column, scale(42), TRUE);
+        }
+        const int offset = multi ? 126 : 0;
+        MoveWindow(speedTestProgress_, margin, scale(208 + offset), width, scale(14), TRUE);
+        MoveWindow(speedTestPhase_, margin, scale(236 + offset), width, scale(48), TRUE);
+        const int footer = rect.bottom - margin - buttonH, detailsTop = scale(296 + offset);
         MoveWindow(speedTestOutput_, margin, detailsTop, width, std::max(scale(40), footer - detailsTop - gap), TRUE);
         const int buttonW = (width - gap * 3) / 4;
         const HWND buttons[] = {speedTestStart_, speedTestCancel_, speedTestExport_, speedTestClose_};
@@ -1398,13 +1529,19 @@ class Application {
             speedTestClose_ = control(L"BUTTON", L"关闭", SPEED_TEST_CLOSE, WS_TABSTOP | BS_OWNERDRAW);
             speedTestDownload_ = control(L"STATIC", L"—", SPEED_TEST_DOWNLOAD, SS_NOPREFIX);
             speedTestUpload_ = control(L"STATIC", L"—", SPEED_TEST_UPLOAD, SS_NOPREFIX);
+            speedTestMultiDownload_ = control(L"STATIC", L"—", SPEED_TEST_MULTI_DOWNLOAD, SS_NOPREFIX);
+            speedTestMultiUpload_ = control(L"STATIC", L"—", SPEED_TEST_MULTI_UPLOAD, SS_NOPREFIX);
             speedTestLatency_ = control(L"STATIC", L"—", SPEED_TEST_LATENCY, SS_NOPREFIX);
             speedTestDownloadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_DOWNLOAD_SECONDARY, SS_NOPREFIX);
             speedTestUploadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_UPLOAD_SECONDARY, SS_NOPREFIX);
+            speedTestMultiDownloadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_MULTI_DOWNLOAD_SECONDARY, SS_NOPREFIX);
+            speedTestMultiUploadSecondary_ = control(L"STATIC", L"—", SPEED_TEST_MULTI_UPLOAD_SECONDARY, SS_NOPREFIX);
             speedTestSamples_ = control(L"STATIC", L"传输中 RTT · 中位数", SPEED_TEST_SAMPLES, SS_NOPREFIX);
             speedTestLabels_[0] = control(L"STATIC", L"A 下载 · B → A", 0, SS_NOPREFIX);
             speedTestLabels_[1] = control(L"STATIC", L"A 上传 · A → B", 0, SS_NOPREFIX);
             speedTestLabels_[2] = control(L"STATIC", L"延迟 RTT", 0, SS_NOPREFIX);
+            speedTestLabels_[3] = control(L"STATIC", L"TCP 四连接 · A 下载", 0, SS_NOPREFIX);
+            speedTestLabels_[4] = control(L"STATIC", L"TCP 四连接 · A 上传", 0, SS_NOPREFIX);
             speedTestProgress_ = control(PROGRESS_CLASSW, L"", SPEED_TEST_PROGRESS, PBS_SMOOTH);
             SendMessageW(speedTestProgress_, PBM_SETRANGE32, 0, 1000);
             speedTestPhase_ = control(L"STATIC", L"正在读取已配对连接…", SPEED_TEST_PHASE, SS_NOPREFIX);
@@ -1433,7 +1570,7 @@ class Application {
             SpeedTestFont(); LayoutSpeedTest(); return 0;
         }
         case WM_GETMINMAXINFO: {
-            const auto dpi = GetDpiForWindow(window); RECT rect{0, 0, MulDiv(620, dpi, 96), MulDiv(440, dpi, 96)};
+            const auto dpi = GetDpiForWindow(window); RECT rect{0, 0, MulDiv(620, dpi, 96), MulDiv(566, dpi, 96)};
             AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, dpi);
             reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {rect.right - rect.left, rect.bottom - rect.top}; return 0;
         }
@@ -1448,6 +1585,7 @@ class Application {
             KillTimer(window, SPEED_TEST_TIMER); RetireSpeedTestView(); speedTestWindow_ = nullptr;
             speedTestTarget_ = speedTestStart_ = speedTestCancel_ = speedTestExport_ = speedTestOutput_ = speedTestClose_ = nullptr;
             speedTestDownload_ = speedTestDownloadSecondary_ = speedTestUpload_ = speedTestUploadSecondary_ = nullptr;
+            speedTestMultiDownload_ = speedTestMultiDownloadSecondary_ = speedTestMultiUpload_ = speedTestMultiUploadSecondary_ = nullptr;
             speedTestLatency_ = speedTestSamples_ = speedTestProgress_ = speedTestPhase_ = nullptr;
             for (auto& label : speedTestLabels_) label = nullptr;
             speedTestState_ = Json::object(); speedTestReport_ = Json(); speedTestTargets_.clear(); speedTestSupported_.clear(); lastSpeedTestTargets_.clear();
@@ -1474,7 +1612,7 @@ class Application {
             type.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101)); type.hIconSm = type.hIcon;
             if (!RegisterClassExW(&type)) throw std::runtime_error("无法注册测速窗口");
         }
-        RECT owner; GetWindowRect(window_, &owner); RECT rect{0, 0, S(680), S(500)};
+        RECT owner; GetWindowRect(window_, &owner); RECT rect{0, 0, S(720), S(640)};
         const DWORD extra = WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT;
         AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, extra, dpi_);
         MONITORINFO monitor{sizeof(monitor)}; GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor);
@@ -1638,6 +1776,7 @@ class Application {
             case TRAY_RESTORE: Restore(); break;
             case TRAY_EXIT: SetExitSource(ExitSource::Tray); DestroyWindow(window_); break;
             case STARTUP_ENABLE: SetStartup(); break;
+            case APP_UPDATE: StartUpdate(); break;
             case THEME_TOGGLE: ToggleTheme(); break;
             case NETWORK_CONNECT: Action(L"/api/network/login", Json::object(), "login"); break;
             case NETWORK_DISCONNECT: Action(L"/api/network/disconnect", Json::object(), "network-disconnect"); break;
@@ -1700,6 +1839,7 @@ class Application {
     }
     void Stop() {
         if (stopping_.exchange(true)) return;
+        updateCancel_ = true;
         lifecycle.Event("cleanup-started", {{"reason", ExitSourceName(exitSource_.load())}});
         if (diagnosticsWindow_) DestroyWindow(diagnosticsWindow_);
         if (speedTestWindow_) DestroyWindow(speedTestWindow_);
@@ -1726,7 +1866,8 @@ class Application {
             if (process_.value) { DWORD code = 1; if (GetExitCodeProcess(process_.value, &code)) ObserveEngineExit(code); }
             job_.reset();
         }
-        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &speedTestThread_, &speedStatusThread_, &channelRefreshThread_}) if (thread->joinable()) thread->join();
+        for (auto* thread : {&pollThread_, &actionThread_, &testThread_, &diagnosticsThread_, &speedTestThread_, &speedStatusThread_, &channelRefreshThread_, &updateThread_}) if (thread->joinable()) thread->join();
+        if (!updateHandoff_) CleanupUpdate();
         {
             std::lock_guard lock(speedCancelMutex_); speedCancelStopping_ = true; pendingSpeedCancel_.clear();
         }
@@ -1859,6 +2000,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (!args) throw std::runtime_error("无法读取启动参数");
         std::unique_ptr<wchar_t*, decltype(&LocalFree)> allocation(args, LocalFree);
         std::vector<std::wstring> arguments(args + 1, args + count);
+        if (const auto result = DesktopUpdate::HandleInstall(arguments)) {
+            if (SUCCEEDED(com)) CoUninitialize();
+            return *result;
+        }
         auto options = DesktopCli::Parse(arguments, defaultDirectory);
         if (options.version) {
             std::string text = "Claude Bridge " BRIDGE_VERSION " / C++ native desktop / embedded Tailscale";

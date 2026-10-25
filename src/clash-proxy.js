@@ -78,9 +78,11 @@ export class ClashProxy {
     this.proxy.listenPort = this.settings.port;
     if (this.settings.enabled) {
       try { await this.proxy.start(); }
-      catch (error) { this.error = `本地代理监听失败：${error.message}，不会改用其他端口`; }
+      catch (error) { this.error = `本地代理监听失败：${error.message}，不会改用其他端口`; this.nativeRestoreError = this.proxy.native === true; }
     }
     this.synchronize();
+    try { await this.proxy.flush?.(); }
+    catch { this.error ||= '原生网络组件暂不可用，界面保持可用，请等待连接恢复后重试'; this.nativeRestoreError = this.proxy.native === true; }
   }
   synchronize() {
     if (this.closed) return;
@@ -92,22 +94,27 @@ export class ClashProxy {
   }
   status() {
     const state = this.proxy.status();
+    if (this.nativeRestoreError && state.listening && !state.error) { this.nativeRestoreError = false; this.error = ''; }
     const role = this.role();
     const sharing = role === 'client' ? this.bridge.remoteSharing === true : state.sharing;
-    const online = role === 'client' ? state.online && sharing && Boolean(this.proxy.server?.listening) && !this.error : Boolean(this.bridge.peer?.state.listening);
+    const online = role === 'client' ? state.online && sharing && Boolean(this.proxy.server?.listening) && !this.error
+      : this.proxy.native && sharing ? state.ready : Boolean(this.bridge.peer?.state.listening);
     const enabled = state.enabled;
     let phase = 'disabled', message = '请先配对，然后开启 B 网络共享或 A 本地 Clash 节点。';
     if (role === 'host') { phase = sharing ? online ? 'ready' : 'waiting' : 'disabled'; message = sharing ? 'B 已允许配对的 A 使用本机网络；关闭共享会立即断开代理连接。' : 'B 网络共享已关闭；模型调用权限不受影响。'; }
+    if (role === 'host' && this.proxy.native && sharing && !online) message = '原生网络共享正在启动或恢复，配对和模型服务保持独立。';
     else if (enabled) { phase = online ? 'ready' : 'blocked'; message = online ? 'B 出口已连接；请在 Clash 导入完整配置并开启 TUN。' : this.bridge.remoteSharing === false ? 'B 未开启网络共享，代理流量已阻断。' : 'B 已断开或正在恢复，代理流量已阻断，等待自动重连。'; }
     else if (role === 'client') message = '启用本地节点后，可将完整配置订阅导入 Mihomo / Clash Meta 客户端。';
     if (this.error) { phase = enabled ? 'blocked' : 'disabled'; message = this.error; }
+    if (this.proxy.native && state.error && (enabled || sharing)) { phase = 'blocked'; message = state.error; }
     if (online && phase === 'ready' && state.lastError?.code === 'PROXY_CAPACITY') message = '代理连接数已达上限，请等待空闲连接释放后重试';
     const channelRecovery = this.bridge.channelRecovery?.status();
     const recoveryLabels = { monitoring: role === 'host' ? '通道健康监测中' : channelRecovery?.mode === 'notify' ? '通道持续受阻时仅提示，由你点击刷新' : 'Bridge 自动恢复：监测中', refreshing: 'Bridge 通道刷新中',
       cooldown: '线路刷新：冷却中', 'budget-exhausted': '线路刷新：等待额度恢复', waiting: '通道监测：等待连接或任务空闲' };
     const recoveryMessage = channelRecovery?.enabled ? recoveryLabels[channelRecovery.state] || '' : '';
     const subscriptionUrl = enabled && this.proxy.server?.listening && this.address ? `http://127.0.0.1:${this.address.port}/clash/${this.subscriptionToken}/config.yaml` : '';
-    return { enabled, sharing, online, state: phase, message, port: state.listenPort, channelRecovery, recoveryMessage,
+    return { enabled, sharing, online: online && !state.error, state: phase, message, port: state.listenPort,
+      transport: state.transport || 'websocket', metricsAvailable: state.metricsAvailable ?? true, channelRecovery, recoveryMessage,
       speedTest: this.bridge.channelSpeed?.status(),
       channelRefresh: this.bridge.channelRefresh?.status(),
       connections: state.connections, uploadBytes: state.uploadBytes, downloadBytes: state.downloadBytes,
@@ -136,7 +143,7 @@ export class ClashProxy {
   resetAuthorization() {
     return this.enqueue(async () => {
       const settings = { ...this.settings, enabled: false, sharing: false, pairing: null };
-      await this.save(settings); this.settings = settings; this.synchronize();
+      await this.save(settings); this.settings = settings; this.synchronize(); await this.proxy.flush?.();
     });
   }
   enqueue(operation) {
@@ -159,7 +166,7 @@ export class ClashProxy {
       const settings = { ...base, ...input, pairing };
       if (settings.enabled) { await this.proxy.start(); settings.port = this.proxy.port; }
       await this.save(settings);
-      this.settings = settings; this.error = ''; this.synchronize();
+      this.settings = settings; this.error = ''; this.synchronize(); await this.proxy.flush?.();
       return this.status();
     });
   }

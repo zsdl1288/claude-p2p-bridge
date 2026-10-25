@@ -6,10 +6,12 @@ import { makePairing, encodeInvitation, parseInvitation } from './crypto.js';
 import { getTailscaleStatus, networkDevices } from './tailscale.js';
 import { runClaude, validateRequest, probeClaude } from './runner.js';
 import { NetworkProxy } from './network-proxy.js';
+import { NativeNetworkProxy } from './native-network-proxy.js';
 import { ChannelRecovery } from './channel-recovery.js';
 import { ChannelSpeed } from './channel-speed.js';
 import { ChannelRefresh } from './channel-refresh.js';
 import { SpeedTransport } from './speed-transport.js';
+import { NativeSpeedTransport } from './native-speed-transport.js';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { discoverClaudeModels, normalizeModels } from './claude-models.js';
@@ -29,7 +31,8 @@ export class Bridge extends EventEmitter {
     this.queue = [];
     this.maxQueued = 15;
     this.logs = [];
-    this.networkProxy = new NetworkProxy({ bridge: this, ...proxyOptions });
+    const Proxy = typeof networkAdapter?.nativeProxyConfigure === 'function' ? NativeNetworkProxy : NetworkProxy;
+    this.networkProxy = new Proxy({ bridge: this, ...proxyOptions });
     this.remoteSharing = null;
     this.modelEnabled = false;
     this.modelGeneration = 0;
@@ -39,7 +42,8 @@ export class Bridge extends EventEmitter {
     this.models = []; this.modelsState = 'unavailable'; this.modelsError = ''; this.modelsAt = 0;
     this.catalogEpoch = 0; this.catalogRequests = new Map();
     this.channelRecovery = new ChannelRecovery({ ...recoveryOptions, bridge: this });
-    this.speedTransport = new SpeedTransport({ ...speedOptions, bridge: this });
+    const Speed = networkAdapter?.embedded || typeof networkAdapter?.nativeSpeedPrepare === 'function' ? NativeSpeedTransport : SpeedTransport;
+    this.speedTransport = new Speed({ ...speedOptions, bridge: this });
     this.channelSpeed = new ChannelSpeed({ bridge: this, transport: this.speedTransport });
     this.channelRefresh = new ChannelRefresh({ ...refreshOptions, bridge: this });
   }
@@ -128,7 +132,8 @@ export class Bridge extends EventEmitter {
   }
   async attach(role, pairing, { retryInitial = false } = {}) {
     const peer = this.peer = new BridgePeer({ role, pairing, retryInitial, allowLoopback: this.demo, networkAdapter: this.demo ? null : this.networkAdapter,
-      capabilities: { speedTest: 2, channelRefresh: 1 }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
+      capabilities: { ...(this.speedTransport.native ? { nativeSpeed: 5 } : { speedTest: 2 }), channelRefresh: 1,
+        ...(this.networkProxy.native ? { nativeProxy: 1 } : {}) }, metadata: () => this.deviceMetadata(), info: () => ({ role: 'host', name: this.deviceMetadata().name, protocol: 1 }),
       networkUpgrade: (req, socket, head, current) => {
         if (current !== this.peer) { socket.destroy(); return true; }
         if (this.speedTransport.upgrade(req, socket, head, current)) return true;
@@ -325,9 +330,12 @@ export class Bridge extends EventEmitter {
     const peer = this.peer;
     if (peer?.role !== 'host') return;
     for (const connection of peer.connections) {
-      if (!peer.isConnected(connection) || connection.advertisedSharing === this.networkProxy.sharing) continue;
-      connection.advertisedSharing = this.networkProxy.sharing;
-      try { peer.send({ type: 'proxy-status', id: randomUUID(), sharing: this.networkProxy.sharing }, connection); }
+      const nativeProxy = this.networkProxy.advertisement?.(connection);
+      const signature = JSON.stringify({ sharing: this.networkProxy.sharing, nativeProxy });
+      if (!peer.isConnected(connection) || connection.advertisedSharing === signature) continue;
+      connection.advertisedSharing = signature;
+      try { peer.send({ type: 'proxy-status', id: randomUUID(), sharing: this.networkProxy.sharing,
+        ...(this.networkProxy.native ? { nativeProxy: nativeProxy || null } : {}) }, connection); }
       catch { connection.ws.terminate(); }
     }
   }
@@ -379,6 +387,7 @@ export class Bridge extends EventEmitter {
     }
     if (this.peer?.role === 'client' && msg.type === 'proxy-status' && typeof msg.sharing === 'boolean') {
       this.remoteSharing = msg.sharing;
+      this.networkProxy.receiveStatus?.(msg, connection);
       this.networkProxy.peerChanged();
       this.emit('state');
       return;
@@ -543,6 +552,8 @@ export class Bridge extends EventEmitter {
     this.sessions.clear();
     await modelPeer?.close();
     await peer?.close();
+    await this.networkProxy.flush?.();
+    if (this.speedTransport.native) await this.channelSpeed.running;
     if (catalogReading) {
       let timer;
       try { await Promise.race([catalogReading.promise.catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, 2000); timer.unref(); })]); }

@@ -104,7 +104,7 @@ def packaged_files(root, directories, suffixes, *, forbidden=PRIVATE_PARTS):
 def source_files(root=ROOT):
     root = root.resolve()
     files = [checked_file(root / name) for name in ('package.json', 'package-lock.json', 'README.md', '.gitignore')]
-    suffixes = {'.js', '.mjs', '.json', '.md', '.css', '.html', '.txt', '.py', '.go', '.mod', '.sum', '.hpp', '.cpp', '.manifest', '.MIT', '.jpg', '.png'}
+    suffixes = {'.js', '.mjs', '.json', '.md', '.css', '.html', '.txt', '.py', '.go', '.mod', '.sum', '.hpp', '.cpp', '.rc', '.manifest', '.MIT', '.jpg', '.png'}
     files.extend(packaged_files(root, ('src', 'public', 'scripts', 'test', 'examples', 'native'),
                                 suffixes, forbidden=PRIVATE_PARTS | {'node_modules'}))
     return sorted(files)

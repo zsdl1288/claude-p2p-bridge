@@ -9,7 +9,9 @@ import { isRefreshMessage } from './channel-refresh.js';
 function controlCapabilities(channel, value) {
   if (channel !== 'control') return {};
   return { ...([1, 2].includes(value?.speedTest) ? { speedTest: value.speedTest } : {}),
-    ...(value?.channelRefresh === 1 ? { channelRefresh: 1 } : {}) };
+    ...(value?.channelRefresh === 1 ? { channelRefresh: 1 } : {}),
+    ...([1, 2, 3, 4, 5].includes(value?.nativeSpeed) ? { nativeSpeed: value.nativeSpeed } : {}),
+    ...(value?.nativeProxy === 1 ? { nativeProxy: 1 } : {}) };
 }
 
 // B owns a private listener with one independently authenticated channel per A.
@@ -162,6 +164,7 @@ export class BridgePeer extends EventEmitter {
     heartbeat.unref();
     ws.on('pong', (payload) => {
       alive = true;
+      if (this.isConnected(connection)) connection.lastActivityAt = performance.now();
       if (!latencyProbe || !Buffer.isBuffer(payload) || !equalSecret(payload.toString(), latencyProbe.token)) return;
       const probe = latencyProbe; latencyProbe = null;
       if (!this.isConnected(connection)) return;
@@ -203,6 +206,7 @@ export class BridgePeer extends EventEmitter {
           if (connection.authenticated || !connection.remoteNonce || msg.echo !== connection.localNonce || msg.nonce !== connection.remoteNonce) throw new Error('身份验证失败');
           connection.session = digest(this.role === 'host' ? `${connection.localNonce}:${connection.remoteNonce}` : `${connection.remoteNonce}:${connection.localNonce}`);
           connection.authenticated = true;
+          connection.lastActivityAt = performance.now();
           this.hasConnected = true;
           this.retry = 0;
           clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
@@ -213,6 +217,7 @@ export class BridgePeer extends EventEmitter {
         } else if (connection.authenticated && msg.kind === 'message' && msg.session === connection.session) {
           if (msg.sequence !== connection.receiveSequence + 1) throw new Error('消息顺序无效');
           connection.receiveSequence = msg.sequence;
+          connection.lastActivityAt = performance.now();
           this.emit('message', msg.body, connection);
         } else throw new Error('未认证的消息');
       } catch (error) { fail(`加密消息被拒绝：${error.message}`); }
@@ -284,13 +289,14 @@ export class BridgePeer extends EventEmitter {
   trySendSpeedMessage(body, connection = this.clientConnection) {
     const reasons = new Set(['busy', 'unsupported', 'model-busy', 'cooldown', 'network-stopped', 'recovery-busy',
       'control-unavailable', 'target-changed', 'helper-changed', 'deadline', 'receiver-timeout', 'user-cancelled', 'closed', 'transport-failed']);
-    if (this.channel !== 'control' || !this.isConnected(connection) || body?.v !== 1 ||
+    if (this.channel !== 'control' || !this.isConnected(connection) || ![1, 2, 3, 4, 5, 6].includes(body?.v) ||
         typeof body.id !== 'string' || !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(body.id) ||
         !['speed-request', 'speed-offer', 'speed-reject', 'speed-cancel'].includes(body.type) || connection.ws.bufferedAmount >= 64 * 1024) return false;
-    const allowed = body.type === 'speed-offer' ? ['type', 'v', 'id', 'session', 'ticket']
+    const allowed = body.type === 'speed-offer' ? ['type', 'v', 'id', 'session', 'ticket', ...(body.v >= 2 ? ['port'] : [])]
       : ['speed-reject', 'speed-cancel'].includes(body.type) ? ['type', 'v', 'id', 'reason'] : ['type', 'v', 'id'];
     if (Object.keys(body).length !== allowed.length || Object.keys(body).some((key) => !allowed.includes(key)) ||
         (body.type === 'speed-offer' && (!equalSecret(body.session, connection.session) || typeof body.ticket !== 'string' || !/^[\w-]{43}$/.test(body.ticket))) ||
+        (body.type === 'speed-offer' && body.v >= 2 && (!Number.isInteger(body.port) || body.port < 1 || body.port > 65535)) ||
         (['speed-reject', 'speed-cancel'].includes(body.type) && !reasons.has(body.reason))) return false;
     try {
       if (Buffer.byteLength(JSON.stringify(body)) > 2048) return false;

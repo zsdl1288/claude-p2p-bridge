@@ -139,7 +139,7 @@ try:
     run([compiler, "-std=c++20", "-O2", "-s", "-static", "-static-libgcc", "-static-libstdc++", "-municode", "-mwindows",
          "-Wall", "-Wextra", "-Wno-missing-field-initializers", "-I", build,
          root / "native/desktop/main.cpp", build / "resources.o", "-o", temporary,
-         "-lwinhttp", "-lcomctl32", "-lshell32", "-lole32", "-luuid", "-lgdi32", "-lbcrypt", "-luser32", "-ladvapi32", "-luxtheme"])
+         "-lwinhttp", "-lcomctl32", "-lshell32", "-lole32", "-luuid", "-lgdi32", "-lbcrypt", "-luser32", "-ladvapi32", "-luxtheme", "-lversion"])
     if source_manifest() != build_sources:
         raise RuntimeError('Sources changed during compilation; finish editing and rebuild')
     # A failed build or a running release must leave the last usable EXE intact.

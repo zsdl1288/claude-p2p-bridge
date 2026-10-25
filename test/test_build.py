@@ -38,7 +38,7 @@ class ReleasePolicyTests(unittest.TestCase):
         names = {file.relative_to(ROOT).as_posix() for file in source_files()}
         self.assertNotIn('start.cmd', names)
         self.assertNotIn('native/cmd/bridge/runtime.zip', names)
-        self.assertTrue({'src/version.js', 'scripts/build_support.py', 'native/desktop/app.manifest'} <= names)
+        self.assertTrue({'src/version.js', 'scripts/build_support.py', 'native/desktop/app.manifest', 'test/update-release.rc'} <= names)
         self.assertFalse(any(name.endswith(('.exe', '.pyc')) or '.bridge/' in name for name in names))
 
     def test_linked_source_cannot_escape_the_archive_root(self):

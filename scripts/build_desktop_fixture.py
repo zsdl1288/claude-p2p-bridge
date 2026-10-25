@@ -13,12 +13,12 @@ from build_support import ROOT
 from test_support import checked_fixture_path
 
 
-def build_fixture(name=None, output_directory=None, source=None):
+def build_fixture(name=None, output_directory=None, source=None, resources_directory=None):
     name = name or "smoke-" + uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9-]+", name):
         raise ValueError("The fixture name must contain only letters, numbers and hyphens")
     compiler = ROOT / ".tools/w64devkit/bin/g++.exe"
-    resources = ROOT / "bin/desktop-build/resources.o"
+    resources = Path(resources_directory or ROOT / "bin/desktop-build") / "resources.o"
     if not resources.is_file():
         raise FileNotFoundError("Build the Windows release first to prepare its embedded resources")
     directory = (ROOT / "bin/desktop-fixture" / name if output_directory is None
@@ -32,7 +32,7 @@ def build_fixture(name=None, output_directory=None, source=None):
                     f'-DBRIDGE_DESKTOP_TEST_NAMESPACE=L"{name}"', "-I", str(resources.parent),
                     str(source or ROOT / "native/desktop/main.cpp"), str(resources), "-o", str(target),
                     "-lwinhttp", "-lcomctl32", "-lshell32", "-lole32", "-luuid", "-lgdi32",
-                    "-lbcrypt", "-luser32", "-ladvapi32", "-luxtheme"],
+                    "-lbcrypt", "-luser32", "-ladvapi32", "-luxtheme", "-lversion"],
                    env=env, check=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
     return target
 

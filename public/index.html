@@ -81,13 +81,37 @@
   </main>
   <dialog id="speed-test-dialog" aria-labelledby="speed-test-heading">
     <div class="card-heading"><h2 id="speed-test-heading">网络测速</h2><button type="button" class="text-button" id="speed-test-close" aria-label="关闭测速窗口">关闭</button></div>
-    <p class="field-hint">测试当前 A ↔ B 配对通道。上传、下载各最多 20 秒 / 256 MiB；延迟在传输时同步测量，会占用带宽。</p>
+    <p class="field-hint" id="speed-test-scope">测试当前 A ↔ B 的原生 TCP/UDP 传输。结果不包含 B 的互联网出口；测试会占用带宽。</p>
     <label for="speed-test-target">当前配对设备</label><select id="speed-test-target" disabled></select>
     <div class="speed-metrics">
       <div><span>传输中延迟 RTT</span><strong id="speed-test-latency">—</strong><small id="speed-test-latency-unit">ms · 上传、下载时同步测量</small></div>
-      <div><span>A 下载 · B → A</span><strong id="speed-test-download">—</strong><small id="speed-test-download-unit">Mbps / MB/s</small></div>
-      <div><span>A 上传 · A → B</span><strong id="speed-test-upload">—</strong><small id="speed-test-upload-unit">Mbps / MB/s</small></div>
+      <div><span id="speed-test-download-label">TCP · A 下载 · B → A</span><strong id="speed-test-download">—</strong><small id="speed-test-download-unit">Mbps / MB/s</small></div>
+      <div><span id="speed-test-upload-label">TCP · A 上传 · A → B</span><strong id="speed-test-upload">—</strong><small id="speed-test-upload-unit">Mbps / MB/s</small></div>
     </div>
+    <div id="speed-test-tcp-multi" class="speed-metrics" hidden>
+      <div><span id="speed-test-multi-download-label">TCP 已测最高 · A 下载 · B → A</span><strong id="speed-test-multi-download">—</strong><small id="speed-test-multi-download-unit">合计实收 Mbps / MB/s</small></div>
+      <div><span id="speed-test-multi-upload-label">TCP 已测最高 · A 上传 · A → B</span><strong id="speed-test-multi-upload">—</strong><small id="speed-test-multi-upload-unit">合计实收 Mbps / MB/s</small></div>
+    </div>
+    <details id="speed-test-tcp-stages" hidden>
+      <summary>TCP 连接数逐档测速明细</summary>
+      <p class="field-hint">每档最多发送 10 秒 / 合计 192 MiB。最高速度只取完整确认档；单连接结果复用第 1 档，不重复发送。</p>
+      <h3>A 下载 · B → A</h3>
+      <div class="speed-stage-scroll"><table class="speed-stage-table"><thead><tr><th>连接数</th><th>实收速率</th><th>共同时间</th><th>接收量</th><th>结果</th></tr></thead><tbody id="speed-test-tcp-download-rows"></tbody></table></div>
+      <h3>A 上传 · A → B</h3>
+      <div class="speed-stage-scroll"><table class="speed-stage-table"><thead><tr><th>连接数</th><th>实收速率</th><th>共同时间</th><th>接收量</th><th>结果</th></tr></thead><tbody id="speed-test-tcp-upload-rows"></tbody></table></div>
+    </details>
+    <div id="speed-test-udp" class="speed-metrics" hidden>
+      <div><span>UDP · A 下载 · B → A</span><strong id="speed-test-udp-download">—</strong><small id="speed-test-udp-download-unit">有效接收 Mbps / 丢包率</small></div>
+      <div><span>UDP · A 上传 · A → B</span><strong id="speed-test-udp-upload">—</strong><small id="speed-test-udp-upload-unit">有效接收 Mbps / 丢包率</small></div>
+    </div>
+    <details id="speed-test-udp-stages" hidden>
+      <summary>UDP 逐级测速明细</summary>
+      <p class="field-hint">速率均为有效载荷 Mbps；低丢包最佳和峰值取自完整确认的档位，可能对应不同丢包率。</p>
+      <h3>A 下载 · B → A</h3>
+      <div class="speed-stage-scroll"><table class="speed-stage-table"><thead><tr><th>档位</th><th>目标</th><th>实发</th><th>实收</th><th>丢包</th><th>结果</th></tr></thead><tbody id="speed-test-udp-download-rows"></tbody></table></div>
+      <h3>A 上传 · A → B</h3>
+      <div class="speed-stage-scroll"><table class="speed-stage-table"><thead><tr><th>档位</th><th>目标</th><th>实发</th><th>实收</th><th>丢包</th><th>结果</th></tr></thead><tbody id="speed-test-udp-upload-rows"></tbody></table></div>
+    </details>
     <progress id="speed-test-progress" max="1" value="0" aria-label="当前测速阶段进度"></progress>
     <p id="speed-test-status" class="field-hint" role="status" aria-live="polite">连接配对设备后可开始测速。</p>
     <div class="form-actions"><button type="button" class="primary" id="speed-test-start" disabled>开始测速</button><button type="button" class="secondary" id="speed-test-cancel" disabled>取消测速</button><button type="button" class="secondary" id="speed-test-export" disabled>导出报告</button></div>

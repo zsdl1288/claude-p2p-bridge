@@ -146,5 +146,16 @@ public:
         auto updated = Enable(executable, version);
         return !SamePath(updated, *target);
     }
+    bool RefreshAfterUpdate(const fs::path& executable, const std::wstring& version) const {
+        const auto target = OwnedTarget();
+        if (!target) return false;
+        // The updater preserves the launch path, including an old app/<version>
+        // startup copy. Only an acknowledged update may migrate that same-path
+        // copy into the new version/hash directory. Never enable a disabled or
+        // another profile's startup entry.
+        if (!SamePath(executable, *target)) return RefreshIfNewer(executable, version);
+        const auto updated = Enable(executable, version);
+        return !SamePath(updated, *target);
+    }
 };
 }

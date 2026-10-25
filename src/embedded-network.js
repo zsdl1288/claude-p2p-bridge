@@ -51,7 +51,7 @@ export class EmbeddedNetwork extends EventEmitter {
         const message = JSON.parse(line); const pending = this.pending.get(message.id);
         if (!pending || pending.child !== child) return;
         this.pending.delete(message.id); clearTimeout(pending.timer);
-        if (message.error) pending.reject(new Error(`内置组网：${message.error}`)); else pending.resolve(message.result);
+        if (message.error) pending.reject(Object.assign(new Error(`内置组网：${message.error}`), { rpcRejected: true })); else pending.resolve(message.result);
       } catch (error) { this.invalidate(child, error, 'protocol-error'); }
     } });
     child.stderr.on('data', () => {});
@@ -100,7 +100,7 @@ export class EmbeddedNetwork extends EventEmitter {
       if (this.closed || child !== this.child || !child?.stdin.writable) { reject(new Error('组网进程未启动或已关闭')); return; }
       const id = ++this.sequence;
       const line = `${JSON.stringify({ id, method, params })}\n`;
-      const nonfatal = method === 'diagnostics' || method === 'refresh-transport' || method === 'channel-probe';
+      const nonfatal = method === 'diagnostics' || method === 'refresh-transport' || method === 'channel-probe' || method === 'native-proxy-status' || method.startsWith('native-speed-');
       const fail = (error, reason = 'request-write') => {
         if (!nonfatal) {
           if (reason === 'request-timeout') this.lifecycleLog.write('helper-timeout-kill', { childPid: child.pid, reason, ownerRequested: true });
@@ -114,13 +114,68 @@ export class EmbeddedNetwork extends EventEmitter {
         // A timed-out listen/dial may still allocate a proxy. Reset its owner
         // so those resources cannot survive without a corresponding JS handle.
         fail(new Error(method === 'diagnostics' ? '内置组网诊断响应超时' : method === 'refresh-transport' ? '内置组网通道刷新响应超时' : method === 'channel-probe' ? '内置组网探针响应超时' : '内置组网响应超时，将在下次连接时重试'), 'request-timeout');
-      }, method === 'channel-probe' ? Math.min(this.requestTimeoutMs, 4000) : method === 'refresh-transport' ? Math.min(this.requestTimeoutMs, 5000) : this.requestTimeoutMs);
+      }, method === 'channel-probe' || method.startsWith('native-speed-') ? Math.min(this.requestTimeoutMs, 4000) : method === 'refresh-transport' ? Math.min(this.requestTimeoutMs, 5000) : this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer, child });
       try { child.stdin.write(line, (error) => { if (error) fail(error); }); }
       catch (error) { fail(error); }
     });
   }
   async call(method, params) { const child = await this.start(); return this.request(method, params, child); }
+  // Benchmark RPCs only use the already running owner. Their five-second
+  // native lease bounds ambiguous failures without disrupting business flows.
+  async nativeSpeedCall(method, params, child = this.child) {
+    if (this.closed || this.wantRunning !== true || !child || child !== this.child || !this.initialized.has(child) || !child.stdin?.writable) {
+      throw new Error('现有原生测速组件尚未就绪');
+    }
+    return this.request(method, params, child);
+  }
+  nativeSpeedPrepare(params, child) { return this.nativeSpeedCall('native-speed-prepare', params, child); }
+  nativeSpeedStart(params, child) { return this.nativeSpeedCall('native-speed-start', params, child); }
+  nativeSpeedStatus(params, child) { return this.nativeSpeedCall('native-speed-status', params, child); }
+  nativeSpeedCancel(params, child) { return this.nativeSpeedCall('native-speed-cancel', params, child); }
+  async nativeProxyConfigure(params) {
+    const child = await this.start();
+    try { return await this.request('native-proxy-configure', params, child); }
+    catch (error) {
+      // The wrapper reserves even epochs. An explicit rejection can close just
+      // the proxy at the intervening odd epoch, preserving the model/control
+      // channels. A timeout or unconfirmed revocation retires the whole owner.
+      let revoked = false;
+      if (error.rpcRejected === true && child === this.child && Number.isSafeInteger(params.epoch) && params.epoch % 2 === 0) {
+        try {
+          const receipt = await this.request('native-proxy-close', { epoch: params.epoch + 1 }, child);
+          revoked = child === this.child && receipt?.epoch === params.epoch + 1 && receipt.enabled === false
+            && receipt.listening === false && receipt.port === 0 && receipt.connections === 0;
+        } catch {}
+      }
+      if (!revoked && child === this.child) this.invalidate(child, error, 'native-proxy-configure');
+      throw error;
+    }
+  }
+  async nativeProxyClose(params) {
+    const child = this.child;
+    if (this.closed || !child || !this.initialized.has(child)) return { epoch: params.epoch, enabled: false, listening: false, port: 0, connections: 0 };
+    try {
+      const receipt = await this.request('native-proxy-close', params, child);
+      if (receipt?.epoch !== params.epoch || receipt.enabled !== false || receipt.listening !== false || receipt.port !== 0 || receipt.connections !== 0) {
+        throw new Error('原生网络组件未确认撤销全部代理连接');
+      }
+      return receipt;
+    }
+    catch (error) {
+      if (child === this.child) this.invalidate(child, error, 'native-proxy-close');
+      throw error;
+    }
+  }
+  async nativeProxyStatus() {
+    const child = this.child;
+    if (this.closed || !child || !this.initialized.has(child)) return null;
+    return this.request('native-proxy-status', {}, child);
+  }
+  abortNativeProxy() {
+    const child = this.child;
+    if (child) this.invalidate(child, new Error('原生代理状态无效，已撤销全部传输'), 'native-proxy-invalid');
+  }
   async networkState(method) { return { hostname: this.hostname, ...await this.call(method) }; }
   async status() {
     try { return await this.networkState('status'); }
