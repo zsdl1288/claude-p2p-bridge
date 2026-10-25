@@ -407,6 +407,16 @@ try:
     kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
     kernel32.TerminateProcess.restype = wintypes.BOOL
     try:
+        # HTTP can become ready before the desktop finishes its own bootstrap.
+        # This case injects a failure into a running engine, not the separate
+        # startup-error path (which intentionally keeps its error dialog open).
+        fault_session = lifecycle_state("lifecycle-engine-exit")["sessionId"]
+        def fault_desktop_ready():
+            rows = [row for row in lifecycle_rows("lifecycle-engine-exit")
+                    if row.get("sessionId") == fault_session and row.get("pid") == fault_process.pid]
+            return any(row["event"] == "engine-ready" for row in rows) and any(
+                row["event"] == "engine-created" and row.get("childPid") == fault_pid for row in rows)
+        wait_ui(fault_process, fault_desktop_ready, "desktop ready before running-engine failure injection")
         assert kernel32.TerminateProcess(fault_engine, 23)
         assert fault_process.wait(timeout=15) == 1, "Background failure became a successful desktop exit"
     finally:
