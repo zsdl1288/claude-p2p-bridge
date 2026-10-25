@@ -55,6 +55,17 @@ struct Widget {
     bool sidebar = false, muted = false, edit = false, bottom = false;
 };
 
+// Settings controls and painted cards share one vertical layout in logical pixels.
+struct SettingsCard {
+    int top, height;
+    constexpr int Next() const { return top + height + 12; }
+};
+constexpr SettingsCard SETTINGS_BACKGROUND{112, 112};
+constexpr SettingsCard SETTINGS_STARTUP{SETTINGS_BACKGROUND.Next(), 128};
+constexpr SettingsCard SETTINGS_ABOUT{SETTINGS_STARTUP.Next(), 88 + (BRIDGE_DIAGNOSTICS_BUILD ? 24 : 0)};
+constexpr SettingsCard SETTINGS_UPDATE{SETTINGS_ABOUT.Next(), 96};
+constexpr SettingsCard SETTINGS_DIAGNOSTICS{SETTINGS_UPDATE.Next(), 108};
+
 class Application {
     Options options_; HINSTANCE instance_; HWND window_ = nullptr;
     DesktopSingleInstance::Names instanceNames_;
@@ -301,7 +312,7 @@ class Application {
             if (visible) InvalidateRect(item.window, nullptr, TRUE);
         }
         const wchar_t* titles[] = {L"设备与配对", L"模型 API", L"运行记录", L"网络代理", L"设置"};
-        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用服务端的 Claude；工具、文件和命令由调用端执行。", L"仅显示本次运行的记录；退出客户端后清空，不保存到磁盘。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接服务端，提供网络共享节点。", L"管理后台运行、开机启动与开源许可。"};
+        const wchar_t* descriptions[] = {L"先确定本机身份，再连接私有网络并配对；退出私有网络后才能切换身份。", role_ == 2 ? L"配置本机 Claude 服务；模型服务与网络共享分别控制。" : L"通过本机 API 调用服务端的 Claude；工具、文件和命令由调用端执行。", L"仅显示本次运行的记录；退出客户端后清空，不保存到磁盘。", role_ == 2 ? L"为已配对的调用端提供本机网络出口，独立于 Claude 模型服务。" : L"Clash 负责本机 TUN；本客户端连接服务端，提供网络共享节点。", L"管理后台运行、开机启动、软件更新与诊断。"};
         Text(heading_, titles[page_]); Text(description_, descriptions[page_]);
         InvalidateRect(window_, nullptr, TRUE);
     }
@@ -415,26 +426,26 @@ class Application {
         Label(L"导入完整配置并开启 Clash TUN；服务端断开时不回退直连。请保持本客户端运行。", 228, 696, 764, 24, 3, 1, 3, true); widgets_.back().stretch = true; widgets_.back().bottom = true;
         Label(L"共享说明", 228, 612, 580, 24, 3, 2, 1); widgets_.back().bottom = true;
         Label(L"只有已配对的调用端可以使用本机网络出口。\r\n“使用中”表示正在连接网络共享；停止共享不会中断 Claude 模型服务。", 228, 652, 764, 52, 3, 2, 0, true); widgets_.back().stretch = true; widgets_.back().bottom = true;
-        Label(L"后台运行", 228, 132, 540, 24, 4, 0, 1);
-        Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, 172, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
-        Button(L"收起到托盘", MINIMIZE_TRAY, 228, 224, 220, 34, 4);
-        Label(L"开机启动", 228, 294, 540, 24, 4, 0, 1);
-        Add(L"BUTTON", L"Windows 登录后自动在后台运行", STARTUP_ENABLE, 228, 328, 540, 26, 4, 0, BS_AUTOCHECKBOX | WS_TABSTOP);
-        startupHint_ = Label(L"", 228, 364, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label(L"后台运行", 228, SETTINGS_BACKGROUND.top + 20, 568, 24, 4, 0, 1);
+        Button(L"收起到托盘", MINIMIZE_TRAY, 816, SETTINGS_BACKGROUND.top + 16, 176, 34, 4, 0, true);
+        Label(L"最小化或关闭窗口会收起到托盘，连接与服务继续运行。\r\n双击托盘图标可恢复窗口；右键选择“退出”才会停止客户端。", 228, SETTINGS_BACKGROUND.top + 54, 764, 42, 4, 0, 0, true); widgets_.back().stretch = true;
+        Label(L"开机启动", 228, SETTINGS_STARTUP.top + 16, 568, 24, 4, 0, 1);
+        Add(L"BUTTON", L"Windows 登录后自动在后台运行", STARTUP_ENABLE, 228, SETTINGS_STARTUP.top + 46, 764, 26, 4, 0, BS_AUTOCHECKBOX | WS_TABSTOP); widgets_.back().stretch = true;
+        startupHint_ = Label(L"", 228, SETTINGS_STARTUP.top + 80, 764, 40, 4, 0, 3, true); widgets_.back().stretch = true;
         auto versionLabel = L"Claude Bridge · v" + Wide(BRIDGE_VERSION);
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) versionLabel += L" · 本地诊断版";
-        Label(versionLabel.c_str(), 228, 440, 540, 24, 4);
-        Button(L"开源许可", OPEN_LICENSES, 784, 432, 208, 34, 4, 0, true);
-        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, 476, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label(versionLabel.c_str(), 228, SETTINGS_ABOUT.top + 20, 568, 24, 4, 0, 1);
+        Button(L"开源许可", OPEN_LICENSES, 816, SETTINGS_ABOUT.top + 16, 176, 34, 4, 0, true);
+        Label(L"查看本客户端及其所用开源组件的许可与版权说明。", 228, SETTINGS_ABOUT.top + 54, 764, 20, 4, 0, 3, true); widgets_.back().stretch = true;
         if constexpr (BRIDGE_DIAGNOSTICS_BUILD) {
-            Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, 500, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
+            Label(Wide(BRIDGE_BUILD_LABEL).c_str(), 228, SETTINGS_ABOUT.top + 78, 764, 24, 4, 0, 3, true); widgets_.back().stretch = true;
         }
-        Label(L"软件更新", 228, 538, 540, 24, 4, 0, 1);
-        Button(L"检查更新", APP_UPDATE, 784, 534, 208, 34, 4, 0, true);
-        updateMessage_ = Add(L"STATIC", L"检查 GitHub 正式版；下载完成后自动替换并重启，连接会短暂中断。", APP_UPDATE_STATUS, 228, 578, 764, 48, 4, 0, SS_LEFT, 3, false, true);
-        Label(L"退出与崩溃诊断", 228, 646, 540, 24, 4, 0, 1);
-        Button(L"打开退出日志", OPEN_LIFECYCLE_LOGS, 784, 642, 208, 34, 4, 0, true);
-        Label(L"自动保留退出来源、异常码和上次未完整结束的记录。\r\n日志只保存在本机，按大小轮转；不会保存模型或代理内容。", 228, 688, 764, 48, 4, 0, 3, true); widgets_.back().stretch = true;
+        Label(L"软件更新", 228, SETTINGS_UPDATE.top + 12, 568, 24, 4, 0, 1);
+        Button(L"检查更新", APP_UPDATE, 816, SETTINGS_UPDATE.top + 31, 176, 34, 4, 0, true);
+        updateMessage_ = Add(L"STATIC", L"从 GitHub 下载新版，校验后自动替换并重启。", APP_UPDATE_STATUS, 228, SETTINGS_UPDATE.top + 40, 568, 48, 4, 0, SS_LEFT, 3, false, true);
+        Label(L"退出与崩溃诊断", 228, SETTINGS_DIAGNOSTICS.top + 20, 568, 24, 4, 0, 1);
+        Button(L"打开退出日志", OPEN_LIFECYCLE_LOGS, 816, SETTINGS_DIAGNOSTICS.top + 16, 176, 34, 4, 0, true);
+        Label(L"自动保留退出来源、异常码和上次未完整结束的记录。\r\n日志只保存在本机，按大小轮转；不会保存模型或代理内容。", 228, SETTINGS_DIAGNOSTICS.top + 54, 764, 48, 4, 0, 3, true); widgets_.back().stretch = true;
         LoadSettings(); LoadStartup(); Visibility(); Layout(); UpdateButtons();
     }
     void UpdateUpdateButton() {
@@ -632,7 +643,8 @@ class Application {
         if (page_ == 1) { if (role_ == 2) card(208, 112, 808 + extraW, 574 + extraH); else { card(208, 112, 808 + extraW, 322); card(208, 450, 808 + extraW, 286 + extraH); } }
         if (page_ == 2) card(208, 112, 808 + extraW, 574 + extraH);
         if (page_ == 3) { card(208, 112, 808 + extraW, 200); card(208, 328, 808 + extraW, 256 + extraH); card(208, 600 + extraH, 808 + extraW, 136); }
-        if (page_ == 4) { card(208, 112, 808 + extraW, 160); card(208, 280, 808 + extraW, 136); card(208, 430, 808 + extraW, 86); card(208, 556, 808 + extraW, 140); }
+        if (page_ == 4) for (const auto& section : {SETTINGS_BACKGROUND, SETTINGS_STARTUP, SETTINGS_ABOUT, SETTINGS_UPDATE, SETTINGS_DIAGNOSTICS})
+            card(208, section.top, 808 + extraW, section.height);
         SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); EndPaint(window_, &ps);
     }
     void DrawButton(DRAWITEMSTRUCT* draw) {

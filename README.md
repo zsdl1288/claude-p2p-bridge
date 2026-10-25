@@ -1,4 +1,4 @@
-# Claude Bridge · Windows 桌面托盘版 v1.3.0
+# Claude Bridge · Windows 桌面托盘版 v1.3.1
 
 多台电脑安装同一个客户端，各端登录同一个 Tailscale 账号。每份实例选择一个固定方向的身份：A 调用端连接一台 B，B 服务端接受已授权的 A。模型服务和网络共享分别配置、分别启停；仅使用网络共享时不需要安装 Claude。B 的模型服务使用已安装并登录的官方 Claude Code，为 A 上的 DeepSeek Harness 提供主模型决策；Harness 的文件和终端工具在 A 执行。
 
@@ -8,7 +8,7 @@ A 上 Harness → A 本机 /v1/chat/completions → 加密连接 → B 的官方
       └── A 执行工具 → 下一轮带回结果 ← 回答 / 结构化工具调用 ──┘
 ```
 
-正式版为 `release/ClaudeBridge-1.3.0-windows-x64.exe`，支持 Windows 10/11 x64，可从 [GitHub Release v1.3.0](https://github.com/zsdl1288/claude-p2p-bridge/releases/tag/v1.3.0) 下载。此版整合原生 Tailscale TCP/UDP 网络共享、自适应通道测速和客户端更新；设置页支持检查 GitHub 正式版，自动下载、校验、替换并重启。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
+正式版为 `release/ClaudeBridge-1.3.1-windows-x64.exe`，支持 Windows 10/11 x64，可从 [GitHub Release v1.3.1](https://github.com/zsdl1288/claude-p2p-bridge/releases/tag/v1.3.1) 下载。此版修复设置页底部内容越框，统一卡片间距和按钮位置，并将软件更新改为紧凑布局。保留原生 Tailscale TCP/UDP 网络共享、自适应通道测速和客户端更新；设置页支持检查 GitHub 正式版，自动下载、校验、替换并重启。用户无需安装 C++ 开发环境、Visual C++ 运行库、Node.js、Go 或系统 Tailscale 客户端，也无需自己部署公网服务器。启用模型服务时，B 需安装当前版官方 Claude Code 并正常登录；A 无需安装 Claude Code，模型调用由自行安装的 Harness 或兼容工具完成。
 
 桌面窗口、系统托盘和进程管理使用 C++ / Win32；Tailscale `tsnet` 网络核心使用 Go；任务引擎及 Node.js 运行时内置于同一 EXE，首次启动解包到用户数据目录。源码打包只包含受校验的项目文件，不含本机账号、配对或 API Token。
 
